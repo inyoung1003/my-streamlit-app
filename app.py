@@ -34,6 +34,11 @@ import numpy as np
 import streamlit as st
 from openai import OpenAI
 
+import os
+os.makedirs(".streamlit", exist_ok=True)
+with open(".streamlit/config.toml", "w") as f:
+    f.write("[server]\nenableXsrfProtection = false\nenableCORS = false\nmaxUploadSize = 50\n")
+
 # ─────────────────────────────────────────────
 # 기본 설정
 # ─────────────────────────────────────────────
