@@ -47,7 +47,7 @@ PRIORITIES = ["높음", "보통", "낮음"]
 PRIORITY_ORDER = {p: i for i, p in enumerate(PRIORITIES)}
 PRIORITY_COLOR = {"높음": "#dc2626", "보통": "#d97706", "낮음": "#6b7280"}
 # 일정 종류별 색상 · 기본 소요시간(분)
-EVENT_TYPES = {
+DEFAULT_EVENT_TYPES = {
     "내부 체크인": {"color": "#0d9488", "minutes": 20},
     "일반 회의": {"color": "#2563eb", "minutes": 30},
     "온라인 회의": {"color": "#7c3aed", "minutes": 45},
@@ -56,9 +56,8 @@ EVENT_TYPES = {
     "개인": {"color": "#16a34a", "minutes": 60},
     "기타": {"color": "#64748b", "minutes": 60},
 }
-EVENT_CATS = list(EVENT_TYPES)
 # 할 일 분류별 색상 (일정과 다른 색)
-TODO_CATS = {"보고·문서": "#ea580c", "조사·분석": "#c026d3", "연락·메일": "#0891b2",
+DEFAULT_TODO_CATS = {"보고·문서": "#ea580c", "조사·분석": "#c026d3", "연락·메일": "#0891b2",
              "일반 업무": "#4f46e5", "개인": "#84cc16"}
 LEGACY_CATS = {"회의": "일반 회의"}          # 이전 버전 분류 → 새 분류
 GAP_MIN = 10                                 # 앞뒤 일정과 이 간격(분) 미만이면 충돌
@@ -148,6 +147,33 @@ def normalize_note(n):
 if "data" not in st.session_state:
     st.session_state.data = load_data()
 data = st.session_state.data
+data.setdefault("settings", {})
+
+# 일정 종류 · 할 일 분류: 사용자가 직접 정한 값이 있으면 그것을, 없으면 기본값 사용
+EVENT_TYPES = {k: {"color": v.get("color", "#64748b"), "minutes": int(v.get("minutes", 60))}
+               for k, v in (data["settings"].get("event_types") or DEFAULT_EVENT_TYPES).items()}
+TODO_CATS = dict(data["settings"].get("todo_cats") or DEFAULT_TODO_CATS)
+EVENT_CATS = list(EVENT_TYPES)
+
+
+def fallback_event_type():
+    return "기타" if "기타" in EVENT_TYPES else EVENT_CATS[0]
+
+
+def fallback_todo_cat():
+    return "일반 업무" if "일반 업무" in TODO_CATS else list(TODO_CATS)[0]
+
+
+def type_minutes(cat):
+    return EVENT_TYPES.get(cat, {}).get("minutes", 60)
+
+
+def type_color(cat):
+    return EVENT_TYPES.get(cat, {}).get("color", "#64748b")
+
+
+def type_guide():
+    return ", ".join(f"{k} {v['minutes']}분" for k, v in EVENT_TYPES.items())
 for k, v in DATA_DEFAULTS.items():
     data.setdefault(k, json.loads(json.dumps(v)))
 data["meeting_notes"] = [normalize_note(x) for x in data["meeting_notes"] if isinstance(x, dict)]
@@ -178,7 +204,7 @@ def clean_text(t):
     return re.sub(r"[ \t]+", " ", EMOJI_RE.sub("", t or "")).strip()
 
 
-def guess_todo_cat(title):
+def _guess_todo_base(title):
     t = title or ""
     if re.search(r"보고|문서|초안|작성|기획안|제안서|자료|회의록", t):
         return "보고·문서"
@@ -189,6 +215,14 @@ def guess_todo_cat(title):
     if re.search(r"병원|생일|휴가|연차|운동|가족|개인|여행", t):
         return "개인"
     return "일반 업무"
+
+
+def guess_todo_cat(title):
+    for name in TODO_CATS:
+        if name not in DEFAULT_TODO_CATS and name in (title or ""):
+            return name
+    g = _guess_todo_base(title)
+    return g if g in TODO_CATS else fallback_todo_cat()
 
 
 def add_todo(title, due="", priority="보통", detail="", source="직접 입력", category=""):
@@ -235,7 +269,7 @@ def end_from(start, minutes):
     return hhmm(min(s + minutes, 24 * 60 - 1)) if s is not None and minutes else ""
 
 
-def guess_category(title):
+def _guess_category_base(title):
     # 제목으로 일정 종류 추정 → 기본 소요시간이 정해짐
     t = title or ""
     if re.search(r"체크인|스탠드업|데일리|싱크|1:1|원온원", t, re.I):
@@ -251,6 +285,14 @@ def guess_category(title):
     return "업무"
 
 
+def guess_category(title):
+    for name in EVENT_TYPES:
+        if name not in DEFAULT_EVENT_TYPES and name in (title or ""):
+            return name
+    g = _guess_category_base(title)
+    return g if g in EVENT_TYPES else fallback_event_type()
+
+
 def norm_times(start, end, category="기타"):
     # 끝나는 시간이 없으면 종류별 소요시간으로 추정
     s = parse_time(start)
@@ -258,7 +300,7 @@ def norm_times(start, end, category="기타"):
         return "", ""
     e = parse_time(end)
     if e is None or e <= s:
-        e = min(s + EVENT_TYPES.get(category, EVENT_TYPES["기타"])["minutes"], 24 * 60 - 1)
+        e = min(s + type_minutes(category), 24 * 60 - 1)
     return hhmm(s), hhmm(e)
 
 
@@ -267,7 +309,7 @@ def event_span(e):
     if s is None:
         return None
     if en is None or en <= s:
-        en = min(s + EVENT_TYPES.get(e.get("category"), EVENT_TYPES["기타"])["minutes"], 24 * 60 - 1)
+        en = min(s + type_minutes(e.get("category")), 24 * 60 - 1)
     return s, en
 
 
@@ -355,7 +397,7 @@ def conflict_text(c):
 
 
 def build_event(title, date, start="", end="", category="", note=""):
-    cat = LEGACY_CATS.get(category, category)
+    cat = LEGACY_CATS.get(category, category) if category not in EVENT_TYPES else category
     cat = cat if cat in EVENT_TYPES else guess_category(title)
     s, e = norm_times(start, end, cat)
     return {"title": clean_text(title), "date": str(date)[:10], "start": s, "end": e,
@@ -948,7 +990,7 @@ st.markdown("<style>" + " ".join(APP_CSS) + "</style>", unsafe_allow_html=True)
 
 
 def ev_color(e):
-    return EVENT_TYPES.get(e["category"], EVENT_TYPES["기타"])["color"]
+    return type_color(e["category"])
 
 
 def badge(text, color):
@@ -968,7 +1010,7 @@ def items_by_date():
         d = parse_date(t["due"])
         if d:
             kind = "done" if t["done"] else "todo"
-            color = "#9ca3af" if t["done"] else TODO_CATS.get(t["category"], "#4f46e5")
+            color = "#9ca3af" if t["done"] else TODO_CATS.get(t["category"], "#64748b")
             m.setdefault(d, []).append(("99:99", kind, "마감 " + t["title"], color))
     for v in m.values():
         v.sort(key=lambda x: x[0])
@@ -1011,7 +1053,7 @@ def todo_html(t):
         due = f'<b style="color:{color}">{d_day(d)}</b> · 마감 {fmt_date(d)}'
     else:
         due = "기한 없음"
-    return (f'{badge(t["category"], TODO_CATS.get(t["category"], "#4f46e5"))}'
+    return (f'{badge(t["category"], TODO_CATS.get(t["category"], "#64748b"))}'
             f'{badge(t["priority"], PRIORITY_COLOR[t["priority"]])}<b>{title}</b>'
             f'<br><span class="able-meta">{due}</span>')
 
@@ -1035,7 +1077,7 @@ def event_form(key, ev=None, default_date=None):
         c1, c2 = st.columns(2)
         date = c1.date_input("날짜", value=parse_date(ev["date"]) if ev else (default_date or today))
         cat_opts = ["자동 (제목으로 추정)"] + EVENT_CATS
-        cat = c2.selectbox("종류", cat_opts, index=cat_opts.index(ev["category"]) if ev else 0)
+        cat = c2.selectbox("종류", cat_opts, index=cat_opts.index(ev["category"]) if ev and ev["category"] in cat_opts else 0)
         c3, c4 = st.columns(2)
         t_opts = list(TIME_OPTIONS)
         cur = (ev["start"] or "종일") if ev else "10:00"
@@ -1054,8 +1096,8 @@ def event_form(key, ev=None, default_date=None):
             d_idx = list(d_opts).index(match[0])
         dur = c4.selectbox("소요 시간", list(d_opts), index=d_idx)
         note = st.text_input("메모", value=ev["note"] if ev else "")
-        st.caption("소요 시간을 '자동'으로 두면 내부 체크인 20분 · 일반 회의 30분 · 온라인 회의 45분 · 고객사 미팅 60분으로 "
-                   "계산해요. 기존 일정과 겹치거나 간격이 10분 미만이면 알려 드려요.")
+        st.caption(f"소요 시간을 '자동'으로 두면 종류별로 계산해요 ({type_guide()}). "
+                   "기존 일정과 겹치거나 간격이 10분 미만이면 알려 드려요.")
         if st.form_submit_button("저장" if ev else "추가", type="primary"):
             if not title.strip():
                 st.warning("제목을 입력하세요.")
@@ -1073,7 +1115,7 @@ def todo_form(key, t=None, default_due=None):
         due = c1.date_input("마감일", value=(parse_date(t["due"]) if t else default_due))
         prio = c2.selectbox("우선순위", PRIORITIES, index=PRIORITIES.index(t["priority"]) if t else 1)
         cat_opts = ["자동 (제목으로 추정)"] + list(TODO_CATS)
-        cat = c3.selectbox("분류", cat_opts, index=cat_opts.index(t["category"]) if t else 0)
+        cat = c3.selectbox("분류", cat_opts, index=cat_opts.index(t["category"]) if t and t["category"] in cat_opts else 0)
         detail = st.text_input("세부 내용", value=t["detail"] if t else "")
         if st.form_submit_button("저장" if t else "추가", type="primary"):
             if not title.strip():
@@ -1082,6 +1124,122 @@ def todo_form(key, t=None, default_due=None):
             return {"title": title, "due": due.isoformat() if due else "", "priority": prio,
                     "category": "" if cat.startswith("자동") else cat, "detail": detail}
     return None
+
+
+def _types_ver():
+    return st.session_state.get("types_ver", 0)
+
+
+def save_event_types(rows, new_row):
+    # rows: (원래 이름, 새 이름, 색, 소요시간, 삭제 여부)
+    keep = [(old, clean_text(nm), col, int(mins)) for old, nm, col, mins, rm in rows if not rm]
+    if new_row and clean_text(new_row[0]):
+        keep.append((None, clean_text(new_row[0]), new_row[1], int(new_row[2])))
+    names = [k[1] for k in keep]
+    if not keep:
+        return "일정 종류는 하나 이상 있어야 해요."
+    if any(not n for n in names):
+        return "종류 이름을 비워 둘 수 없어요."
+    if len(set(names)) != len(names):
+        return "같은 이름의 종류가 있어요."
+    rename = {old: nm for old, nm, _, _ in keep if old}
+    new_types = {nm: {"color": col, "minutes": mins} for _, nm, col, mins in keep}
+    fallback = "기타" if "기타" in new_types else names[0]
+    for e in data["events"]:                         # 이름을 바꾸거나 지운 종류를 쓰던 일정도 함께 정리
+        e["category"] = rename.get(e["category"], fallback)
+    data["settings"]["event_types"] = new_types
+    save_data()
+    return ""
+
+
+def save_todo_cats(rows, new_row):
+    keep = [(old, clean_text(nm), col) for old, nm, col, rm in rows if not rm]
+    if new_row and clean_text(new_row[0]):
+        keep.append((None, clean_text(new_row[0]), new_row[1]))
+    names = [k[1] for k in keep]
+    if not keep:
+        return "할 일 분류는 하나 이상 있어야 해요."
+    if any(not n for n in names):
+        return "분류 이름을 비워 둘 수 없어요."
+    if len(set(names)) != len(names):
+        return "같은 이름의 분류가 있어요."
+    rename = {old: nm for old, nm, _ in keep if old}
+    fallback = "일반 업무" if "일반 업무" in names else names[0]
+    for t in data["todos"]:
+        t["category"] = rename.get(t["category"], fallback)
+    data["settings"]["todo_cats"] = {nm: col for _, nm, col in keep}
+    save_data()
+    return ""
+
+
+def _reset_types(kind):
+    data["settings"].pop("event_types" if kind == "event" else "todo_cats", None)
+    defaults = DEFAULT_EVENT_TYPES if kind == "event" else DEFAULT_TODO_CATS
+    fb = "기타" if kind == "event" else "일반 업무"
+    for x in data["events" if kind == "event" else "todos"]:
+        if x["category"] not in defaults:
+            x["category"] = fb
+    save_data()
+    st.session_state.types_ver = _types_ver() + 1
+    st.session_state.pending_toast = ("일정 종류" if kind == "event" else "할 일 분류") + "를 기본값으로 되돌렸어요."
+
+
+def render_type_settings():
+    # 일정 종류 · 할 일 분류를 사용자가 직접 정하기 (이름, 색, 일정 기본 소요시간)
+    v = _types_ver()
+    st.caption("여기서 정한 종류는 일정·할 일 추가/수정 화면, 캘린더 색상, 에이블 비서(음성·글 요청), 회의·메일 분석에 모두 쓰여요. "
+               "종류를 지우면 그 종류의 일정은 '기타'(할 일은 '일반 업무', 없으면 첫 번째 종류)로 바뀌어요.")
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown("**일정 종류** · 이름 / 색 / 기본 소요시간(분)")
+        with st.form(f"ev_types_{v}"):
+            rows = []
+            for i, (name, info) in enumerate(EVENT_TYPES.items()):
+                c1, c2, c3, c4 = st.columns([3, 1, 1.6, 1])
+                nm = c1.text_input("이름", value=name, key=f"et_n_{v}_{i}", label_visibility="collapsed")
+                col = c2.color_picker("색", value=info["color"], key=f"et_c_{v}_{i}", label_visibility="collapsed")
+                mins = c3.number_input("분", min_value=5, max_value=600, step=5, value=int(info["minutes"]),
+                                       key=f"et_m_{v}_{i}", label_visibility="collapsed")
+                rm = c4.checkbox("삭제", key=f"et_d_{v}_{i}")
+                rows.append((name, nm, col, mins, rm))
+            st.caption("새 종류 추가")
+            c1, c2, c3, _ = st.columns([3, 1, 1.6, 1])
+            n_nm = c1.text_input("새 이름", key=f"et_new_n_{v}", placeholder="예: 교육", label_visibility="collapsed")
+            n_col = c2.color_picker("새 색", value="#0ea5e9", key=f"et_new_c_{v}", label_visibility="collapsed")
+            n_min = c3.number_input("새 분", min_value=5, max_value=600, step=5, value=60, key=f"et_new_m_{v}",
+                                    label_visibility="collapsed")
+            if st.form_submit_button("일정 종류 저장", type="primary"):
+                err = save_event_types(rows, (n_nm, n_col, n_min))
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.types_ver = v + 1
+                    st.session_state.pending_toast = "일정 종류를 저장했어요."
+                    st.rerun()
+        st.button("일정 종류 기본값으로", key=f"et_reset_{v}", on_click=_reset_types, args=("event",))
+    with right:
+        st.markdown("**할 일 분류** · 이름 / 색")
+        with st.form(f"td_types_{v}"):
+            rows = []
+            for i, (name, color) in enumerate(TODO_CATS.items()):
+                c1, c2, c3 = st.columns([3, 1, 1])
+                nm = c1.text_input("이름", value=name, key=f"tc_n_{v}_{i}", label_visibility="collapsed")
+                col = c2.color_picker("색", value=color, key=f"tc_c_{v}_{i}", label_visibility="collapsed")
+                rm = c3.checkbox("삭제", key=f"tc_d_{v}_{i}")
+                rows.append((name, nm, col, rm))
+            st.caption("새 분류 추가")
+            c1, c2, _ = st.columns([3, 1, 1])
+            n_nm = c1.text_input("새 이름", key=f"tc_new_n_{v}", placeholder="예: 결재", label_visibility="collapsed")
+            n_col = c2.color_picker("새 색", value="#14b8a6", key=f"tc_new_c_{v}", label_visibility="collapsed")
+            if st.form_submit_button("할 일 분류 저장", type="primary"):
+                err = save_todo_cats(rows, (n_nm, n_col))
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.types_ver = v + 1
+                    st.session_state.pending_toast = "할 일 분류를 저장했어요."
+                    st.rerun()
+        st.button("할 일 분류 기본값으로", key=f"tc_reset_{v}", on_click=_reset_types, args=("todo",))
 
 
 def _toggle_from_dialog(todo_id):
@@ -1297,6 +1455,9 @@ with tab_dash:
               delta=f"기한 지남 {len(overdue)}건" if overdue else None, delta_color="inverse")
     c3.metric("이번 주 마감", f"{len(due_this_week)}건")
 
+    with st.expander("⚙️ 일정 종류 · 할 일 분류 직접 정하기"):
+        render_type_settings()
+
     left, right = st.columns([3, 2], gap="large")
 
     # --- 캘린더 ---
@@ -1462,7 +1623,7 @@ TOOLS = [
                 "start": {"type": "string", "description": "시작 시간 HH:MM (24시간), 종일 일정이면 빈 문자열"},
                 "end": {"type": "string",
                         "description": "끝나는 시간 HH:MM. 말하지 않았으면 빈 문자열 → 종류별 자동 "
-                                       "(내부 체크인 20분, 일반 회의 30분, 온라인 회의 45분, 고객사 미팅 60분)"},
+                                       f"({type_guide()})"},
                 "category": {"type": "string", "enum": EVENT_CATS, "description": "일정 종류"},
                 "note": {"type": "string", "description": "메모, 없으면 빈 문자열"},
             },
@@ -1616,7 +1777,8 @@ def system_prompt():
         "  근거가 없는 내용은 지어내지 말고 '확인되지 않는 내용입니다'라고 말합니다.",
         "- '다음 주 금요일', '모레 오후 3시' 같은 표현은 오늘 기준 YYYY-MM-DD, HH:MM으로 바꿔 도구에 넘깁니다.",
         "- 할 일/일정 추가, 일정 변경, 완료 처리를 요청하면 해당 도구를 사용합니다. 제목에 이모티콘을 넣지 않습니다.",
-        "- 일정 종류: 내부 체크인 / 일반 회의 / 온라인 회의 / 고객사 미팅 / 업무 / 개인 / 기타 중 내용에 맞게 고릅니다.",
+        f"- 일정 종류: {' / '.join(EVENT_CATS)} 중 내용에 맞게 고릅니다. (김 대리가 직접 정한 종류 목록)",
+        f"- 할 일 분류: {' / '.join(TODO_CATS)} 중 내용에 맞게 고릅니다.",
         "  끝나는 시간을 말하지 않았으면 end는 빈 문자열로 둡니다(종류별 소요시간 자동 추정).",
         "- add_event·move_event 결과가 needs_approval이면 아직 등록되지 않은 것입니다.",
         "  어떤 일정과 왜 충돌하는지(시간 겹침/간격 n분) 알리고, suggestions의 번호와 시간만 제시한 뒤",
@@ -2286,7 +2448,7 @@ def analyze_mails(mails):
         "- 메일을 받은 김 대리에게 요청된 일이 kim_tasks입니다. 광고·자동 알림·단순 공유면 빈 배열.",
         "- events: 김 대리가 참석·진행해야 하는 회의·미팅·행사 일정만 넣습니다(마감 기한은 kim_tasks).",
         "  date_type/date는 기한 규칙과 같고, 시간이 메일에 있으면 start(HH:MM), 없으면 빈 문자열.",
-        "  category는 내용에 맞게(내부 체크인/일반 회의/온라인 회의/고객사 미팅/업무/개인/기타). 근거 문장 evidence 필수.",
+        f"  category는 내용에 맞게({'/'.join(EVENT_CATS)}). 근거 문장 evidence 필수.",
         "- needs_reply: 사람이 보낸 메일이고 회신이 필요하면 true, 광고·자동 알림이면 false.",
         "- reply_draft: needs_reply가 true일 때만 김 대리 입장의 공손한 답장. 메일에 없는 날짜·숫자·약속은 만들지 않고,",
         "  끝에 '김 대리 드림'. false면 빈 문자열.",
