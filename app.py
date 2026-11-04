@@ -1,4 +1,3 @@
-
 # AI 개인비서 '에이블' (Streamlit)
 # 실행: streamlit run app.py
 # 같은 폴더에 필요한 파일:
@@ -932,6 +931,9 @@ APP_CSS = [
     ".cal-cell.other {opacity:.35;}",
     ".st-key-able_cal button {padding:0 4px; min-height:32px;}",
     ".st-key-able_cal [data-testid='stHorizontalBlock'] {gap:.35rem;}",
+    "[class*='st-key-act_'] {gap:.3rem;}",
+    "[class*='st-key-act_'] button {min-height:28px; padding:2px 6px;}",
+    "[class*='st-key-act_'] button p {font-size:.76rem; white-space:nowrap;}",
 ]
 st.markdown("<style>" + " ".join(APP_CSS) + "</style>", unsafe_allow_html=True)
 
@@ -1003,6 +1005,14 @@ def todo_html(t):
     return (f'{badge(t["category"], TODO_CATS.get(t["category"], "#4f46e5"))}'
             f'{badge(t["priority"], PRIORITY_COLOR[t["priority"]])}<b>{title}</b>'
             f'<br><span class="able-meta">{due}</span>')
+
+
+def action_buttons(col, uid):
+    # 수정·삭제 버튼: 작은 글씨로 세로로 놓아 좁은 화면에서도 글자가 잘리지 않게
+    with col.container(key=f"act_{uid}"):
+        edit = st.button("수정", key=f"ed_{uid}", use_container_width=True)
+        delete = st.button("삭제", key=f"del_{uid}", use_container_width=True)
+    return edit, delete
 
 
 def time_index(options, value):
@@ -1094,14 +1104,15 @@ def day_dialog(d):
                     st.session_state.dlg_edit = None
                     st.rerun(scope="fragment")
             else:
-                a, b, c = st.columns([6, 1, 1])
+                a, b = st.columns([6, 1])
                 a.markdown(event_html(e, show_date=False), unsafe_allow_html=True)
                 if e["note"]:
                     a.caption(e["note"])
-                if b.button("수정", key=f"dlg_ed_ev_{e['id']}"):
+                ed, dl = action_buttons(b, f"dlgev_{e['id']}")
+                if ed:
                     st.session_state.dlg_edit = e["id"]
                     st.rerun(scope="fragment")
-                if c.button("삭제", key=f"dlg_del_ev_{e['id']}"):
+                if dl:
                     delete_item("events", e["id"])
                     st.rerun(scope="fragment")
 
@@ -1110,13 +1121,30 @@ def day_dialog(d):
     if not todos:
         st.caption("이 날 마감인 할 일이 없습니다.")
     for t in todos:
-        a, b, c = st.columns([0.6, 6.4, 1])
-        a.checkbox("완료", value=t["done"], key=f"dlg_chk_{t['id']}",
-                   on_change=_toggle_from_dialog, args=(t["id"],), label_visibility="collapsed")
-        b.markdown(todo_html(t), unsafe_allow_html=True)
-        if c.button("삭제", key=f"dlg_del_td_{t['id']}"):
-            delete_item("todos", t["id"])
-            st.rerun(scope="fragment")
+        with st.container(border=True):
+            if st.session_state.get("dlg_edit_td") == t["id"]:
+                f = todo_form(f"dlg_td_edit_{t['id']}", t)
+                if f:
+                    update_todo(t["id"], **f)
+                    st.session_state.dlg_edit_td = None
+                    st.rerun(scope="fragment")
+                if st.button("취소", key=f"dlg_td_cancel_{t['id']}"):
+                    st.session_state.dlg_edit_td = None
+                    st.rerun(scope="fragment")
+            else:
+                a, b, c = st.columns([0.6, 6, 1])
+                a.checkbox("완료", value=t["done"], key=f"dlg_chk_{t['id']}",
+                           on_change=_toggle_from_dialog, args=(t["id"],), label_visibility="collapsed")
+                b.markdown(todo_html(t), unsafe_allow_html=True)
+                if t["detail"]:
+                    b.caption(t["detail"])
+                ed, dl = action_buttons(c, f"dlgtd_{t['id']}")
+                if ed:
+                    st.session_state.dlg_edit_td = t["id"]
+                    st.rerun(scope="fragment")
+                if dl:
+                    delete_item("todos", t["id"])
+                    st.rerun(scope="fragment")
 
     st.markdown("#### 이 날에 추가")
     kind = st.radio("종류", ["일정", "할 일(마감)"], horizontal=True, key=f"dlg_kind_{iso}",
@@ -1253,16 +1281,12 @@ with tab_dash:
     due_this_week = [t for t in undone if (d := parse_date(t["due"])) and today <= d <= week_end]
     overdue = [t for t in undone if (d := parse_date(t["due"])) and d < today]
     today_events = [e for e in data["events"] if parse_date(e["date"]) == today]
-    total = len(data["todos"])
-    rate = round(100 * (total - len(undone)) / total) if total else 0
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3 = st.columns(3)
     c1.metric("오늘 일정", f"{len(today_events)}건")
     c2.metric("남은 할 일", f"{len(undone)}건",
               delta=f"기한 지남 {len(overdue)}건" if overdue else None, delta_color="inverse")
     c3.metric("이번 주 마감", f"{len(due_this_week)}건")
-    c4.metric("충돌 일정", f"{_ov}건")
-    c5.metric("완료율", f"{rate}%")
 
     left, right = st.columns([3, 2], gap="large")
 
@@ -1286,10 +1310,12 @@ with tab_dash:
 
     # --- 오른쪽: 주요 일정 / 할 일 목록 (나란히 놓고 골라 보기) ---
     with right:
-        rt_ev, rt_td = st.tabs([f"주요 일정 ({sum(1 for e in data['events'] if (d := parse_date(e['date'])) and today <= d <= today + dt.timedelta(days=30))})",
-                                f"할 일 목록 ({len(undone)})"])
+        n_up = sum(1 for e in data["events"] if (d := parse_date(e["date"])) and today <= d <= today + dt.timedelta(days=30))
+        right_view = st.radio("보기 선택", ["주요 일정", "할 일 목록"], horizontal=True, key="dash_right",
+                              label_visibility="collapsed",
+                              format_func=lambda v: f"{v} ({n_up if v == '주요 일정' else len(undone)})")
 
-        with rt_ev:
+        if right_view == "주요 일정":
             horizon = today + dt.timedelta(days=30)
             upcoming = sorted([e for e in data["events"] if (d := parse_date(e["date"])) and today <= d <= horizon],
                               key=lambda e: (e["date"], e["start"] or "00:00"))
@@ -1310,16 +1336,17 @@ with tab_dash:
                             st.session_state.edit_ev = None
                             st.rerun()
                     else:
-                        a, b, c = st.columns([5, 1.1, 1.1])
+                        a, b = st.columns([5, 1])
                         a.markdown(event_html(e), unsafe_allow_html=True)
                         if e["note"]:
                             a.caption(e["note"])
                         if e["source"] in ("에이블", "회의 분석") or e["source"].startswith("메일"):
                             a.caption(f"AI 등록 ({e['source']}) · 수정할 수 있어요")
-                        if b.button("수정", key=f"ed_ev_{e['id']}", use_container_width=True):
+                        ed, dl = action_buttons(b, f"ev_{e['id']}")
+                        if ed:
                             st.session_state.edit_ev = e["id"]
                             st.rerun()
-                        if c.button("삭제", key=f"del_ev_{e['id']}", use_container_width=True):
+                        if dl:
                             delete_item("events", e["id"])
                             st.rerun()
             with st.expander("일정 추가"):
@@ -1330,8 +1357,9 @@ with tab_dash:
                         st.session_state.pending_toast = f"'{r['title']}' 일정을 {event_time_text(r)}에 등록했어요."
                     st.rerun()
 
-        with rt_td:
-            view = st.radio("보기", ["진행 중", "완료", "전체"], horizontal=True, label_visibility="collapsed")
+        else:
+            view = st.radio("보기", ["진행 중", "완료", "전체"], horizontal=True, key="td_view",
+                            label_visibility="collapsed")
 
             def toggle(todo_id):
                 set_todo_done(todo_id, st.session_state[f"chk_{todo_id}"])
@@ -1352,22 +1380,25 @@ with tab_dash:
                         if f:
                             update_todo(t["id"], **f)
                             st.session_state.edit_td = None
-                            st.session_state.pending_toast = "할 일을 수정했어요."
+                            st.session_state.pending_toast = f"'{clean_text(f['title'])}' 할 일을 수정했어요."
                             st.rerun()
                         if st.button("수정 취소", key=f"td_edit_cancel_{t['id']}"):
                             st.session_state.edit_td = None
                             st.rerun()
                     else:
-                        c0, c1, c2, c3 = st.columns([0.5, 5, 1.1, 1.1])
+                        c0, c1, c2 = st.columns([0.5, 5, 1])
                         c0.checkbox("완료", value=t["done"], key=f"chk_{t['id']}", on_change=toggle,
                                     args=(t["id"],), label_visibility="collapsed")
                         c1.markdown(todo_html(t), unsafe_allow_html=True)
                         if t["detail"]:
                             c1.caption(t["detail"])
-                        if c2.button("수정", key=f"ed_td_{t['id']}", use_container_width=True):
+                        if t["source"] not in ("직접 입력", ""):
+                            c1.caption(f"AI 등록 ({t['source']}) · 수정할 수 있어요")
+                        ed, dl = action_buttons(c2, f"td_{t['id']}")
+                        if ed:
                             st.session_state.edit_td = t["id"]
                             st.rerun()
-                        if c3.button("삭제", key=f"del_td_{t['id']}", use_container_width=True):
+                        if dl:
                             delete_item("todos", t["id"])
                             st.rerun()
             with st.expander("할 일 추가"):
@@ -1755,9 +1786,6 @@ with tab_chat:
                 voice_in = st.audio_input("음성으로 요청하기", key=f"chat_mic_{n}", label_visibility="collapsed")
             else:
                 st.warning("실시간 녹음을 쓰려면 `!pip install -q -U streamlit`으로 업데이트하세요.")
-        st.markdown("**에이블이 할 수 있는 일**  \n"
-                    "회의·파일 요약과 김 대리 업무 정리 · 일정 추가/변경(충돌 감지와 대체 시간 추천) · "
-                    "연락처로 메일 작성·발송(보내기 전 확인) · 이전 질문을 기억하는 대화 · 답변 음성 재생")
 
     for t in turns:
         with st.chat_message("user", avatar="🧑‍💼"):
@@ -2003,6 +2031,16 @@ with tab_meet:
 
         st.markdown(f"### 📄 {n['title']}")
         st.caption(f"{n['when']} · {n['source']} · 참석자: {n['attendees'] or '입력 없음'}")
+        with st.expander("회의록 이름 수정"):
+            new_title = st.text_input("회의록 이름", value=n["title"], key=f"rename_{n['id']}")
+            if st.button("이름 저장", key=f"rename_save_{n['id']}", type="primary"):
+                if clean_text(new_title):
+                    n["title"] = clean_text(new_title)[:60]
+                    save_data()
+                    st.session_state.pending_toast = f"회의록 이름을 '{n['title']}'(으)로 바꿨어요."
+                    st.rerun()
+                else:
+                    st.warning("회의록 이름을 입력하세요.")
 
         l, r = st.columns([3, 2], gap="large")
         with l:
@@ -2251,7 +2289,7 @@ with tab_mail:
     if not gmail_ready():
         st.warning("api_key.txt에 GMAIL_ADDRESS, GMAIL_APP_PASSWORD가 있어야 메일을 보내고 받을 수 있습니다.")
 
-    sub_send, sub_inbox, sub_contacts = st.tabs(["✉️ 메일 보내기", "📥 받은 메일 요약", f"📇 연락처 ({len(data['contacts'])})"])
+    sub_send, sub_inbox, sub_contacts = st.tabs(["✉️ 메일 보내기", "📥 받은 메일 요약", "📇 연락처"])
 
     # --- 메일 보내기 ---
     with sub_send:
