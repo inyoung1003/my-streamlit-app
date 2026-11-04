@@ -1,4 +1,3 @@
-
 # AI 개인비서 '에이블' (Streamlit)
 # 실행: streamlit run app.py
 # 같은 폴더에 필요한 파일:
@@ -511,6 +510,33 @@ def fmt_date(d):
     return f"{d.month}/{d.day}({WEEKDAYS[d.weekday()]})"
 
 
+def date_table():
+    # '이번 주 목요일' 같은 표현을 LLM이 직접 계산하지 않고 표에서 찾아 쓰도록, 오늘 기준 날짜표를 매번 새로 만듦
+    # (today가 실행할 때마다 바뀌므로 내년·연말에도 그 주에 맞는 날짜가 자동으로 들어감)
+    monday = today - dt.timedelta(days=today.weekday())
+    near = [f"{label} {(today + dt.timedelta(days=i)).isoformat()}({WEEKDAYS[(today + dt.timedelta(days=i)).weekday()]})"
+            for i, label in enumerate(["오늘", "내일", "모레", "글피"])]
+    lines = ["[날짜표] 한 주는 월요일~일요일입니다. 날짜는 직접 계산하지 말고 반드시 이 표에서 골라 씁니다.",
+             "- " + ", ".join(near)]
+    for w, label in enumerate(["지난 주", "이번 주", "다음 주", "다다음 주"], start=-1):
+        days = [monday + dt.timedelta(days=7 * w + i) for i in range(7)]
+        lines.append(f"- {label}: " + ", ".join(f"{WEEKDAYS[d.weekday()]} {d.isoformat()}" for d in days))
+    lines += ["- '이번 주/다음 주' 없이 요일만 말하면(예: '목요일에') 오늘 이후(오늘 포함) 가장 가까운 그 요일입니다.",
+              "- 시간에 오전/오후가 없을 때: 1~7시는 오후(13:00~19:00), 8~11시는 오전, 12시는 12:00으로 봅니다.",
+              "  '오전', '새벽', '아침'이라고 말했을 때만 1~7시를 오전으로 씁니다."]
+    return "\n".join(lines)
+
+
+def check_weekday(date_iso, weekday):
+    # 김 대리가 말한 요일과 도구에 넘어온 날짜의 요일이 다르면 등록하지 않고 다시 계산하게 함
+    d = parse_date(date_iso)
+    if not weekday or d is None or WEEKDAYS[d.weekday()] == weekday:
+        return None
+    return {"status": "failed", "retry": True,
+            "error": f"{date_iso}는 {WEEKDAYS[d.weekday()]}요일인데 요청한 요일은 {weekday}요일입니다. "
+                     "처리하지 않았습니다. [날짜표]에서 날짜를 다시 찾아 도구를 다시 호출하세요."}
+
+
 # 예전 버전에서 저장한 일정·할 일·연락처·대화도 새 형식으로 읽기 (시간 없는 일정은 종일 일정으로 그대로 유지)
 for _e in data["events"]:
     _e.setdefault("note", "")
@@ -704,7 +730,7 @@ TASK_RULES = [
     "- evidence에는 그 업무가 김 대리에게 맡겨졌다는 근거 문장을 원문에서 글자 그대로 한 문장 복사합니다.",
     "- due_type: 날짜나 요일이 구체적이면 exact(예: 11월 14일까지, 이번 주 금요일까지),",
     "  '다음 주까지', '다음 달 초', '빨리', '출시 2주 전'처럼 대략적이면 approximate, 기한 언급이 없으면 none.",
-    "- due_text는 원문 표현 그대로, due_date는 exact일 때만 오늘 기준 YYYY-MM-DD로 바꿔 씁니다.",
+    "- due_text는 원문 표현 그대로, due_date는 exact일 때만 [날짜표]에서 찾아 YYYY-MM-DD로 씁니다.",
     "- priority: 원문에 '중요', '꼭', '빨리', '급하게' 같은 표현이 있으면 높음, 없으면 보통.",
 ]
 
@@ -1385,6 +1411,118 @@ def count_overlaps():
     return n
 
 
+# ─────────────────────────────────────────────
+# 자연어로 일정 삭제: 대상을 보여 주고 김 대리가 승인한 뒤에만 삭제
+# ─────────────────────────────────────────────
+DELETE_MAX = 5
+DELETE_STOP = {"일정", "스케줄", "거", "것", "그거", "약속잡은거"}
+
+
+def _nospace(s):
+    return re.sub(r"\s", "", s or "").lower()
+
+
+def find_delete_candidates(date_iso, keyword):
+    # 날짜(없으면 오늘 이후 전체) 안에서 키워드가 제목·메모·종류에 많이 들어간 일정 순으로 최대 5개
+    words = [_nospace(w) for w in re.split(r"[\s,]+", keyword or "") if w and _nospace(w) not in DELETE_STOP]
+    if date_iso:
+        pool = [e for e in data["events"] if e["date"] == date_iso]
+    else:
+        pool = [e for e in data["events"] if (d := parse_date(e["date"])) and d >= today]
+        if not words:
+            return []
+    scored = []
+    for e in pool:
+        text = _nospace(e["title"] + " " + e.get("note", "") + " " + e["category"])
+        score = sum(w in text for w in words)
+        if score or not words:
+            scored.append((-score, e["date"], e["start"] or "00:00", e))
+    scored.sort(key=lambda x: x[:3])
+    if scored and words:                         # 키워드가 가장 많이 맞는 일정만 후보로 (예: '점심 약속' > '팀 점심')
+        scored = [x for x in scored if x[0] == scored[0][0]]
+    return [x[3] for x in scored[:DELETE_MAX]]
+
+
+def request_delete(date_iso, keyword):
+    # 바로 지우지 않고 삭제 후보를 승인 대기(pending_delete)로 저장
+    if date_iso and not parse_date(date_iso):
+        return {"status": "failed", "error": "날짜 형식은 YYYY-MM-DD 입니다."}
+    cands = find_delete_candidates(date_iso, keyword)
+    if not cands:
+        same_day = sorted([e for e in data["events"] if e["date"] == date_iso], key=lambda e: e["start"] or "00:00")
+        return {"status": "failed",
+                "error": f"'{keyword or date_iso}'에 해당하는 일정을 찾지 못했습니다. 아무것도 삭제하지 않았습니다.",
+                "events_on_date": [f"{e['title']} ({event_time_text(e)})" for e in same_day]}
+    st.session_state.pending_delete = {"ids": [e["id"] for e in cands], "query": keyword or date_iso}
+    st.session_state.pending_toast = "⚠️ 삭제할 일정을 화면 위 카드에서 확인해 주세요. 승인하기 전에는 지우지 않아요."
+    return {"status": "needs_approval", "kind": "delete",
+            "candidates": [{"no": i + 1, "title": e["title"], "category": e["category"],
+                            "when": f"{fmt_date(parse_date(e['date']))} {event_time_text(e)}"}
+                           for i, e in enumerate(cands)],
+            "message": "아직 삭제하지 않았습니다. 삭제 대상을 보여 주고 김 대리의 승인(번호/전부/취소)을 기다립니다."}
+
+
+def pending_delete_events():
+    p = st.session_state.get("pending_delete")
+    if not p:
+        return []
+    by_id = {e["id"]: e for e in data["events"]}
+    return [by_id[i] for i in p["ids"] if i in by_id]
+
+
+def decide_pending_delete(choice):
+    # 김 대리 승인: 번호(1~5) / all(후보 전부) / cancel(삭제하지 않음)
+    evs = pending_delete_events()
+    if not st.session_state.get("pending_delete"):
+        return {"status": "failed", "error": "삭제 승인을 기다리는 일정이 없습니다."}
+    if choice == "cancel" or not evs:
+        st.session_state.pop("pending_delete", None)
+        return {"status": "success", "decision": "취소", "deleted": []}
+    if choice == "all":
+        targets = evs
+    elif choice.isdigit() and 1 <= int(choice) <= len(evs):
+        targets = [evs[int(choice) - 1]]
+    else:
+        return {"status": "failed", "error": f"{choice}번 일정이 없습니다. 1~{len(evs)}, all, cancel 중에서 골라 주세요."}
+    for e in targets:
+        delete_item("events", e["id"])
+    st.session_state.pop("pending_delete", None)
+    return {"status": "success", "decision": "삭제",
+            "deleted": [f"{e['title']} ({fmt_date(parse_date(e['date']))} {event_time_text(e)})" for e in targets]}
+
+
+def _delete_cb(choice):
+    r = decide_pending_delete(choice)
+    if r["status"] != "success":
+        st.session_state.pending_toast = f"⚠️ {r['error']}"
+    elif r["decision"] == "취소":
+        st.session_state.pending_toast = "일정 삭제를 취소했어요. 일정은 그대로 있어요."
+    else:
+        st.session_state.pending_toast = "일정을 삭제했어요: " + ", ".join(r["deleted"])
+
+
+def render_pending_delete():
+    if not st.session_state.get("pending_delete"):
+        return
+    evs = pending_delete_events()
+    if not evs:                                  # 그 사이 다른 곳에서 지워졌으면 카드 닫기
+        st.session_state.pop("pending_delete", None)
+        return
+    with st.container(border=True):
+        st.error(f"🗑️ 일정 삭제 확인 — '{st.session_state.pending_delete['query']}'에 해당하는 일정 {len(evs)}건")
+        st.caption("승인하기 전에는 삭제하지 않아요. 지울 일정을 골라 주세요. 에이블 비서에게 '1번 지워줘', '취소'라고 말해도 돼요.")
+        for i, e in enumerate(evs):
+            a, b = st.columns([5, 1.3])
+            a.markdown(f"**{i + 1}.** " + event_html(e), unsafe_allow_html=True)
+            b.button("🗑️ 삭제", key=f"pd_del_{e['id']}", on_click=_delete_cb, args=(str(i + 1),), type="primary",
+                     use_container_width=True)
+        c1, c2, _ = st.columns([1.4, 1, 3])
+        if len(evs) > 1:
+            c1.button(f"모두 삭제 ({len(evs)}건)", key="pd_all", on_click=_delete_cb, args=("all",),
+                      use_container_width=True)
+        c2.button("취소", key="pd_cancel", on_click=_delete_cb, args=("cancel",), use_container_width=True)
+
+
 def _decide_cb(choice):
     r = decide_pending(choice)
     if r["status"] == "success":
@@ -1450,6 +1588,7 @@ st.markdown(
     unsafe_allow_html=True)
 
 render_pending_event()
+render_pending_delete()
 
 tab_chat, tab_dash, tab_meet, tab_mail = st.tabs(["🤖 에이블 비서", "📊 대시보드", "🎙️ 회의 분석", "📥 메일 비서"])
 
@@ -1632,14 +1771,17 @@ TOOLS = [
             "properties": {
                 "title": {"type": "string", "description": "일정 제목"},
                 "date": {"type": "string", "description": "날짜 YYYY-MM-DD"},
-                "start": {"type": "string", "description": "시작 시간 HH:MM (24시간), 종일 일정이면 빈 문자열"},
+                "start": {"type": "string",
+                          "description": "시작 시간 HH:MM (24시간), 종일 일정이면 빈 문자열. 오전/오후 없는 1~7시는 오후(예: 2시 → 14:00)"},
                 "end": {"type": "string",
                         "description": "끝나는 시간 HH:MM. 말하지 않았으면 빈 문자열 → 종류별 자동 "
                                        f"({type_guide()})"},
                 "category": {"type": "string", "enum": EVENT_CATS, "description": "일정 종류"},
                 "note": {"type": "string", "description": "메모, 없으면 빈 문자열"},
+                "weekday": {"type": "string", "enum": ["", "월", "화", "수", "목", "금", "토", "일"],
+                            "description": "김 대리가 요일을 말했으면 그 요일(예: 목), 날짜로만 말했으면 빈 문자열"},
             },
-            "required": ["title", "date", "start", "end", "category", "note"], "additionalProperties": False,
+            "required": ["title", "date", "start", "end", "category", "note", "weekday"], "additionalProperties": False,
         },
         "strict": True,
     },
@@ -1654,8 +1796,10 @@ TOOLS = [
                 "date": {"type": "string", "description": "YYYY-MM-DD"},
                 "start": {"type": "string", "description": "HH:MM, 종일이면 빈 문자열"},
                 "end": {"type": "string", "description": "HH:MM, 모르면 빈 문자열(원래 길이 유지)"},
+                "weekday": {"type": "string", "enum": ["", "월", "화", "수", "목", "금", "토", "일"],
+                            "description": "김 대리가 요일을 말했으면 그 요일(예: 목), 날짜로만 말했으면 빈 문자열"},
             },
-            "required": ["id", "date", "start", "end"], "additionalProperties": False,
+            "required": ["id", "date", "start", "end", "weekday"], "additionalProperties": False,
         },
         "strict": True,
     },
@@ -1693,6 +1837,34 @@ TOOLS = [
         "strict": True,
     },
     {
+        "type": "function", "name": "delete_event",
+        "description": "일정을 삭제(취소)해 달라고 할 때 사용합니다. 바로 지우지 않고 삭제 대상을 찾아 화면에 보여 준 뒤 "
+                       "status=needs_approval과 candidates를 돌려줍니다. 김 대리가 승인해야 decide_pending_delete로 삭제됩니다.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "일정 날짜 YYYY-MM-DD ([날짜표]에서 찾기), 날짜를 말하지 않았으면 빈 문자열"},
+                "weekday": {"type": "string", "enum": ["", "월", "화", "수", "목", "금", "토", "일"],
+                            "description": "김 대리가 요일을 말했으면 그 요일, 아니면 빈 문자열"},
+                "keyword": {"type": "string",
+                            "description": "일정을 가리키는 말 그대로(예: '점심 약속', '고객사 미팅'), 없으면 빈 문자열"},
+            },
+            "required": ["date", "weekday", "keyword"], "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function", "name": "decide_pending_delete",
+        "description": "삭제 승인 대기 중인 일정을 김 대리의 대답대로 처리합니다. 김 대리가 승인한 뒤에만 사용합니다. "
+                       "번호(1~5): 그 일정 삭제, all: 후보 전부 삭제, cancel: 삭제하지 않음.",
+        "parameters": {
+            "type": "object",
+            "properties": {"choice": {"type": "string", "enum": ["1", "2", "3", "4", "5", "all", "cancel"]}},
+            "required": ["choice"], "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
         "type": "function", "name": "complete_todo",
         "description": "할 일을 완료 처리합니다. id는 현재 할 일 목록에 있는 값을 사용합니다.",
         "parameters": {
@@ -1706,7 +1878,8 @@ TOOLS = [
 
 TOOL_LABEL = {"send_email": "메일", "add_todo": "할 일 추가", "add_event": "일정 추가",
               "move_event": "일정 변경", "complete_todo": "완료 처리", "decide_pending_event": "일정 승인",
-              "confirm_pending_email": "메일 발송", "get_recent_mails": "받은 메일"}
+              "confirm_pending_email": "메일 발송", "get_recent_mails": "받은 메일",
+              "delete_event": "일정 삭제", "decide_pending_delete": "삭제 승인"}
 
 
 def recent_mails_for_chat(count=5):
@@ -1730,6 +1903,10 @@ def recent_mails_for_chat(count=5):
 def run_tool(name, args):
     if name == "add_todo":
         return add_todo(args["title"], args["due"], args["priority"], args["detail"], "에이블", args["category"])
+    if name in ("add_event", "move_event", "delete_event"):
+        bad = check_weekday(args["date"], args.get("weekday", ""))
+        if bad:
+            return bad
     if name == "add_event":
         return add_event(args["title"], args["date"], args["note"], "에이블", args["start"], args["end"],
                          args["category"])
@@ -1737,6 +1914,10 @@ def run_tool(name, args):
         return move_event(args["id"], args["date"], args["start"], args["end"])
     if name == "decide_pending_event":
         return decide_pending(args["choice"])
+    if name == "delete_event":
+        return request_delete(args["date"], args["keyword"].strip())
+    if name == "decide_pending_delete":
+        return decide_pending_delete(args["choice"])
     if name == "get_recent_mails":
         return recent_mails_for_chat(args["count"])
     if name == "complete_todo":
@@ -1748,6 +1929,13 @@ def action_of(name, args, result):
     label = TOOL_LABEL.get(name, name)
     if not isinstance(result, dict) or result.get("status") == "failed":
         return {"ok": False, "text": f"{label} 실패 ({(result or {}).get('error', '')})"}
+    if name == "delete_event":
+        return {"ok": True, "warn": True, "text": "🗑️ 삭제 승인 대기 → "
+                + ", ".join(f"{c['no']}. {c['title']} ({c['when']})" for c in result["candidates"])}
+    if name == "decide_pending_delete":
+        if result["decision"] == "취소":
+            return {"ok": True, "text": "🗑️ 일정 삭제를 취소했어요 (일정은 그대로 있어요)"}
+        return {"ok": True, "text": "🗑️ 일정 삭제 완료 → " + ", ".join(result["deleted"])}
     if result.get("status") == "needs_approval":
         return {"ok": True, "warn": True,
                 "text": f"일정 충돌 감지 → 승인 대기: {result['title']} ({result['requested']}) · "
@@ -1782,12 +1970,14 @@ def system_prompt():
     lines = [
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 요청한 업무를 최선을 다해 처리합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일), 현재 시각: {now_kst()[11:]}",
+        date_table(),
         f"김 대리 이메일: {my_email() or '(미설정)'}",
         "",
         "규칙",
         "- [현재 업무 데이터], [최근 회의], 첨부 파일, 이전 대화에 있는 내용만 근거로 답합니다.",
         "  근거가 없는 내용은 지어내지 말고 '확인되지 않는 내용입니다'라고 말합니다.",
-        "- '다음 주 금요일', '모레 오후 3시' 같은 표현은 오늘 기준 YYYY-MM-DD, HH:MM으로 바꿔 도구에 넘깁니다.",
+        "- '이번 주 목요일', '모레 오후 3시' 같은 표현은 [날짜표]에서 날짜를 찾아 YYYY-MM-DD, HH:MM으로 도구에 넘깁니다.",
+        "  요일을 말했으면 add_event·move_event의 weekday에 그 요일을 넣습니다. 요일이 맞지 않는다는 결과가 오면 날짜표를 다시 보고 고칩니다.",
         "- 할 일/일정 추가, 일정 변경, 완료 처리를 요청하면 해당 도구를 사용합니다. 제목에 이모티콘을 넣지 않습니다.",
         f"- 일정 종류: {' / '.join(EVENT_CATS)} 중 내용에 맞게 고릅니다. (김 대리가 직접 정한 종류 목록)",
         f"- 할 일 분류: {' / '.join(TODO_CATS)} 중 내용에 맞게 고릅니다.",
@@ -1796,6 +1986,12 @@ def system_prompt():
         "  어떤 일정과 왜 충돌하는지(시간 겹침/간격 n분) 알리고, suggestions의 번호와 시간만 제시한 뒤",
         "  '대체 시간 번호 선택, 원래 시간으로 등록, 취소' 중 고르게 합니다. 다른 시간을 지어내지 않습니다.",
         "  김 대리가 고르면(예: '2번으로', '그냥 원래대로', '취소해') decide_pending_event를 사용합니다.",
+        "- 일정을 취소·삭제해 달라고 하면(예: '금요일 점심 약속 취소해줘') delete_event를 사용합니다. 바로 지워지지 않습니다.",
+        "  결과의 candidates를 번호·제목·시간과 함께 알려 주고 '이 일정을 삭제할까요?'라고 묻습니다.",
+        "  같은 답변 안에서 decide_pending_delete를 호출하지 않고, 반드시 김 대리의 다음 대답을 기다립니다.",
+        "  김 대리가 '응/지워줘/1번'이라고 하면 decide_pending_delete(번호, 후보가 하나면 1), '전부' → all,",
+        "  '아니/하지 마/취소'라고 하면 cancel입니다. (삭제 승인 대기 중의 '취소'는 삭제를 그만두라는 뜻)",
+        "  찾지 못했으면(failed) events_on_date를 알려 주고 어떤 일정인지 묻습니다. 삭제했다고 지어내지 않습니다.",
         "- 이메일로 보내 달라는 명시적 요청이 있을 때만 send_email을 사용합니다.",
         "  받는 사람을 말하지 않으면 to에 '나'를 넣습니다. 연락처에 있는 사람은 이름으로 넣을 수 있고,",
         "  연락처에 없는 사람의 이메일 주소는 절대 지어내지 않습니다.",
@@ -1821,6 +2017,10 @@ def system_prompt():
         lines += ["[승인 대기 중인 일정]",
                   f"{f['title']} ({f['date']} {event_time_text(f)}, {f['category']}) — 대체 시간: "
                   + ", ".join(f"{i + 1}) {slot_text(x)}" for i, x in enumerate(p["suggestions"])), ""]
+    pd_evs = pending_delete_events()
+    if pd_evs:
+        lines += ["[삭제 승인 대기 중인 일정] (아직 삭제하지 않음)"]
+        lines += [f"{i + 1}) {e['title']} ({e['date']} {event_time_text(e)})" for i, e in enumerate(pd_evs)] + [""]
     note = latest_note()
     if note:
         lines += [f"[최근 회의] {note['title']} ({note['when']})", "요약:"]
@@ -1965,6 +2165,7 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
 
     client = get_client()
     actions, mail = [], None
+    asked_delete = False                 # 이번 답변에서 삭제 대상을 보여 줬으면 같은 답변에서는 삭제 금지
     for _ in range(5):  # 도구 호출은 최대 5회 반복
         resp = client.responses.create(model=MODEL, instructions=instructions, input=inputs, tools=TOOLS)
         calls = [i for i in resp.output if i.type == "function_call"]
@@ -1978,10 +2179,18 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
                 mail = new_mail or mail
             elif c.name == "confirm_pending_email":
                 result, act = confirm_pending_mail(chat, args["action"], mail)
+            elif c.name == "decide_pending_delete" and asked_delete and args["choice"] != "cancel":
+                result = {"status": "failed", "retry": True,
+                          "error": "삭제 대상을 방금 보여 드렸습니다. 김 대리의 승인 대답을 받은 뒤에만 삭제할 수 있습니다. "
+                                   "지금은 삭제 대상을 알려 주고 삭제할지 물어보세요."}
+                act = None
             else:
                 result = run_tool(c.name, args)
                 act = action_of(c.name, args, result)
-            actions.append(act)
+                if c.name == "delete_event" and result.get("status") == "needs_approval":
+                    asked_delete = True
+            if not (isinstance(result, dict) and result.get("retry")):
+                actions.append(act)
             inputs.append({"type": "function_call_output", "call_id": c.call_id,
                            "output": json.dumps(result, ensure_ascii=False)})
     return resp.output_text or "요청을 처리했습니다.", actions, mail
@@ -2169,6 +2378,7 @@ def analyze_meeting(text, title="", attendees=""):
     instructions = "\n".join([
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 회의 원문을 분석합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일). 회의는 오늘 열렸다고 가정합니다.",
+        date_table(),
         "원문이 음성 인식 결과일 수 있어 오탈자가 있을 수 있습니다. 문맥상 분명한 것만 바로잡습니다.",
         "",
         "[작성 규칙]",
@@ -2455,6 +2665,7 @@ def analyze_mails(mails):
     instructions = "\n".join([
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 받은 메일을 분석합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일). 여기서 '원문'은 각 메일의 제목과 본문입니다.",
+        date_table(),
         "메일마다 index(입력 번호 그대로), category, summary(1~2문장), kim_tasks, events, needs_reply, reply_draft를 씁니다.",
         *TASK_RULES,
         "- 메일을 받은 김 대리에게 요청된 일이 kim_tasks입니다. 광고·자동 알림·단순 공유면 빈 배열.",
