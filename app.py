@@ -8,6 +8,8 @@
 #   메인 탭  : 🤖 에이블 비서 (음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
 #              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
+#   회의 코파일럿: 회의 중 30초~1분 구간 녹음 → 김 대리 업무·일정 충돌·지난 기록 귓속말 → 종료 시 회의록
+#   보고 리허설: 팀장님 스타일 분석 → 예상 질문 음성 → 답변 코칭 → 준비할 것 정리
 #   사이드바 : 🔎 업무 기록 검색(RAG) / 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
 #   일정     : 종류별 색상·소요시간 추정(체크인 20/회의 30/온라인 45/고객사 60분), 겹치거나 간격 10분 미만이면
 #              충돌 감지 → 대체 시간 3개 추천 → 승인(대체 시간/원래 시간/취소), 음성·텍스트 요청도 동일하게 검사
@@ -33,11 +35,6 @@ from email.utils import parseaddr, parsedate_to_datetime
 import numpy as np
 import streamlit as st
 from openai import OpenAI
-
-import os
-os.makedirs(".streamlit", exist_ok=True)
-with open(".streamlit/config.toml", "w") as f:
-    f.write("[server]\nenableXsrfProtection = false\nenableCORS = false\nmaxUploadSize = 50\n")
 
 # ─────────────────────────────────────────────
 # 기본 설정
@@ -106,7 +103,7 @@ def gmail_ready():
 # 데이터 저장/불러오기
 # ─────────────────────────────────────────────
 DATA_DEFAULTS = {"todos": [], "events": [], "meeting_notes": [], "mail_summaries": {},
-                 "processed_mails": [], "settings": {}, "contacts": [], "chats": [],
+                 "processed_mails": [], "settings": {}, "contacts": [], "chats": [], "rehearsals": [], "copilot": {},
                  "mail_analysis": {"when": "", "mails": []}}
 
 
@@ -1598,7 +1595,8 @@ st.markdown(
 render_pending_event()
 render_pending_delete()
 
-tab_chat, tab_dash, tab_meet, tab_mail = st.tabs(["🤖 에이블 비서", "📊 대시보드", "🎙️ 회의 분석", "📥 메일 비서"])
+tab_chat, tab_dash, tab_meet, tab_rh, tab_mail = st.tabs(["🤖 에이블 비서", "📊 대시보드", "🎙️ 회의 분석",
+                                                       "🎤 보고 리허설", "📥 메일 비서"])
 
 # ===== 대시보드 =====
 with tab_dash:
@@ -1904,7 +1902,7 @@ CHUNK_SIZE = 700         # 조각 하나의 글자 수
 CHUNK_OVERLAP = 120      # 조각끼리 겹치는 글자 수 (문장이 잘려도 앞뒤 맥락 유지)
 RAG_TOP_K = 6            # 답변 근거로 쓸 조각 수
 RAG_MIN_SCORE = 0.25     # 이보다 낮으면 '관련 기록 없음'
-RAG_KINDS = {"meeting": "📝 회의", "mail": "📥 메일", "chat": "💬 대화", "todo": "✅ 할 일", "event": "📅 일정"}
+RAG_KINDS = {"meeting": "📝 회의", "mail": "📥 메일", "chat": "💬 대화", "todo": "✅ 할 일", "event": "📅 일정", "rehearsal": "🎤 리허설"}
 RAG_SCOPES = {"전체": None, "회의": ["meeting"], "메일": ["mail"], "대화": ["chat"], "할 일·일정": ["todo", "event"]}
 
 
@@ -1970,6 +1968,16 @@ def collect_records():
         body = (f"일정: {e['title']} / {e['date']} {event_time_text(e)} / 종류: {e['category']}"
                 + (f"\n메모: {e['note']}" if e.get("note") else ""))
         add("event", e["id"], e["title"], e["date"], body)
+
+    for r in data.get("rehearsals", []):
+        if not r.get("report"):
+            continue
+        boss = r["boss"]["name"]
+        body = "\n".join([f"보고 상대: {boss} / 총평: {r['report']['overall']}"]
+                         + [f"질문: {q['q']} → {q['eval']['score']}점, 보완: {', '.join(q['eval']['missing'])}"
+                            for q in r["questions"] if q.get("eval")]
+                         + [f"준비할 것: {x['title']}" for x in r["report"]["prep_items"]])
+        add("rehearsal", r["id"], r["topic"], r["when"], body, f"[보고 리허설] {r['topic']}")
 
     for r in recs:
         r["key"] = hashlib.sha1(f"{r['kind']}|{r['src_id']}|{r['text']}".encode("utf-8")).hexdigest()
@@ -2736,10 +2744,425 @@ def note_markdown(n):
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────
+# ⚡ 실시간 회의 코파일럿 (회의 중 귓속말)
+#   회의를 30초~1분씩 끊어 녹음 → 멈추는 즉시 받아쓰기 → 방금 나온 말에서
+#     · 김 대리에게 맡겨진 업무      → "그날 이미 고객사 미팅이 있어요" (캘린더·할 일 대조)
+#     · 새로 잡는 회의·일정          → 시간 충돌 확인 + 대체 시간 제안
+#     · "지난번에 정한 예산" 같은 언급 → 업무 기록 검색(RAG)으로 바로 찾아 출처와 함께
+#     · 김 대리에게 던진 질문        → 지난 기록에서 답변 힌트
+#   를 찾아 오른쪽 '귓속말' 카드로 알림 (원하면 이어폰용 음성). 회의가 끝나면 그대로 회의록 생성.
+# ─────────────────────────────────────────────
+def ask_json(instructions, user_input, name, schema):
+    # 구조화된 JSON 답변 공통 함수 (코파일럿·보고 리허설에서 사용)
+    resp = get_client().responses.create(
+        model=MODEL, instructions=instructions, input=user_input,
+        text={"format": {"type": "json_schema", "name": name, "schema": schema, "strict": True}})
+    return json.loads(resp.output_text)
+
+
+CP_MAX_LOOKUPS = 2        # 구간마다 기록 검색은 최대 2번 (속도·비용)
+CP_COLORS = {"task": "#2563eb", "conflict": "#dc2626", "free": "#16a34a", "lookup": "#7c3aed",
+             "question": "#d97706", "info": "#64748b"}
+
+CP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kim_tasks": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "업무 이름 (짧게)"},
+                "requester": {"type": "string", "description": "맡긴 사람, 없으면 빈 문자열"},
+                "due_text": {"type": "string", "description": "기한 표현 원문 그대로, 없으면 빈 문자열"},
+                "due_date": {"type": "string", "description": "날짜가 구체적일 때만 YYYY-MM-DD, 아니면 빈 문자열"},
+                "priority": {"type": "string", "enum": PRIORITIES},
+                "evidence": {"type": "string", "description": "[새로 들린 말]에서 글자 그대로 복사한 근거 문장"},
+            },
+            "required": ["title", "requester", "due_text", "due_date", "priority", "evidence"],
+            "additionalProperties": False}},
+        "schedules": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "date": {"type": "string", "description": "YYYY-MM-DD, 모르면 빈 문자열"},
+                "start": {"type": "string", "description": "HH:MM, 모르면 빈 문자열. 오전/오후 없는 1~7시는 오후"},
+                "end": {"type": "string", "description": "HH:MM, 말하지 않았으면 빈 문자열"},
+                "kim_attends": {"type": "boolean", "description": "김 대리가 참석·관련되는 일정인지"},
+                "evidence": {"type": "string", "description": "[새로 들린 말]에서 글자 그대로 복사한 근거 문장"},
+            },
+            "required": ["title", "date", "start", "end", "kim_attends", "evidence"],
+            "additionalProperties": False}},
+        "lookups": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "지난 기록에서 찾을 검색어 (핵심 단어 위주)"},
+                "reason": {"type": "string", "description": "왜 찾아야 하는지 짧게"},
+                "evidence": {"type": "string", "description": "[새로 들린 말]에서 글자 그대로 복사한 근거 문장"},
+            },
+            "required": ["query", "reason", "evidence"], "additionalProperties": False}},
+        "questions_to_kim": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "김 대리에게 물은 내용 요약"},
+                "query": {"type": "string", "description": "답을 찾을 검색어"},
+                "evidence": {"type": "string", "description": "[새로 들린 말]에서 글자 그대로 복사한 근거 문장"},
+            },
+            "required": ["question", "query", "evidence"], "additionalProperties": False}},
+    },
+    "required": ["kim_tasks", "schedules", "lookups", "questions_to_kim"],
+    "additionalProperties": False,
+}
+
+
+def cp_state():
+    cp = data.get("copilot") or {}
+    return cp if cp.get("active") else None
+
+
+def cp_start(title, attendees):
+    data["copilot"] = {"active": True, "title": title.strip(), "attendees": attendees.strip(), "started": now_kst(),
+                       "segments": [], "whispers": [], "seen": []}
+    save_data()
+    st.session_state.cp_n = st.session_state.get("cp_n", 0) + 1
+
+
+def cp_transcript(cp):
+    return "\n".join(s["text"] for s in cp["segments"])
+
+
+def cp_detect(cp, new_text):
+    # 방금 들린 구간에서 귓속말 거리 찾기 (앞 내용은 맥락으로만 사용)
+    before = cp_transcript(cp)[-1500:]
+    instructions = "\n".join([
+        "당신은 회의에 함께 앉아 있는 김 대리의 비서 '에이블'입니다. 회의를 실시간으로 듣고 있습니다.",
+        f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일)",
+        date_table(),
+        f"회의: {cp['title'] or '(제목 없음)'} / 참석자: {cp['attendees'] or '(입력 없음)'}",
+        "",
+        "[찾을 것] — 반드시 [새로 들린 말]에 나온 것만. [앞 내용]은 맥락을 이해하는 데만 씁니다.",
+        "- kim_tasks: '김대리/김 대리'에게 맡겨진 업무. 다른 사람 업무는 넣지 않습니다.",
+        "- schedules: 회의에서 새로 잡거나 언급한 회의·일정·마감 행사.",
+        "- lookups: '지난번에 정한 ~', '그때 그 견적', '저번 회의에서 ~'처럼 지난 기록을 확인해야 하는 언급,",
+        "  또는 숫자·결정 사항을 두고 참석자들이 기억이 엇갈리는 부분.",
+        "- questions_to_kim: 김 대리에게 직접 묻거나 확인을 요청한 질문.",
+        "- evidence는 [새로 들린 말]에서 글자 그대로 복사합니다. 음성 인식 결과라 오탈자가 있어도 고치지 않고 그대로 옮깁니다.",
+        "- 해당하는 것이 없으면 빈 배열로 둡니다. 억지로 만들지 않습니다.",
+        "- [이미 알린 것]에 있는 내용은 다시 넣지 않습니다.",
+    ])
+    return ask_json(instructions,
+                    f"[이미 알린 것]\n{', '.join(cp['seen'][-30:]) or '(없음)'}\n\n[앞 내용]\n{before or '(회의 시작)'}"
+                    f"\n\n[새로 들린 말]\n{new_text}", "copilot_detect", CP_SCHEMA)
+
+
+def cp_whisper(cp, kind, title, body, payload=None, sources=None):
+    key = _squash(f"{kind}{title}")[:40]
+    if key in cp["seen"]:
+        return None
+    cp["seen"].append(key)
+    w = {"id": uuid.uuid4().hex[:6], "time": now_kst()[11:16], "kind": kind, "title": title, "body": body,
+         "payload": payload or {}, "sources": sources or [], "done": ""}
+    cp["whispers"].insert(0, w)
+    return w
+
+
+def day_brief(d_iso):
+    evs = sorted([e for e in data["events"] if e["date"] == d_iso], key=lambda e: e["start"] or "00:00")
+    tds = [t for t in data["todos"] if not t["done"] and t["due"] == d_iso]
+    return evs, tds
+
+
+def cp_process(cp, new_text):
+    # 구간 하나 처리 → 새 귓속말 목록
+    new_text = new_text.strip()
+    if not new_text:
+        return []
+    found = cp_detect(cp, new_text)
+    cp["segments"].append({"time": now_kst()[11:16], "text": new_text})
+    out = []
+
+    for t in found["kim_tasks"]:
+        if not found_in(t["evidence"], new_text):
+            continue                                     # 들린 말에 근거가 없으면 귓속말하지 않음
+        d = parse_date(t["due_date"])
+        lines = [f"“{t['evidence']}”"]
+        if d:
+            evs, tds = day_brief(d.isoformat())
+            due = f"{fmt_date(d)} ({d_day(d)})"
+            if evs:
+                lines.append(f"그날 이미 일정 {len(evs)}건: " + ", ".join(f"{e['title']} {event_time_text(e)}" for e in evs[:3]))
+            if tds:
+                lines.append(f"그날 마감인 할 일도 {len(tds)}건 있어요: " + ", ".join(x["title"] for x in tds[:3]))
+            if not evs and not tds:
+                lines.append("그날은 다른 일정·마감이 없어요.")
+            if d.weekday() >= 5:
+                lines.append("⚠️ 주말이에요. 날짜를 한 번 확인해 보세요.")
+        else:
+            due = t["due_text"] or "기한 언급 없음"
+            lines.append("기한이 정확하지 않아요. 회의 중에 날짜를 확인해 두면 좋아요." if t["due_text"] else
+                         "기한을 정하지 않았어요. '언제까지 드리면 될까요?'라고 물어보세요.")
+        w = cp_whisper(cp, "task", f"📌 김 대리님 업무: {t['title']} · {due}", "\n".join(lines),
+                       {"title": t["title"], "due": d.isoformat() if d else "", "priority": t["priority"],
+                        "detail": (f"요청: {t['requester']} / " if t["requester"] else "") + f"기한: {t['due_text'] or '없음'}"})
+        if w:
+            out.append(w)
+
+    for s in found["schedules"]:
+        if not found_in(s["evidence"], new_text) or not parse_date(s["date"]):
+            continue
+        f = build_event(s["title"], s["date"], s["start"], s["end"], "", f"회의 중 언급: {s['evidence']}")
+        when = f"{fmt_date(parse_date(f['date']))} {event_time_text(f)}"
+        payload = {"title": f["title"], "date": f["date"], "start": f["start"], "end": f["end"],
+                   "category": f["category"], "note": f["note"]}
+        if not f["start"]:
+            evs, _ = day_brief(f["date"])
+            body = ("그날 일정: " + ", ".join(f"{e['title']} {event_time_text(e)}" for e in evs)) if evs else "그날은 비어 있어요."
+            w = cp_whisper(cp, "info", f"📅 일정 언급: {f['title']} · {when}", body + " 시간을 정하면 충돌도 바로 확인해 드릴게요.", payload)
+        else:
+            conflicts = find_conflicts(f["date"], f["start"], f["end"])
+            if conflicts:
+                alts = suggest_slots(f["date"], f["start"], f["end"])
+                body = ("겹치는 일정: " + ", ".join(conflict_text(c) for c in conflicts)
+                        + ("\n이 시간은 비어 있어요: " + " / ".join(slot_text(a) for a in alts) if alts else ""))
+                if not s["kim_attends"]:
+                    body += "\n(김 대리님 참석 일정이 아니라면 무시해도 돼요.)"
+                w = cp_whisper(cp, "conflict", f"⚠️ 시간 충돌: {f['title']} · {when}", body, payload)
+            else:
+                w = cp_whisper(cp, "free", f"✅ 가능해요: {f['title']} · {when}",
+                               "김 대리님 캘린더에서 그 시간은 비어 있어요.", payload)
+        if w:
+            out.append(w)
+
+    asks = [("lookup", f"🔎 지난 기록: {x['reason']}", x["query"], x["evidence"]) for x in found["lookups"]]
+    asks += [("question", f"💬 답변 힌트: {x['question']}", x["query"], x["evidence"]) for x in found["questions_to_kim"]]
+    for kind, title, query, ev in asks[:CP_MAX_LOOKUPS]:
+        if not found_in(ev, new_text) or _squash(f"{kind}{title}")[:40] in cp["seen"]:
+            continue
+        r = rag_answer(query)
+        if not r["ok"] or not r["hits"]:
+            continue                                     # 찾지 못한 건 귓속말하지 않음 (회의 방해 X)
+        w = cp_whisper(cp, kind, title, r["answer"], {"query": query},
+                       [f"[{h['no']}] {h['kind_label']} · {h['title']} · {h['when']}" for h in r["hits"]])
+        if w:
+            out.append(w)
+
+    save_data()
+    return out
+
+
+def cp_finish(cp):
+    # 회의 종료 → 전체 받아쓰기로 회의록 생성 (회의 분석과 같은 방식, 귓속말도 함께 보관)
+    text = cp_transcript(cp)
+    res = analyze_meeting(text, cp["title"], cp["attendees"])
+    tasks = apply_kim_tasks(res["kim_tasks"], text, "회의 코파일럿")
+    note = {
+        "id": uuid.uuid4().hex[:8],
+        "title": cp["title"] or res["title_guess"].strip() or f"{today.isoformat()} 회의",
+        "when": now_kst(), "attendees": cp["attendees"], "source": "실시간 코파일럿",
+        "text": text, "summary": res["summary"], "decisions": res["decisions"], "kim_tasks": tasks,
+        "schedules": [dict(s, verified=found_in(s["evidence"], text)) for s in res["schedules"]],
+        "whispers": [{k: w[k] for k in ("time", "title", "body")} for w in reversed(cp["whispers"])],
+    }
+    data["meeting_notes"].insert(0, note)
+    del data["meeting_notes"][20:]
+    data["copilot"] = {}
+    save_data()
+    return note, tasks
+
+
+def _cp_todo_cb(wid):
+    cp = cp_state()
+    w = next((x for x in cp["whispers"] if x["id"] == wid), None) if cp else None
+    if not w:
+        return
+    p = w["payload"]
+    if p["title"].strip() in {t["title"].strip() for t in data["todos"] if not t["done"]}:
+        w["done"] = "이미 할 일에 있어요"
+    else:
+        add_todo(p["title"], p["due"], p["priority"], p["detail"], "회의 코파일럿")
+        w["done"] = "할 일에 추가했어요"
+    save_data()
+
+
+def _cp_event_cb(wid):
+    cp = cp_state()
+    w = next((x for x in cp["whispers"] if x["id"] == wid), None) if cp else None
+    if not w:
+        return
+    p = w["payload"]
+    r = add_event(p["title"], p["date"], p["note"], "회의 코파일럿", p["start"], p["end"], p["category"])
+    w["done"] = ("캘린더에 등록했어요" if r["status"] == "success" else
+                 "겹치는 일정이 있어 화면 위 카드에서 시간을 골라 주세요" if r["status"] == "needs_approval" else
+                 f"등록 실패: {r.get('error', '')}")
+    save_data()
+
+
+def _cp_hide_cb(wid):
+    cp = cp_state()
+    if cp:
+        cp["whispers"] = [x for x in cp["whispers"] if x["id"] != wid]
+        save_data()
+
+
+def _cp_cancel_cb():
+    data["copilot"] = {}
+    save_data()
+    st.session_state.pop("cp_demo", None)
+    st.session_state.pending_toast = "코파일럿을 끝냈어요. 받아쓴 내용은 저장하지 않았어요."
+
+
+def cp_demo_segments(text, size=260):
+    # 데모용: 대본을 문장 단위로 묶어 '실시간으로 들리는 것처럼' 한 구간씩 넣음
+    sents = [x.strip() for x in re.split(r"(?<=[.?!다요])\s+|\n+", text) if x.strip()]
+    out, cur = [], ""
+    for s in sents:
+        if cur and len(cur) + len(s) > size:
+            out.append(cur)
+            cur = ""
+        cur = (cur + " " + s).strip()
+    return out + ([cur] if cur else [])
+
+
+def render_whisper(w, live=True):
+    color = CP_COLORS.get(w["kind"], "#64748b")
+    st.markdown(f"<div style='border-left:4px solid {color}; padding:6px 10px; margin:2px 0 4px;"
+                f" background:rgba(128,128,128,.07); border-radius:6px'>"
+                f"<div style='font-weight:600'>{html.escape(w['title'])}</div>"
+                f"<div class='able-meta' style='white-space:pre-wrap'>{html.escape(w['body'])}</div>"
+                f"<div class='able-meta' style='font-size:.72rem'>{w['time']}</div></div>", unsafe_allow_html=True)
+    for s in w.get("sources", []):
+        st.caption(s)
+    if not live:
+        return
+    if w["done"]:
+        st.caption(f"✔ {w['done']}")
+        return
+    cols = st.columns([1.3, 1.3, 1], gap="small")
+    if w["kind"] == "task":
+        cols[0].button("➕ 할 일에 추가", key=f"cpt_{w['id']}", on_click=_cp_todo_cb, args=(w["id"],), use_container_width=True)
+    if w["kind"] in ("free", "conflict", "info") and w["payload"].get("start"):
+        cols[0].button("📅 일정 등록", key=f"cpe_{w['id']}", on_click=_cp_event_cb, args=(w["id"],), use_container_width=True)
+    cols[2].button("✖", key=f"cph_{w['id']}", on_click=_cp_hide_cb, args=(w["id"],), help="이 귓속말 지우기",
+                   use_container_width=True)
+
+
+def render_copilot():
+    st.session_state.setdefault("cp_n", 0)
+    for msg in st.session_state.pop("cp_toasts", []):       # 새 귓속말은 화면 구석에 살짝 알림
+        st.toast(msg, icon="🤫")
+    cp = cp_state()
+    with st.container(border=True, key="cp_box"):
+        st.markdown("#### ⚡ 실시간 회의 코파일럿")
+        st.caption("회의 중에 30초~1분씩 녹음하면, 멈출 때마다 바로 받아쓰고 **김 대리 업무·일정 충돌·지난 기록**을 귓속말로 알려 드려요. "
+                   "회의를 마치면 그대로 회의록이 만들어집니다.")
+        if cp is None:
+            c1, c2 = st.columns(2)
+            title = c1.text_input("회의 제목", key="cp_title", placeholder="예: 신제품 출시 주간 회의")
+            people = c2.text_input("참석자", key="cp_people", placeholder="예: 팀장, 박과장, 이과장")
+            if st.button("▶ 회의 시작 (코파일럿 켜기)", type="primary", key="cp_go", use_container_width=True):
+                cp_start(title, people)
+                st.rerun()
+            return
+
+        n_seg, n_w = len(cp["segments"]), len(cp["whispers"])
+        st.markdown(f"🔴 **진행 중** · {cp['title'] or '제목 없는 회의'} · 시작 {cp['started'][11:16]} · "
+                    f"받아쓴 구간 {n_seg}개 · 귓속말 {n_w}개")
+        left, right = st.columns([1.05, 1], gap="medium")
+
+        with left:
+            n = st.session_state.cp_n
+            new_text, src = "", ""
+            if hasattr(st, "audio_input"):
+                rec = st.audio_input("🎙️ 녹음 → 멈추면 바로 분석 (30초~1분 권장)", key=f"cp_mic_{n}")
+                if rec is not None:
+                    src = "voice"
+            else:
+                rec = None
+                st.warning("녹음을 쓰려면 `!pip install -q -U streamlit`으로 업데이트하세요. 아래에 글로 넣어도 돼요.")
+            with st.form(f"cp_typed_{n}", clear_on_submit=True, border=False):
+                typed = st.text_input("✍️ 들은 말 직접 넣기", placeholder="예) 김 대리가 금요일까지 견적 비교표 정리해 줘요")
+                if st.form_submit_button("넣기", use_container_width=True) and typed.strip():
+                    new_text, src = typed, "typed"
+            with st.expander("🎬 발표·시연용: 회의 대본으로 실시간 흉내 내기"):
+                demo = st.session_state.get("cp_demo")
+                if not demo:
+                    script = st.text_area("회의 대본", key="cp_script", height=120,
+                                          placeholder="팀장: 김 대리, 이번 주 금요일까지 경쟁사 가격 조사 부탁해요. …")
+                    if st.button("대본 준비", key="cp_demo_ready", disabled=not script.strip()):
+                        st.session_state.cp_demo = {"parts": cp_demo_segments(script), "pos": 0}
+                        st.rerun()
+                else:
+                    st.caption(f"{demo['pos']} / {len(demo['parts'])} 구간 진행")
+                    if demo["pos"] < len(demo["parts"]):
+                        st.markdown(f":gray[다음 구간: {demo['parts'][demo['pos']][:80]}…]")
+                        if st.button("▶ 다음 구간 듣기", key="cp_demo_next", type="primary", use_container_width=True):
+                            new_text, src = demo["parts"][demo["pos"]], "demo"
+                            demo["pos"] += 1
+                    else:
+                        st.caption("대본을 모두 넣었어요.")
+                    if st.button("대본 지우기", key="cp_demo_clear"):
+                        st.session_state.pop("cp_demo", None)
+                        st.rerun()
+
+            if src:
+                try:
+                    with st.spinner("듣고 확인하는 중…"):
+                        if src == "voice":
+                            a_bytes, a_name = shrink_audio(rec.getvalue(), "segment.wav")
+                            hint = f"회사 회의 녹음입니다. 참석자: {cp['attendees']}. " + cp_transcript(cp)[-150:]
+                            new_text = speech_to_text(a_bytes, a_name, hint)
+                        fresh = cp_process(cp, new_text)
+                    st.session_state.cp_n = n + 1                          # 녹음기 비우고 다음 구간 대기
+                    st.session_state.cp_toasts = [w["title"] for w in fresh][:3]
+                    if fresh and st.session_state.get("cp_voice"):
+                        st.session_state.cp_speak = " ".join(re.sub(r"^\W+", "", w["title"]) for w in fresh[:2])
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"이 구간을 처리하지 못했어요: {e}")
+
+            st.markdown("**📝 받아쓴 내용**")
+            with st.container(height=260, border=True):
+                if not cp["segments"]:
+                    st.caption("아직 받아쓴 내용이 없어요. 녹음을 시작해 보세요.")
+                for s in reversed(cp["segments"]):
+                    st.markdown(f":gray[{s['time']}] {s['text']}")
+
+        with right:
+            h1, h2 = st.columns([1.4, 1])
+            h1.markdown("**🤫 귓속말**")
+            h2.toggle("🎧 음성", key="cp_voice", help="이어폰을 끼고 있을 때 새 귓속말을 소리로 들려줘요")
+            speak = st.session_state.pop("cp_speak", None)
+            if speak:
+                try:
+                    st.audio(text_to_speech(speak, "shimmer"), format="audio/mp3", autoplay=True)
+                except Exception:
+                    pass
+            with st.container(height=470, border=False):
+                if not cp["whispers"]:
+                    st.caption("회의 내용에서 김 대리님이 챙길 것이 들리면 여기에 알려 드릴게요.")
+                for w in cp["whispers"]:
+                    render_whisper(w)
+
+        b1, b2 = st.columns([2, 1])
+        if b1.button("⏹ 회의 종료 · 회의록 만들기", type="primary", key="cp_end", use_container_width=True,
+                     disabled=not cp["segments"]):
+            try:
+                with st.spinner("전체 회의 내용을 정리하는 중…"):
+                    note, tasks = cp_finish(cp)
+                st.session_state.pop("cp_demo", None)
+                st.session_state.meet_view = note["id"]
+                n_add = sum(t["status"] in ("calendar", "approximate", "nodue") for t in tasks)
+                st.session_state.pending_toast = f"회의록을 만들었어요. 새로 추가된 김 대리 업무 {n_add}건."
+                st.rerun()
+            except Exception as e:
+                st.error(f"회의록을 만들지 못했어요: {e}")
+        b2.button("취소 (저장 안 함)", key="cp_cancel", on_click=_cp_cancel_cb, use_container_width=True)
+
+
 with tab_meet:
     st.markdown("회의를 녹음하거나 녹음·텍스트 파일을 올리면 에이블이 요약하고 **김 대리 업무만** 할 일에 올립니다.")
     st.caption("📅 정확한 날짜가 있는 김 대리 업무만 캘린더에 들어갑니다. 대략적인 기한이나 다른 일정은 이 화면에서만 보여 드려요. "
                "원문에서 근거를 찾지 못한 내용은 추가하지 않습니다.")
+    render_copilot()
 
     with st.container(border=True):
         mode = st.radio("분석 방법", ["🎙️ 실시간 녹음", "📁 음성 파일 분석", "📄 텍스트 파일 분석"],
@@ -2916,6 +3339,436 @@ with tab_meet:
             st.rerun()
         with st.expander("🗣️ 회의 원문 / 녹취록 보기"):
             st.text(n["text"])
+        if n.get("whispers"):
+            with st.expander(f"🤫 회의 중 귓속말 기록 ({len(n['whispers'])}개)"):
+                for w in n["whispers"]:
+                    st.markdown(f"**{w['time']} · {w['title']}**")
+                    st.caption(w["body"])
+
+
+# ─────────────────────────────────────────────
+# 🎤 보고 리허설 (팀장님 시뮬레이터)
+#   ① 지난 회의록·메일·대화에서 보고 상대(예: 팀장님)가 자주 묻던 것을 찾아 '스타일' 분석
+#   ② 보고 자료를 보고 그 스타일대로 예상 질문을 만들어 음성으로 질문
+#   ③ 김 대리가 말(또는 글)로 답하면 바로 채점·보완점 + 답이 약하면 꼬리질문 1번
+#   ④ 끝나면 막힌 질문·보완할 자료 정리 → 할 일로 추가, 막힌 질문만 다시 연습
+# ─────────────────────────────────────────────
+MAX_REHEARSALS = 10
+RH_VOICES = {"onyx": "낮고 묵직한", "echo": "차분한", "alloy": "기본", "nova": "밝은", "shimmer": "부드러운"}
+RH_DEFAULT_STYLE = {
+    "style_summary": "지난 기록이 부족해 일반적인 팀장님 스타일로 질문합니다. 결론, 근거, 일정, 리스크를 주로 확인합니다.",
+    "focus_points": ["결론을 먼저 말하는지", "숫자와 근거가 있는지", "일정과 리스크 대응", "비용·인력 등 필요한 지원"],
+    "tone": "차분하지만 핵심을 바로 묻는 말투",
+    "evidence": [],
+    "from_records": False,
+}
+
+PERSONA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "style_summary": {"type": "string", "description": "이 사람이 보고를 받을 때의 특징 2~3문장"},
+        "focus_points": {"type": "array", "items": {"type": "string"}, "description": "자주 확인하는 것 3~5개"},
+        "tone": {"type": "string", "description": "말투 한 줄"},
+        "evidence": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"point": {"type": "string"}, "source_no": {"type": "integer"},
+                           "quote": {"type": "string", "description": "기록 원문에서 그대로 옮긴 짧은 구절"}},
+            "required": ["point", "source_no", "quote"], "additionalProperties": False}},
+    },
+    "required": ["style_summary", "focus_points", "tone", "evidence"],
+    "additionalProperties": False,
+}
+
+RH_QUESTIONS_SCHEMA = {
+    "type": "object",
+    "properties": {"questions": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "보고 상대가 김 대리에게 실제로 말하듯 묻는 질문 1~2문장"},
+            "intent": {"type": "string", "description": "이 질문으로 확인하려는 것 (짧게)"},
+            "key_points": {"type": "array", "items": {"type": "string"},
+                           "description": "좋은 답변에 들어가야 할 요소 2~4개"},
+        },
+        "required": ["question", "intent", "key_points"], "additionalProperties": False}}},
+    "required": ["questions"], "additionalProperties": False,
+}
+
+RH_EVAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "integer", "description": "1~5점 (5: 바로 통과, 3: 보완 필요, 1: 답하지 못함)"},
+        "good": {"type": "string", "description": "잘한 점 한 문장, 없으면 빈 문자열"},
+        "missing": {"type": "array", "items": {"type": "string"}, "description": "빠졌거나 약한 점"},
+        "better_answer": {"type": "string", "description": "보고 자료에 있는 내용만으로 만든 모범 답변 2~4문장"},
+        "follow_up": {"type": "string", "description": "답이 약할 때 보고 상대가 이어서 물을 꼬리질문, 필요 없으면 빈 문자열"},
+        "boss_reaction": {"type": "string", "description": "보고 상대가 답을 듣고 하는 짧은 한마디"},
+    },
+    "required": ["score", "good", "missing", "better_answer", "follow_up", "boss_reaction"],
+    "additionalProperties": False,
+}
+
+RH_REPORT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "overall": {"type": "string", "description": "전체 총평 2~3문장"},
+        "strengths": {"type": "array", "items": {"type": "string"}},
+        "prep_items": {"type": "array", "description": "보고 전에 준비·보완할 자료 2~5개", "items": {
+            "type": "object",
+            "properties": {"title": {"type": "string", "description": "할 일 제목으로 쓸 수 있게 짧게"},
+                           "why": {"type": "string"}},
+            "required": ["title", "why"], "additionalProperties": False}},
+    },
+    "required": ["overall", "strengths", "prep_items"],
+    "additionalProperties": False,
+}
+
+
+def boss_choices():
+    # 연락처에 있는 사람 + 기본값 '팀장님'
+    out = {"팀장님 (연락처 없이)": {"name": "팀장님", "role": "", "memo": ""}}
+    for c in data["contacts"]:
+        out[contact_label(c)] = {"name": c["name"], "role": c["role"], "memo": c.get("memo", "")}
+    return out
+
+
+def analyze_boss(boss):
+    # 지난 기록에서 이 사람이 한 말·질문·지적을 찾아 보고 스타일을 정리 (기록이 없으면 기본 스타일)
+    name = boss["name"]
+    hits = []
+    for q in (f"{name} 질문 지적 확인 요청", f"{name} 피드백 보고 검토 의견"):
+        r = search_records(q, "전체", k=6)
+        if r["status"] == "success":
+            hits += [h for h in r["hits"] if h["text"] not in {x["text"] for x in hits}]
+    hits = [h for h in hits if _squash(name.replace("님", "")) in _squash(h["text"])][:8]
+    if not hits and not boss["memo"]:
+        return dict(RH_DEFAULT_STYLE)
+    ctx = "\n\n".join(f"[{i + 1}] {h['kind_label']} · {h['title']} · {h['when']}\n{h['text'][:900]}"
+                      for i, h in enumerate(hits))
+    res = ask_json(
+        "\n".join([
+            f"김 대리의 보고 상대 '{name}{(' ' + boss['role']) if boss['role'] else ''}'의 보고 받는 스타일을 분석합니다.",
+            "- 아래 기록에서 이 사람이 직접 한 말, 질문, 지적, 요청만 근거로 씁니다. 다른 사람의 말과 섞지 않습니다.",
+            "- evidence의 quote는 기록 원문에 있는 구절을 그대로 옮기고, source_no는 기록 번호입니다.",
+            "- 근거가 약하면 '기록이 적어 일반적인 경향을 함께 반영'이라고 style_summary에 밝힙니다.",
+        ]),
+        f"[김 대리 메모] {boss['memo'] or '(없음)'}\n\n[지난 기록]\n{ctx or '(없음)'}",
+        "boss_persona", PERSONA_SCHEMA)
+    srcs = {i + 1: h for i, h in enumerate(hits)}
+    res["evidence"] = [{**e, "source": f"{srcs[e['source_no']]['kind_label']} · {srcs[e['source_no']]['title']}"}
+                       for e in res["evidence"]
+                       if e["source_no"] in srcs and _squash(e["quote"])[:12] in _squash(srcs[e["source_no"]]["text"])]
+    res["from_records"] = bool(hits)
+    return res
+
+
+def boss_speaker(rh):
+    return f"{rh['boss']['name']}{(' ' + rh['boss']['role']) if rh['boss']['role'] else ''}"
+
+
+def persona_text(rh):
+    p = rh["persona"]
+    return (f"[보고 상대] {boss_speaker(rh)}\n[스타일] {p['style_summary']}\n[말투] {p['tone']}\n"
+            "[자주 확인하는 것]\n" + "\n".join(f"- {x}" for x in p["focus_points"]))
+
+
+def make_questions(rh, n):
+    res = ask_json(
+        "\n".join([
+            "당신은 아래 [보고 상대]가 되어, 김 대리의 보고를 듣고 던질 예상 질문을 만듭니다.",
+            persona_text(rh),
+            "",
+            f"- 질문 {n}개. 이 사람이 자주 확인하는 것을 중심으로, 보고 자료에서 약하거나 빠진 부분을 파고듭니다.",
+            "- 실제 말하듯 짧게 (예: '김 대리, 이 일정이 밀리면 대안은 뭐예요?'). 이모티콘을 쓰지 않습니다.",
+            "- 자료에 이미 명확한 답이 있는 쉬운 질문만 내지 말고, 최소 1개는 자료에 없는 리스크·대안을 묻습니다.",
+        ]),
+        f"[보고 주제] {rh['topic']}\n\n[보고 자료]\n{rh['material'][:12000]}",
+        "rehearsal_questions", RH_QUESTIONS_SCHEMA)
+    return [{"id": uuid.uuid4().hex[:6], "q": q["question"], "intent": q["intent"], "key_points": q["key_points"],
+             "follow": False, "answer": "", "via": "", "eval": None} for q in res["questions"][:n]]
+
+
+def evaluate_answer(rh, item):
+    ev = ask_json(
+        "\n".join([
+            "당신은 보고 코치입니다. 아래 [보고 상대]의 기준으로 김 대리의 답변을 평가합니다.",
+            persona_text(rh),
+            "",
+            "- 점수는 1~5점. 질문 의도와 좋은 답변 요소(key_points)를 얼마나 채웠는지로 매깁니다.",
+            "- 답변이 음성 인식 결과라 오탈자가 있을 수 있으니 말의 뜻으로 평가합니다.",
+            "- better_answer는 보고 자료에 있는 사실만 쓰고, 자료에 없으면 '(자료 보완 필요: …)'라고 표시합니다.",
+            "- 점수가 3점 이하이고 이미 꼬리질문이 아니면 follow_up에 이 사람이 이어서 물을 질문을 씁니다.",
+            "- boss_reaction은 이 사람 말투로 한마디 (예: '좋아요, 그럼 비용은요?').",
+        ]),
+        f"[보고 주제] {rh['topic']}\n[보고 자료]\n{rh['material'][:8000]}\n\n"
+        f"[질문] {item['q']}\n[질문 의도] {item['intent']}\n[좋은 답변 요소] {', '.join(item['key_points'])}\n"
+        f"[꼬리질문 여부] {'예' if item['follow'] else '아니오'}\n\n[김 대리 답변]\n{item['answer'] or '(답하지 못함)'}",
+        "answer_eval", RH_EVAL_SCHEMA)
+    ev["score"] = max(1, min(5, int(ev["score"])))
+    if item["follow"] or ev["score"] > 3:
+        ev["follow_up"] = ""
+    return ev
+
+
+def make_report(rh):
+    qa = "\n\n".join(f"Q{i + 1}{' (꼬리질문)' if it['follow'] else ''}. {it['q']}\n답변: {it['answer'] or '(답하지 못함)'}\n"
+                     f"점수: {it['eval']['score']}/5 · 빠진 점: {', '.join(it['eval']['missing']) or '없음'}"
+                     for i, it in enumerate(rh["questions"]) if it["eval"])
+    return ask_json(
+        "\n".join(["당신은 보고 코치입니다. 리허설 결과를 정리합니다.", persona_text(rh),
+                   "- prep_items는 실제 보고 전에 준비할 자료·숫자·대안을 구체적으로 (예: '3분기 비용 비교표 만들기')."]),
+        f"[보고 주제] {rh['topic']}\n\n[리허설 기록]\n{qa}", "rehearsal_report", RH_REPORT_SCHEMA)
+
+
+def current_rh():
+    rid = st.session_state.get("rh_id")
+    return next((r for r in data["rehearsals"] if r["id"] == rid), None)
+
+
+def rh_next(rh):
+    # 아직 답하지 않은 첫 질문의 위치, 다 답했으면 None
+    return next((i for i, it in enumerate(rh["questions"]) if it["eval"] is None), None)
+
+
+def rh_score(rh):
+    done = [it["eval"]["score"] for it in rh["questions"] if it["eval"]]
+    return round(sum(done) / len(done), 1) if done else 0
+
+
+def rh_audio(rh, item):
+    # 질문을 보고 상대 목소리로 (같은 질문은 다시 만들지 않음)
+    cache = st.session_state.setdefault("rh_audio", {})
+    if item["id"] not in cache:
+        try:
+            cache[item["id"]] = text_to_speech(item["q"], rh.get("voice", "onyx"))
+        except Exception:
+            cache[item["id"]] = None
+    return cache[item["id"]]
+
+
+def start_rehearsal(boss, topic, material, n, voice, questions=None, persona=None):
+    rh = {"id": uuid.uuid4().hex[:8], "when": now_kst(), "boss": boss, "topic": topic.strip() or "보고",
+          "material": material, "voice": voice, "persona": persona or analyze_boss(boss),
+          "questions": [], "report": None}
+    rh["questions"] = questions or make_questions(rh, n)
+    data["rehearsals"].insert(0, rh)
+    del data["rehearsals"][MAX_REHEARSALS:]
+    save_data()
+    st.session_state.rh_id = rh["id"]
+    st.session_state.rh_play = rh["questions"][0]["id"]
+
+
+def submit_answer(rh, idx, answer, via):
+    item = rh["questions"][idx]
+    item.update(answer=answer.strip(), via=via)
+    item["eval"] = evaluate_answer(rh, item)
+    if item["eval"]["follow_up"]:
+        rh["questions"].insert(idx + 1, {"id": uuid.uuid4().hex[:6], "q": item["eval"]["follow_up"],
+                                         "intent": f"'{item['intent']}' 보충 확인", "key_points": item["eval"]["missing"][:3]
+                                         or item["key_points"], "follow": True, "answer": "", "via": "", "eval": None})
+    nxt = rh_next(rh)
+    if nxt is None:
+        rh["report"] = make_report(rh)
+    else:
+        st.session_state.rh_play = rh["questions"][nxt]["id"]
+    save_data()
+
+
+def _rh_end_cb():
+    rh = current_rh()
+    if rh is None:
+        return
+    rh["questions"] = [it for it in rh["questions"] if it["eval"]]      # 답하지 않은 질문은 빼고 마무리
+    if rh["questions"]:
+        try:
+            rh["report"] = make_report(rh)
+        except Exception as e:
+            st.session_state.pending_toast = f"⚠️ 결과를 정리하지 못했어요 ({e})"
+    else:
+        data["rehearsals"] = [r for r in data["rehearsals"] if r["id"] != rh["id"]]
+        st.session_state.rh_id = None
+    save_data()
+
+
+def _rh_new_cb():
+    st.session_state.rh_id = None
+
+
+def _rh_open_cb(rid):
+    st.session_state.rh_id = rid
+
+
+def _rh_retry_cb(rid):
+    # 3점 이하였던 질문만 모아 같은 스타일로 다시 연습
+    old = next((r for r in data["rehearsals"] if r["id"] == rid), None)
+    if not old:
+        return
+    weak = [{"id": uuid.uuid4().hex[:6], "q": it["q"], "intent": it["intent"], "key_points": it["key_points"],
+             "follow": False, "answer": "", "via": "", "eval": None}
+            for it in old["questions"] if it["eval"] and it["eval"]["score"] <= 3 and not it["follow"]]
+    if not weak:
+        st.session_state.pending_toast = "다시 연습할 질문이 없어요. 모두 4점 이상이에요!"
+        return
+    start_rehearsal(old["boss"], old["topic"] + " (재도전)", old["material"], len(weak), old.get("voice", "onyx"),
+                    questions=weak, persona=old["persona"])
+
+
+def _rh_todo_cb(rid, idx):
+    rh = next((r for r in data["rehearsals"] if r["id"] == rid), None)
+    it = rh["report"]["prep_items"][idx]
+    t = add_todo(it["title"], "", "높음", f"[보고 리허설: {rh['topic']}] {it['why']}", "보고 리허설", "보고·문서")
+    it["todo_id"] = t["id"]
+    save_data()
+    st.session_state.pending_toast = f"'{t['title']}'을(를) 할 일에 추가했어요."
+
+
+def render_persona(rh):
+    p = rh["persona"]
+    with st.expander(f"🧑‍💼 {boss_speaker(rh)} 스타일 " + ("(지난 기록에서 분석)" if p.get("from_records") else "(기본 스타일)")):
+        st.markdown(p["style_summary"])
+        st.markdown("**자주 확인하는 것**\n" + "\n".join(f"- {x}" for x in p["focus_points"]))
+        st.caption(f"말투: {p['tone']}")
+        for e in p["evidence"]:
+            st.caption(f"근거 · {e['source']}: “{e['quote']}”")
+
+
+def render_eval(it):
+    ev = it["eval"]
+    color = "#16a34a" if ev["score"] >= 4 else "#d97706" if ev["score"] == 3 else "#dc2626"
+    score_txt = f"{ev['score']}/5"
+    st.markdown(f"{badge(score_txt, color)} <i>“{html.escape(ev['boss_reaction'])}”</i>", unsafe_allow_html=True)
+    if ev["good"]:
+        st.markdown(f"👍 {ev['good']}")
+    if ev["missing"]:
+        st.markdown("🔧 **보완할 점**\n" + "\n".join(f"- {m}" for m in ev["missing"]))
+    with st.expander("💡 이렇게 답하면 좋아요"):
+        st.markdown(ev["better_answer"])
+
+
+def render_rehearsal_tab():
+    st.markdown("보고 전에 에이블이 **보고 상대(팀장님 등)가 되어** 예상 질문을 음성으로 던지고, 김 대리의 답을 바로 코칭합니다.")
+    st.caption("보고 상대의 스타일은 지난 회의록·메일·대화에서 그 사람이 실제로 한 말을 찾아 분석해요. 기록이 없으면 일반적인 팀장님 스타일로 질문합니다.")
+    rh = current_rh()
+
+    # ① 준비
+    if rh is None:
+        with st.container(border=True):
+            bosses = boss_choices()
+            c1, c2 = st.columns([2, 1])
+            pick = c1.selectbox("보고 상대", list(bosses), key="rh_boss")
+            voice = c2.selectbox("질문 목소리", list(RH_VOICES), format_func=lambda v: f"{RH_VOICES[v]} ({v})", key="rh_voice")
+            topic = st.text_input("보고 주제", key="rh_topic", placeholder="예) 3분기 마케팅 캠페인 결과 보고")
+            up = st.file_uploader("보고 자료 (txt, md)", type=["txt", "md"], key="rh_file")
+            material = up.getvalue().decode("utf-8", errors="ignore") if up is not None else ""
+            typed = st.text_area("또는 보고 내용 붙여넣기 / 핵심만 적기", key="rh_text", height=160,
+                                 placeholder="예) 캠페인 클릭률 3.2%(목표 3%), 비용 2,800만 원(예산 3,000만 원), 다음 달 2차 캠페인 제안…")
+            material = "\n\n".join(x for x in (material, typed.strip()) if x)
+            n = st.slider("질문 수", 2, 5, 3, key="rh_n")
+            if st.button("🎬 리허설 시작", type="primary", use_container_width=True, disabled=not material.strip()):
+                try:
+                    with st.spinner(f"{bosses[pick]['name']} 스타일을 분석하고 예상 질문을 만드는 중…"):
+                        start_rehearsal(bosses[pick], topic, material, n, voice)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"리허설을 시작하지 못했어요: {e}")
+            if not material.strip():
+                st.caption("보고 자료를 올리거나 내용을 적으면 시작할 수 있어요.")
+
+        if data["rehearsals"]:
+            st.markdown("##### 🗂️ 지난 리허설")
+            for r in data["rehearsals"]:
+                a, b = st.columns([5, 1])
+                state = f"평균 {rh_score(r)}점" if r["report"] else "진행 중"
+                a.markdown(f"**{r['topic']}** · {boss_speaker(r)}  \n:gray[{r['when']} · {state}]")
+                b.button("열기", key=f"rh_open_{r['id']}", on_click=_rh_open_cb, args=(r["id"],), use_container_width=True)
+        return
+
+    # ② 진행 중 / ③ 결과
+    h1, h2 = st.columns([5, 1.3])
+    h1.markdown(f"#### 🎤 {rh['topic']} · {boss_speaker(rh)}")
+    h2.button("➕ 새 리허설", key="rh_new", on_click=_rh_new_cb, use_container_width=True)
+    render_persona(rh)
+
+    nxt = rh_next(rh)
+    total = len(rh["questions"])
+    for i, it in enumerate(rh["questions"]):
+        if it["eval"] is None:
+            break
+        with st.container(border=True):
+            st.markdown(f"**{'↪ 꼬리질문' if it['follow'] else f'Q{i + 1}'}. {it['q']}**")
+            st.markdown(f":gray[{'🎙️' if it['via'] == 'voice' else '⌨️'} 내 답변: {it['answer'] or '(답하지 못함)'}]")
+            render_eval(it)
+
+    if nxt is not None and not rh["report"]:
+        it = rh["questions"][nxt]
+        st.progress(nxt / total, text=f"질문 {nxt + 1} / {total}")
+        with st.container(border=True):
+            st.markdown(f"##### 🧑‍💼 {boss_speaker(rh)}")
+            st.markdown(f"### “{it['q']}”")
+            audio = rh_audio(rh, it)
+            if audio:
+                st.audio(audio, format="audio/mp3", autoplay=(st.session_state.get("rh_play") == it["id"]))
+                if st.session_state.get("rh_play") == it["id"]:
+                    st.session_state.rh_play = None           # 같은 질문은 한 번만 자동 재생
+            with st.expander("힌트: 이 질문으로 확인하려는 것"):
+                st.markdown(it["intent"])
+            voice_in = st.audio_input("🎙️ 말로 답하기", key=f"rh_mic_{it['id']}") if hasattr(st, "audio_input") else None
+            typed = st.text_area("⌨️ 글로 답하기", key=f"rh_ans_{it['id']}", height=90)
+            c1, c2, c3 = st.columns(3)
+            go = c1.button("✅ 답변 제출", type="primary", key=f"rh_go_{it['id']}", use_container_width=True)
+            skip = c2.button("⏭ 모르겠어요", key=f"rh_skip_{it['id']}", use_container_width=True)
+            c3.button("⏹ 그만하고 결과 보기", key=f"rh_end_{it['id']}", on_click=_rh_end_cb, use_container_width=True)
+            if go or skip:
+                try:
+                    with st.spinner("답변을 듣고 평가하는 중…"):
+                        if skip:
+                            ans, via = "", "text"
+                        elif voice_in is not None:
+                            ans, via = speech_to_text(*shrink_audio(voice_in.getvalue(), "answer.wav"),
+                                                      hint=rh["topic"]), "voice"
+                        else:
+                            ans, via = typed, "text"
+                        if not skip and not ans.strip():
+                            st.warning("답변을 녹음하거나 적어 주세요.")
+                        else:
+                            submit_answer(rh, nxt, ans, via)
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"평가하지 못했어요: {e}")
+        return
+
+    rep = rh["report"]
+    if not rep:
+        st.info("결과를 정리하지 못했어요. ➕ 새 리허설로 다시 시작해 주세요.")
+        return
+    weak = [it for it in rh["questions"] if it["eval"]["score"] <= 3]
+    with st.container(border=True):
+        st.markdown("### 📋 리허설 결과")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("평균 점수", f"{rh_score(rh)} / 5")
+        m2.metric("받은 질문", f"{len(rh['questions'])}개")
+        m3.metric("막힌 질문 (3점 이하)", f"{len(weak)}개")
+        st.markdown(rep["overall"])
+        if rep["strengths"]:
+            st.markdown("**👍 잘한 점**\n" + "\n".join(f"- {s}" for s in rep["strengths"]))
+        if weak:
+            st.markdown("**😥 막힌 질문**\n" + "\n".join(f"- {it['q']} ({it['eval']['score']}점)" for it in weak))
+        st.markdown("**📌 보고 전에 준비할 것**")
+        for i, p in enumerate(rep["prep_items"]):
+            a, b = st.columns([5, 1.4])
+            a.markdown(f"**{p['title']}**  \n:gray[{p['why']}]")
+            if p.get("todo_id"):
+                b.caption("✅ 할 일에 추가됨")
+            else:
+                b.button("할 일로 추가", key=f"rh_todo_{rh['id']}_{i}", on_click=_rh_todo_cb, args=(rh["id"], i),
+                         use_container_width=True)
+        c1, c2 = st.columns(2)
+        c1.button("🔁 막힌 질문만 다시 연습", key=f"rh_retry_{rh['id']}", on_click=_rh_retry_cb, args=(rh["id"],),
+                  type="primary", use_container_width=True, disabled=not weak)
+        c2.button("➕ 새 리허설", key="rh_new2", on_click=_rh_new_cb, use_container_width=True)
+
+
+with tab_rh:
+    render_rehearsal_tab()
 
 
 # ─────────────────────────────────────────────
