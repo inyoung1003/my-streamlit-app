@@ -8,7 +8,7 @@
 #   메인 탭  : 🤖 에이블 비서 (음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
 #              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
-#   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
+#   사이드바 : 🔎 업무 기록 검색(RAG) / 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
 #   일정     : 종류별 색상·소요시간 추정(체크인 20/회의 30/온라인 45/고객사 60분), 겹치거나 간격 10분 미만이면
 #              충돌 감지 → 대체 시간 3개 추천 → 승인(대체 시간/원래 시간/취소), 음성·텍스트 요청도 동일하게 검사
 import os
@@ -30,6 +30,7 @@ from email import policy
 from email.mime.text import MIMEText
 from email.utils import parseaddr, parsedate_to_datetime
 
+import numpy as np
 import streamlit as st
 from openai import OpenAI
 
@@ -1011,6 +1012,8 @@ APP_CSS = [
     "[class*='st-key-act_'] button p {font-size:.76rem; white-space:nowrap;}",
     "[class*='st-key-chatdel_'] button {padding:0 !important; min-width:0 !important; min-height:38px;}",
     "[class*='st-key-chatdel_'] button p {font-size:1rem; line-height:1; margin:0;}",
+    ".st-key-rag_box {gap:.45rem;}",
+    ".st-key-rag_box [data-testid='stExpander'] summary p {font-size:.8rem;}",
 ]
 st.markdown("<style>" + " ".join(APP_CSS) + "</style>", unsafe_allow_html=True)
 
@@ -1882,6 +1885,311 @@ TOOL_LABEL = {"send_email": "메일", "add_todo": "할 일 추가", "add_event":
               "delete_event": "일정 삭제", "decide_pending_delete": "삭제 승인"}
 
 
+# ─────────────────────────────────────────────
+# 업무 기록 전체 검색 (RAG)
+#   회의록·분석한 메일·대화 기록·할 일·일정을 조각(chunk)으로 나눠 임베딩해 두고,
+#   질문과 의미가 가까운 조각을 찾아 그 내용만 근거로 답합니다 (답변마다 출처 번호 표시).
+#   · 색인 파일: able_index.json(조각 정보) + able_index.npy(벡터)  → 앱을 다시 켜도 유지
+#   · 내용이 바뀐 조각만 다시 임베딩 (변하지 않은 조각은 저장된 벡터 재사용 → 비용 절약)
+# ─────────────────────────────────────────────
+EMBED_MODEL = "text-embedding-3-small"
+INDEX_META = BASE / "able_index.json"
+INDEX_VEC = BASE / "able_index.npy"
+CHUNK_SIZE = 700         # 조각 하나의 글자 수
+CHUNK_OVERLAP = 120      # 조각끼리 겹치는 글자 수 (문장이 잘려도 앞뒤 맥락 유지)
+RAG_TOP_K = 6            # 답변 근거로 쓸 조각 수
+RAG_MIN_SCORE = 0.25     # 이보다 낮으면 '관련 기록 없음'
+RAG_KINDS = {"meeting": "📝 회의", "mail": "📥 메일", "chat": "💬 대화", "todo": "✅ 할 일", "event": "📅 일정"}
+RAG_SCOPES = {"전체": None, "회의": ["meeting"], "메일": ["mail"], "대화": ["chat"], "할 일·일정": ["todo", "event"]}
+
+
+def split_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    # 문단·문장 경계를 최대한 살려서 size 글자 안팎으로 자름
+    text = re.sub(r"[ \t]+", " ", (text or "")).strip()
+    if len(text) <= size:
+        return [text] if text else []
+    out, start = [], 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        if end < len(text):
+            cut = max(text.rfind("\n", start + size // 2, end), text.rfind(". ", start + size // 2, end),
+                      text.rfind("다.", start + size // 2, end), text.rfind("요.", start + size // 2, end))
+            if cut > start:
+                end = cut + 1
+        out.append(text[start:end].strip())
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return [c for c in out if c]
+
+
+def collect_records():
+    # 검색 대상이 되는 업무 기록 → 조각 목록 [{key, kind, src_id, title, when, text}]
+    recs = []
+
+    def add(kind, src_id, title, when, body, head=""):
+        for i, part in enumerate(split_text(body)):
+            text = (head + "\n" + part).strip() if head else part
+            recs.append({"kind": kind, "src_id": src_id, "title": title, "when": when, "part": i, "text": text})
+
+    for n in data["meeting_notes"]:
+        head = f"[회의] {n['title']} ({n['when']})" + (f" 참석: {n['attendees']}" if n["attendees"] else "")
+        brief = "\n".join(
+            ["요약:"] + [f"- {s}" for s in n["summary"]]
+            + (["결정 사항:"] + [f"- {s}" for s in n["decisions"]] if n["decisions"] else [])
+            + (["김 대리 업무:"] + [f"- {t['title']} (기한: {t['due_text'] or '언급 없음'})" for t in n["kim_tasks"]]
+               if n["kim_tasks"] else []))
+        if n["summary"] or n["decisions"] or n["kim_tasks"]:
+            add("meeting", n["id"], n["title"], n["when"], brief, head)
+        elif n.get("minutes"):
+            add("meeting", n["id"], n["title"], n["when"], n["minutes"], head)
+        add("meeting", n["id"], n["title"], n["when"], n.get("text", ""), head + " · 원문")
+
+    for m in data["mail_analysis"]["mails"]:
+        head = f"[메일] {m.get('subject', '')} · 보낸 사람: {m.get('from', '')} ({m.get('date', '')})"
+        body = (f"요약: {m['summary']}\n" if m.get("summary") else "") + (m.get("body") or "")[:4000]
+        add("mail", m.get("msg_id", ""), m.get("subject", "(제목 없음)"), m.get("date", ""), body, head)
+
+    for c in data["chats"]:
+        for i, t in enumerate(c.get("turns", [])):
+            add("chat", f"{c['id']}#{i}", c.get("title", "대화"), t.get("time", c.get("updated", "")),
+                f"김 대리: {t.get('q', '')}\n에이블: {t.get('a', '')}", f"[대화] {c.get('title', '')}")
+
+    for t in data["todos"]:
+        body = (f"할 일: {t['title']} / 마감: {t['due'] or '없음'} / 우선순위: {t['priority']} / "
+                f"분류: {t.get('category', '')} / {'완료' if t['done'] else '미완료'} / 출처: {t.get('source', '')}"
+                + (f"\n세부: {t['detail']}" if t.get("detail") else ""))
+        add("todo", t["id"], t["title"], t["due"] or t.get("created", ""), body)
+
+    for e in data["events"]:
+        body = (f"일정: {e['title']} / {e['date']} {event_time_text(e)} / 종류: {e['category']}"
+                + (f"\n메모: {e['note']}" if e.get("note") else ""))
+        add("event", e["id"], e["title"], e["date"], body)
+
+    for r in recs:
+        r["key"] = hashlib.sha1(f"{r['kind']}|{r['src_id']}|{r['text']}".encode("utf-8")).hexdigest()
+    return recs
+
+
+def load_index():
+    if "rag_index" in st.session_state:
+        return st.session_state.rag_index
+    idx = {"meta": [], "vecs": np.zeros((0, 0), dtype=np.float32), "when": ""}
+    try:
+        if INDEX_META.exists() and INDEX_VEC.exists():
+            saved = json.loads(INDEX_META.read_text(encoding="utf-8"))
+            vecs = np.load(INDEX_VEC)
+            if len(saved.get("meta", [])) == len(vecs) and saved.get("model") == EMBED_MODEL:
+                idx = {"meta": saved["meta"], "vecs": vecs.astype(np.float32), "when": saved.get("when", "")}
+    except Exception:
+        pass                               # 색인 파일이 깨졌으면 새로 만듦
+    st.session_state.rag_index = idx
+    return idx
+
+
+def save_index(idx):
+    INDEX_META.write_text(json.dumps({"model": EMBED_MODEL, "when": idx["when"], "meta": idx["meta"]},
+                                     ensure_ascii=False), encoding="utf-8")
+    np.save(INDEX_VEC, idx["vecs"])
+    st.session_state.rag_index = idx
+
+
+def embed_texts(texts):
+    client = get_client()
+    out = []
+    for i in range(0, len(texts), 96):     # 한 번에 너무 많이 보내지 않게 나눠서
+        resp = client.embeddings.create(model=EMBED_MODEL, input=[t[:6000] for t in texts[i:i + 96]])
+        out += [d.embedding for d in resp.data]
+    v = np.array(out, dtype=np.float32)
+    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-8)   # 코사인 유사도용 정규화
+
+
+def refresh_index(force=False):
+    # 업무 기록이 바뀐 부분만 다시 임베딩 → {"total", "added", "removed"}
+    idx = load_index()
+    recs = collect_records()
+    if force:
+        idx = {"meta": [], "vecs": np.zeros((0, 0), dtype=np.float32), "when": ""}
+    old = {m["key"]: i for i, m in enumerate(idx["meta"])}
+    new_keys = [r["key"] for r in recs]
+    if not force and set(new_keys) == set(old) and len(recs) == len(idx["meta"]):
+        return {"total": len(recs), "added": 0, "removed": 0}
+    todo = [r for r in recs if r["key"] not in old]
+    new_vecs = embed_texts([r["text"] for r in todo]) if todo else None
+    new_pos = {r["key"]: i for i, r in enumerate(todo)}
+    dim = new_vecs.shape[1] if new_vecs is not None else idx["vecs"].shape[1] if len(idx["vecs"]) else 1536
+    vecs = np.zeros((len(recs), dim), dtype=np.float32)
+    for i, r in enumerate(recs):
+        vecs[i] = new_vecs[new_pos[r["key"]]] if r["key"] in new_pos else idx["vecs"][old[r["key"]]]
+    removed = len(set(old) - set(new_keys))
+    save_index({"meta": recs, "vecs": vecs, "when": now_kst()})
+    return {"total": len(recs), "added": len(todo), "removed": removed}
+
+
+def keyword_bonus(query, text):
+    # 이름·숫자·고유명사처럼 임베딩이 놓치기 쉬운 단어가 그대로 들어 있으면 점수를 조금 더 줌
+    words = [w for w in re.findall(r"[0-9A-Za-z가-힣]+", query) if len(w) >= 2]
+    if not words:
+        return 0.0
+    t = _squash(text)
+    hit = sum(1 for w in words if _squash(w) in t or (len(w) > 2 and _squash(w[:-1]) in t))
+    return 0.12 * hit / len(words)
+
+
+def search_records(query, scope="전체", k=RAG_TOP_K):
+    # 질문과 가까운 업무 기록 조각을 찾아 점수순으로 돌려줌 (같은 기록은 최대 2조각)
+    query = (query or "").strip()
+    if not query:
+        return {"status": "failed", "error": "검색어가 비어 있습니다."}
+    try:
+        info = refresh_index()
+        idx = load_index()
+        if not idx["meta"]:
+            return {"status": "success", "query": query, "hits": [], "indexed": 0}
+        qv = embed_texts([query])[0]
+    except Exception as e:
+        return {"status": "failed", "error": f"검색하지 못했습니다 ({e})"}
+    kinds = RAG_SCOPES.get(scope) if scope in RAG_SCOPES else None
+    scores = idx["vecs"] @ qv
+    ranked = []
+    for i, m in enumerate(idx["meta"]):
+        if kinds and m["kind"] not in kinds:
+            continue
+        ranked.append((float(scores[i]) + keyword_bonus(query, m["text"]), i))
+    ranked.sort(reverse=True)
+    hits, per_src = [], {}
+    for s, i in ranked:
+        m = idx["meta"][i]
+        src = f"{m['kind']}|{m['src_id']}"
+        if s < RAG_MIN_SCORE or per_src.get(src, 0) >= 2:
+            continue
+        per_src[src] = per_src.get(src, 0) + 1
+        hits.append({"no": len(hits) + 1, "kind": m["kind"], "kind_label": RAG_KINDS[m["kind"]],
+                     "title": m["title"], "when": m["when"], "src_id": m["src_id"],
+                     "score": round(s, 3), "text": m["text"]})
+        if len(hits) >= k:
+            break
+    return {"status": "success", "query": query, "hits": hits, "indexed": info["total"]}
+
+
+RAG_ANSWER_RULES = "\n".join([
+    "당신은 김 대리의 개인 비서 '에이블'입니다. 아래 [검색된 업무 기록]만 근거로 질문에 답합니다.",
+    f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일)",
+    "규칙",
+    "- 기록에 있는 내용만 씁니다. 기록에 없으면 '기록에서 확인되지 않습니다'라고 말하고 지어내지 않습니다.",
+    "- 문장 끝에 근거 기록 번호를 [1], [2]처럼 붙입니다.",
+    "- 날짜·금액·담당자·기한은 기록에 적힌 그대로 옮깁니다.",
+    "- 기록끼리 내용이 다르면 더 최근 기록을 앞세우고, 다르다는 점을 함께 알려 줍니다.",
+    "- 공손한 존댓말로 3~6문장 안에서 간결하게 답합니다.",
+])
+
+
+def rag_answer(question, scope="전체"):
+    # 업무 기록 검색 → 찾은 기록만 근거로 답변 생성 (사이드바 검색창에서 사용)
+    found = search_records(question, scope)
+    if found["status"] != "success":
+        return {"ok": False, "answer": found["error"], "hits": []}
+    hits = found["hits"]
+    if not hits:
+        msg = ("아직 검색할 업무 기록이 없습니다. 회의 분석·메일 분석·비서 대화를 하면 자동으로 쌓여요."
+               if not found["indexed"] else "관련된 업무 기록을 찾지 못했습니다. 다른 단어로 검색해 보세요.")
+        return {"ok": True, "answer": msg, "hits": []}
+    ctx = "\n\n".join(f"[{h['no']}] {h['kind_label']} · {h['title']} · {h['when']}\n{h['text']}" for h in hits)
+    try:
+        resp = get_client().responses.create(
+            model=MODEL, instructions=RAG_ANSWER_RULES,
+            input=f"[검색된 업무 기록]\n{ctx}\n\n[질문]\n{question}")
+        answer = resp.output_text.strip()
+    except Exception as e:
+        return {"ok": False, "answer": f"답변을 만들지 못했습니다 ({e})", "hits": hits}
+    used = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
+    return {"ok": True, "answer": answer, "hits": [h for h in hits if h["no"] in used] or hits[:3]}
+
+
+def records_for_chat(query, scope):
+    # 에이블 비서 도구용: 조각 원문을 적당히 잘라서 넘김
+    found = search_records(query, scope)
+    if found["status"] != "success":
+        return found
+    return {"status": "success", "query": query, "count": len(found["hits"]),
+            "records": [{"no": h["no"], "type": h["kind_label"], "title": h["title"], "when": h["when"],
+                         "content": h["text"][:900]} for h in found["hits"]]}
+
+
+TOOLS.append({
+    "type": "function", "name": "search_records",
+    "description": "김 대리의 지난 업무 기록(모든 회의록, 분석한 메일, 지난 대화, 할 일·일정)을 의미로 검색합니다. "
+                   "'지난달 회의에서 예산 얼마로 정했지?', '박과장님이 보낸 견적 메일 뭐였지?', "
+                   "'예전에 물어봤던 출장 건'처럼 [최근 회의]나 [현재 업무 데이터]만으로 답할 수 없는 과거 기록을 물을 때 사용합니다.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "찾을 내용을 핵심 단어 위주로 (예: '마케팅 예산 결정', '박과장 견적')"},
+            "scope": {"type": "string", "enum": list(RAG_SCOPES), "description": "검색 범위, 모르면 '전체'"},
+        },
+        "required": ["query", "scope"], "additionalProperties": False,
+    },
+    "strict": True,
+})
+TOOL_LABEL["search_records"] = "기록 검색"
+
+
+def _rag_search_cb():
+    q = (st.session_state.get("rag_q") or "").strip()
+    if not q:
+        st.session_state.rag_result = None
+        return
+    with st.spinner("업무 기록을 찾는 중…"):
+        r = rag_answer(q, st.session_state.get("rag_scope", "전체"))
+    st.session_state.rag_result = {"q": q, **r}
+
+
+def _rag_clear_cb():
+    st.session_state.rag_result = None
+    st.session_state.rag_q = ""
+
+
+def _rag_to_chat_cb(q):
+    new_chat_cb(notify=False)
+    set_quick(q)
+    st.session_state.pending_toast = "🤖 에이블 비서 탭에서 이어서 답해 드릴게요."
+
+
+def _rag_reindex_cb():
+    try:
+        r = refresh_index(force=True)
+        st.session_state.pending_toast = f"업무 기록 {r['total']}조각을 다시 색인했어요."
+    except Exception as e:
+        st.session_state.pending_toast = f"⚠️ 색인하지 못했어요 ({e})"
+
+
+def render_record_search():
+    # 사이드바 '새 채팅' 위: 업무 기록 전체 검색
+    with st.container(border=True, key="rag_box"):
+        st.markdown("**🔎 업무 기록 검색**")
+        st.text_input("검색", key="rag_q", placeholder="예: 지난달 회의에서 정한 예산", on_change=_rag_search_cb,
+                      label_visibility="collapsed")
+        a, b = st.columns([3, 2], gap="small")
+        a.selectbox("범위", list(RAG_SCOPES), key="rag_scope", label_visibility="collapsed")
+        b.button("검색", key="rag_go", on_click=_rag_search_cb, use_container_width=True)
+        r = st.session_state.get("rag_result")
+        if r:
+            (st.markdown if r["ok"] else st.error)(r["answer"])
+            for h in r["hits"]:
+                with st.expander(f"[{h['no']}] {h['kind_label']} · {h['title'][:18]}"):
+                    st.caption(f"{h['when']} · 관련도 {h['score']:.2f}")
+                    st.markdown(f"<div class='able-meta' style='white-space:pre-wrap'>"
+                                f"{html.escape(h['text'][:600])}</div>", unsafe_allow_html=True)
+            c, d = st.columns(2, gap="small")
+            c.button("💬 채팅으로", key="rag_chat", on_click=_rag_to_chat_cb, args=(r["q"],),
+                     help="이 질문을 에이블 비서와 이어서 대화해요", use_container_width=True)
+            d.button("✖ 닫기", key="rag_clear", on_click=_rag_clear_cb, use_container_width=True)
+        idx = load_index()
+        st.caption(f"색인 {len(idx['meta'])}조각 · 새 기록은 검색할 때 자동 반영"
+                   + (f" · 마지막 {idx['when'][5:16]}" if idx["when"] else ""))
+        st.button("🔄 전체 다시 색인", key="rag_reindex", on_click=_rag_reindex_cb, use_container_width=True)
+
+
 def recent_mails_for_chat(count=5):
     # 에이블 비서가 받은 메일을 읽을 수 있게: 본문은 일부만 넘기고 요약은 AI가 본문 내용만으로 작성
     if not gmail_ready():
@@ -1922,6 +2230,8 @@ def run_tool(name, args):
         return recent_mails_for_chat(args["count"])
     if name == "complete_todo":
         return set_todo_done(args["id"], True)
+    if name == "search_records":
+        return records_for_chat(args["query"], args["scope"])
     return {"status": "failed", "error": f"알 수 없는 도구: {name}"}
 
 
@@ -1951,6 +2261,8 @@ def action_of(name, args, result):
         return {"ok": True, "text": f"{label} 완료 → {result['title']} ({result['category']})"}
     if name == "get_recent_mails":
         return {"ok": True, "text": f"{label} → 최근 메일 {result['count']}통 확인"}
+    if name == "search_records":
+        return {"ok": True, "text": f"🔎 {label} → '{args['query']}' 관련 기록 {result['count']}건"}
     return {"ok": True, "text": f"{label} 완료 → {result.get('todo', '')}"}
 
 
@@ -2004,6 +2316,10 @@ def system_prompt():
         "  '그래도 보낼까요?'라고 묻습니다. 김 대리가 '보내줘/그래도 보내'라고 하면 confirm_pending_email(send),",
         "  '보내지 마/취소'라고 하면 confirm_pending_email(cancel)을 사용합니다.",
         "- failed면 이유를 알리고 필요한 정보를 묻습니다.",
+        "- 지난 회의·메일·대화·할 일 등 과거 기록을 물으면 search_records로 먼저 찾아봅니다.",
+        "  (가장 최근 회의 1건만 아래에 들어 있으므로, 그 밖의 회의 내용은 반드시 검색합니다.)",
+        "  찾은 기록에 있는 내용만 답하고, 끝에 '(출처: 📝 회의명, 날짜)'처럼 근거를 밝힙니다.",
+        "  결과가 0건이면 '기록에서 확인되지 않습니다'라고 말하고 지어내지 않습니다.",
         "- 도구를 사용한 뒤에는 무엇을 했는지 짧게 보고합니다.",
         "- 공손한 한국어 존댓말로 간결하게 답합니다.",
         "",
@@ -3152,7 +3468,10 @@ with st.sidebar:
     st.markdown("## 🤖 에이블")
     st.caption("김 대리님의 AI 개인비서")
 
-    # 0) GPT처럼 새 채팅 + 대화 기록
+    # 0-1) 업무 기록 전체 검색 (RAG) — 새 채팅 위
+    render_record_search()
+
+    # 0-2) GPT처럼 새 채팅 + 대화 기록
     st.button("➕ 새 채팅", key="new_chat_side", on_click=new_chat_cb, type="primary", use_container_width=True)
     chats = sorted(data["chats"], key=lambda c: c["updated"], reverse=True)
     with st.expander(f"💬 대화 기록 ({len(chats)}/{MAX_CHATS})", expanded=True):
