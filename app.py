@@ -1,4 +1,3 @@
-# 1104
 
 # AI 개인비서 '에이블' (Streamlit)
 # 실행: streamlit run app.py
@@ -11,11 +10,13 @@
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
 #              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
 #   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 할 일 / 최근 회의록 요약 / 최근 받은 메일 5개 요약
-#   일정     : 회의·업무·개인·기타 색상 구분, 겹치면 알림 + 비어 있는 대체 시간 제안
+#   일정     : 종류별 색상·소요시간 추정(체크인 20/회의 30/온라인 45/고객사 60분), 겹치거나 간격 10분 미만이면
+#              충돌 감지 → 대체 시간 3개 추천 → 승인(대체 시간/원래 시간/취소), 음성·텍스트 요청도 동일하게 검사
 import os
 import re
 import json
 import uuid
+import hashlib
 import html
 import email
 import shutil
@@ -44,14 +45,27 @@ KST = dt.timezone(dt.timedelta(hours=9))
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 PRIORITIES = ["높음", "보통", "낮음"]
 PRIORITY_ORDER = {p: i for i, p in enumerate(PRIORITIES)}
-PRIORITY_ICON = {"높음": "🔴", "보통": "🟡", "낮음": "🟢"}
-# 일정 분류별 색상 (회의·업무·개인·기타)
-EVENT_CATS = ["회의", "업무", "개인", "기타"]
-CAT_COLOR = {"회의": "#3e7bfa", "업무": "#f59e0b", "개인": "#22a06b", "기타": "#8b5cf6"}
-CAT_ICON = {"회의": "🟦", "업무": "🟧", "개인": "🟩", "기타": "🟪"}
-WORK_START, WORK_END, LUNCH = 9 * 60, 18 * 60, (12 * 60, 13 * 60)   # 대체 시간 제안 범위
-TIME_OPTIONS = ["종일"] + [f"{h:02d}:{m:02d}" for h in range(7, 22) for m in (0, 30)]
-DURATIONS = {"30분": 30, "1시간": 60, "1시간 30분": 90, "2시간": 120, "3시간": 180}
+PRIORITY_COLOR = {"높음": "#dc2626", "보통": "#d97706", "낮음": "#6b7280"}
+# 일정 종류별 색상 · 기본 소요시간(분)
+EVENT_TYPES = {
+    "내부 체크인": {"color": "#0d9488", "minutes": 20},
+    "일반 회의": {"color": "#2563eb", "minutes": 30},
+    "온라인 회의": {"color": "#7c3aed", "minutes": 45},
+    "고객사 미팅": {"color": "#e11d48", "minutes": 60},
+    "업무": {"color": "#d97706", "minutes": 60},
+    "개인": {"color": "#16a34a", "minutes": 60},
+    "기타": {"color": "#64748b", "minutes": 60},
+}
+EVENT_CATS = list(EVENT_TYPES)
+# 할 일 분류별 색상 (일정과 다른 색)
+TODO_CATS = {"보고·문서": "#ea580c", "조사·분석": "#c026d3", "연락·메일": "#0891b2",
+             "일반 업무": "#4f46e5", "개인": "#84cc16"}
+LEGACY_CATS = {"회의": "일반 회의"}          # 이전 버전 분류 → 새 분류
+GAP_MIN = 10                                 # 앞뒤 일정과 이 간격(분) 미만이면 충돌
+WORK_START, WORK_END, LUNCH = 9 * 60, 18 * 60, (12 * 60, 13 * 60)   # 대체 시간 추천 범위
+TIME_OPTIONS = ["종일"] + [f"{h:02d}:{m:02d}" for h in range(7, 22) for m in range(0, 60, 10)]
+DURATIONS = {"자동 (종류별)": 0, "20분": 20, "30분": 30, "45분": 45, "1시간": 60,
+             "1시간 30분": 90, "2시간": 120, "3시간": 180}
 
 st.set_page_config(page_title="AI 개인비서 에이블", page_icon="🤖", layout="wide")
 
@@ -155,19 +169,52 @@ def parse_date(s):
         return None
 
 
-def add_todo(title, due="", priority="보통", detail="", source="직접 입력"):
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF⌀-⏿☀-➿⬀-⯿️‍⃣]")
+
+
+def clean_text(t):
+    # 등록되는 일정·할 일에는 이모티콘을 넣지 않음
+    return re.sub(r"[ \t]+", " ", EMOJI_RE.sub("", t or "")).strip()
+
+
+def guess_todo_cat(title):
+    t = title or ""
+    if re.search(r"보고|문서|초안|작성|기획안|제안서|자료|회의록", t):
+        return "보고·문서"
+    if re.search(r"조사|분석|리서치|검토|비교|리스트|사례", t):
+        return "조사·분석"
+    if re.search(r"메일|연락|전화|답장|회신|공유|전달", t):
+        return "연락·메일"
+    if re.search(r"병원|생일|휴가|연차|운동|가족|개인|여행", t):
+        return "개인"
+    return "일반 업무"
+
+
+def add_todo(title, due="", priority="보통", detail="", source="직접 입력", category=""):
     item = {
         "id": uuid.uuid4().hex[:8],
-        "title": title.strip(),
-        "detail": detail.strip(),
+        "title": clean_text(title),
+        "detail": clean_text(detail),
         "due": due if parse_date(due) else "",
         "priority": priority if priority in PRIORITIES else "보통",
+        "category": category if category in TODO_CATS else guess_todo_cat(title),
         "done": False,
         "source": source,
     }
     data["todos"].append(item)
     save_data()
     return item
+
+
+def update_todo(todo_id, title, due, priority, category, detail):
+    t = next((x for x in data["todos"] if x["id"] == todo_id), None)
+    if t is None:
+        return {"status": "failed", "error": "할 일을 찾을 수 없습니다."}
+    t.update(title=clean_text(title), due=due if parse_date(due) else "",
+             priority=priority if priority in PRIORITIES else "보통",
+             category=category if category in TODO_CATS else guess_todo_cat(title), detail=clean_text(detail))
+    save_data()
+    return dict(t, status="success")
 
 
 def parse_time(s):
@@ -184,25 +231,33 @@ def hhmm(minutes):
 
 def end_from(start, minutes):
     s = parse_time(start)
-    return hhmm(min(s + minutes, 24 * 60 - 1)) if s is not None else ""
+    return hhmm(min(s + minutes, 24 * 60 - 1)) if s is not None and minutes else ""
 
 
 def guess_category(title):
-    # 제목으로 분류 추측 (사용자가 고르지 않았을 때만 사용)
-    if re.search(r"회의|미팅|면담|보고회|워크숍|세미나|컨퍼런스|간담회", title or ""):
-        return "회의"
-    if re.search(r"병원|생일|약속|휴가|연차|반차|운동|가족|여행|결혼|개인", title or ""):
+    # 제목으로 일정 종류 추정 → 기본 소요시간이 정해짐
+    t = title or ""
+    if re.search(r"체크인|스탠드업|데일리|싱크|1:1|원온원", t, re.I):
+        return "내부 체크인"
+    if re.search(r"온라인|화상|줌|zoom|teams|팀즈|meet|웨비나|비대면", t, re.I):
+        return "온라인 회의"
+    if re.search(r"고객|거래처|클라이언트|파트너사|외부\s*미팅|업체|방문", t):
+        return "고객사 미팅"
+    if re.search(r"회의|미팅|면담|보고회|워크숍|세미나|간담회|브리핑", t):
+        return "일반 회의"
+    if re.search(r"병원|생일|약속|휴가|연차|반차|운동|가족|여행|결혼|개인", t):
         return "개인"
     return "업무"
 
 
-def norm_times(start, end):
+def norm_times(start, end, category="기타"):
+    # 끝나는 시간이 없으면 종류별 소요시간으로 추정
     s = parse_time(start)
     if s is None:
         return "", ""
     e = parse_time(end)
     if e is None or e <= s:
-        e = min(s + 60, 24 * 60 - 1)
+        e = min(s + EVENT_TYPES.get(category, EVENT_TYPES["기타"])["minutes"], 24 * 60 - 1)
     return hhmm(s), hhmm(e)
 
 
@@ -211,7 +266,7 @@ def event_span(e):
     if s is None:
         return None
     if en is None or en <= s:
-        en = min(s + 60, 24 * 60 - 1)
+        en = min(s + EVENT_TYPES.get(e.get("category"), EVENT_TYPES["기타"])["minutes"], 24 * 60 - 1)
     return s, en
 
 
@@ -220,19 +275,27 @@ def event_time_text(e):
     return "종일" if sp is None else f"{hhmm(sp[0])}–{hhmm(sp[1])}"
 
 
+def conflict_reason(a, b):
+    # 겹치거나, 앞뒤 간격이 10분 미만이면 충돌
+    if a[0] < b[1] and b[0] < a[1]:
+        return "시간 겹침"
+    gap = max(b[0] - a[1], a[0] - b[1])
+    return f"간격 {gap}분" if gap < GAP_MIN else None
+
+
 def find_conflicts(date, start="", end="", exclude_id=None):
-    # 같은 날 시간이 겹치는 일정(overlap), 또는 종일 일정과 같은 날인 경우(allday)
+    # 시간이 있는 일정끼리만 비교 (시간 없이 등록된 이전 일정은 그대로 두고 비교에서 제외)
     mine = event_span({"start": start, "end": end})
+    if mine is None:
+        return []
     out = []
     for e in data["events"]:
         if e["id"] == exclude_id or e["date"] != date:
             continue
         other = event_span(e)
-        if mine and other:
-            if mine[0] < other[1] and other[0] < mine[1]:
-                out.append(dict(e, kind="overlap"))
-        else:
-            out.append(dict(e, kind="allday"))
+        reason = conflict_reason(mine, other) if other else None
+        if reason:
+            out.append(dict(e, reason=reason))
     return out
 
 
@@ -241,20 +304,17 @@ def is_free(date_iso, s, e, exclude_id=None):
         if ev["id"] == exclude_id or ev["date"] != date_iso:
             continue
         sp = event_span(ev)
-        if sp is None or (s < sp[1] and sp[0] < e):
+        if sp and conflict_reason((s, e), sp):
             return False
     return True
 
 
-def slot_ok(slot, exclude_id=None):
-    if not slot["start"]:
-        return not any(ev["date"] == slot["date"] and ev["id"] != exclude_id for ev in data["events"])
-    return is_free(slot["date"], parse_time(slot["start"]), parse_time(slot["end"]), exclude_id)
-
-
 def suggest_slots(date_iso, start="", end="", exclude_id=None, n=3):
-    # 대체 시간 찾기: 같은 날 → 이후 평일 순서로, 업무 시간(9~18시, 점심 12~13시 제외) 중 비어 있는 시간
+    # 충돌하지 않는 다른 시간 최대 3개: 같은 날(원래 시간과 가까운 순) → 이후 평일
     span = event_span({"start": start, "end": end})
+    if span is None:
+        return []
+    dur = span[1] - span[0]
     base = parse_date(date_iso) or today
     first = max(base, today)
     now = dt.datetime.now(KST)
@@ -264,80 +324,123 @@ def suggest_slots(date_iso, start="", end="", exclude_id=None, n=3):
         if d.weekday() >= 5 and d != base:
             continue
         iso = d.isoformat()
-        if span is None:          # 종일 일정 → 다른 일정이 없는 날
-            if d != base and slot_ok({"date": iso, "start": "", "end": ""}, exclude_id):
-                out.append({"date": iso, "start": "", "end": ""})
-        else:
-            dur = span[1] - span[0]
-            t = WORK_START
-            if d == today:
-                t = max(t, ((now.hour * 60 + now.minute) // 30 + 1) * 30)
-            cands = []
-            while t + dur <= WORK_END:
-                if not (t < LUNCH[1] and LUNCH[0] < t + dur) and is_free(iso, t, t + dur, exclude_id):
-                    cands.append(t)
-                t += 30
-            cands.sort(key=lambda x: abs(x - span[0]))      # 원래 시간과 가까운 순
-            for t0 in cands[:2 if d == base else 1]:
-                out.append({"date": iso, "start": hhmm(t0), "end": hhmm(t0 + dur)})
+        t = WORK_START
+        if d == today:
+            t = max(t, ((now.hour * 60 + now.minute) // 10 + 1) * 10)
+        cands = []
+        while t + dur <= WORK_END:
+            if not (t < LUNCH[1] and LUNCH[0] < t + dur) and is_free(iso, t, t + dur, exclude_id):
+                cands.append(t)
+            t += 10
+        cands.sort(key=lambda x: abs(x - span[0]))
+        picked = []
+        for c in cands:                    # 같은 날 추천끼리는 30분 이상 떨어지게
+            if all(abs(c - p) >= 30 for p in picked):
+                picked.append(c)
+            if len(picked) >= (2 if d == base else 1):
+                break
+        out += [{"date": iso, "start": hhmm(p), "end": hhmm(p + dur)} for p in sorted(picked)]
         if len(out) >= n:
             break
     return out[:n]
 
 
 def slot_text(s):
-    d = parse_date(s["date"])
-    return f"{fmt_date(d)} " + (f"{s['start']}–{s['end']}" if s["start"] else "종일")
+    return f"{fmt_date(parse_date(s['date']))} {s['start']}–{s['end']}"
 
 
 def conflict_text(c):
-    return f"{c['title']} ({fmt_date(parse_date(c['date']))} {event_time_text(c)})"
+    return f"{c['title']} ({event_time_text(c)}, {c['reason']})"
+
+
+def build_event(title, date, start="", end="", category="", note=""):
+    cat = LEGACY_CATS.get(category, category)
+    cat = cat if cat in EVENT_TYPES else guess_category(title)
+    s, e = norm_times(start, end, cat)
+    return {"title": clean_text(title), "date": str(date)[:10], "start": s, "end": e,
+            "category": cat, "note": clean_text(note)}
+
+
+def commit_event(fields, mode="add", event_id=None, source="직접 입력"):
+    if mode == "edit":
+        ev = next((e for e in data["events"] if e["id"] == event_id), None)
+        if ev is None:
+            return None
+        ev.update(fields)
+        save_data()
+        return ev
+    item = {"id": uuid.uuid4().hex[:8], **fields, "source": source}
+    data["events"].append(item)
+    save_data()
+    return item
+
+
+def request_event(fields, mode="add", event_id=None, source="직접 입력"):
+    # 모든 일정 추가·수정은 여기서 충돌 검사 → 겹치지 않으면 바로 반영, 겹치면 김 대리 승인 대기
+    if not fields["title"]:
+        return {"status": "failed", "error": "일정 제목이 없습니다."}
+    if not parse_date(fields["date"]):
+        return {"status": "failed", "error": "날짜 형식은 YYYY-MM-DD 입니다."}
+    conflicts = find_conflicts(fields["date"], fields["start"], fields["end"], exclude_id=event_id)
+    if not conflicts:
+        item = commit_event(fields, mode, event_id, source)
+        if item is None:
+            return {"status": "failed", "error": "일정을 찾을 수 없습니다."}
+        return dict(item, status="success")
+    sugg = suggest_slots(fields["date"], fields["start"], fields["end"], exclude_id=event_id)
+    st.session_state.pending_event = {"mode": mode, "event_id": event_id, "fields": fields,
+                                      "source": source, "suggestions": sugg}
+    st.session_state.pending_toast = f"⚠️ '{fields['title']}' 일정이 기존 일정과 겹쳐요. 화면 위에서 시간을 골라 주세요."
+    return {"status": "needs_approval", "title": fields["title"], "category": fields["category"],
+            "requested": f"{fields['date']} {event_time_text(fields)}",
+            "conflicts": [conflict_text(c) for c in conflicts],
+            "suggestions": [{"no": i + 1, "time": slot_text(s)} for i, s in enumerate(sugg)],
+            "message": "아직 등록하지 않았습니다. 대체 시간 선택(번호) / 원래 시간으로 등록 / 취소 중 김 대리의 결정이 필요합니다."}
+
+
+def decide_pending(choice):
+    # 사용자 승인: 대체 시간(1~3) / 원래 시간으로 등록(original) / 취소(cancel)
+    p = st.session_state.get("pending_event")
+    if not p:
+        return {"status": "failed", "error": "승인을 기다리는 일정이 없습니다."}
+    f = dict(p["fields"])
+    if choice == "cancel":
+        st.session_state.pop("pending_event", None)
+        return {"status": "success", "decision": "취소", "title": f["title"]}
+    if choice in ("1", "2", "3"):
+        i = int(choice) - 1
+        if i >= len(p["suggestions"]):
+            return {"status": "failed", "error": f"{choice}번 대체 시간이 없습니다."}
+        s = p["suggestions"][i]
+        f.update(date=s["date"], start=s["start"], end=s["end"])
+        if find_conflicts(f["date"], f["start"], f["end"], p["event_id"]):
+            return {"status": "failed", "error": "그 사이 그 시간에 다른 일정이 생겼습니다. 다른 시간을 골라 주세요."}
+    elif choice != "original":
+        return {"status": "failed", "error": "1, 2, 3, original, cancel 중에서 골라 주세요."}
+    item = commit_event(f, p["mode"], p["event_id"], p["source"])
+    st.session_state.pop("pending_event", None)
+    if item is None:
+        return {"status": "failed", "error": "일정을 찾을 수 없습니다."}
+    return {"status": "success", "decision": "원래 시간으로 등록" if choice == "original" else f"{choice}번 대체 시간",
+            "title": item["title"], "date": item["date"], "time": event_time_text(item)}
 
 
 def add_event(title, date, note="", source="직접 입력", start="", end="", category=""):
-    if not parse_date(date):
-        return {"status": "failed", "error": "날짜 형식은 YYYY-MM-DD 입니다."}
-    start, end = norm_times(start, end)
-    item = {
-        "id": uuid.uuid4().hex[:8],
-        "title": title.strip(),
-        "date": str(date)[:10],
-        "start": start,
-        "end": end,
-        "category": category if category in EVENT_CATS else guess_category(title),
-        "note": note.strip(),
-        "source": source,
-    }
-    conflicts = find_conflicts(item["date"], start, end)
-    data["events"].append(item)
-    save_data()
-    result = dict(item, status="success", conflicts=[], suggestions=[])
-    if conflicts:
-        # 겹치면 화면 위 알림 + 대체 시간 제안
-        sugg = suggest_slots(item["date"], start, end, exclude_id=item["id"])
-        result["conflicts"] = [conflict_text(c) for c in conflicts]
-        result["suggestions"] = [slot_text(x) for x in sugg]
-        st.session_state.conflict_alert = {"event_id": item["id"], "suggestions": sugg}
-        st.session_state.pending_toast = (f"⚠️ '{item['title']}' 일정이 기존 일정과 겹쳐요. "
-                                          "화면 위 알림에서 대체 시간을 확인하세요.")
-    return result
+    return request_event(build_event(title, date, start, end, category, note), "add", None, source)
+
+
+def update_event(event_id, title, date, start="", end="", category="", note=""):
+    return request_event(build_event(title, date, start, end, category, note), "edit", event_id)
 
 
 def move_event(event_id, date, start="", end=""):
     ev = next((e for e in data["events"] if e["id"] == event_id), None)
     if ev is None:
         return {"status": "failed", "error": "일정을 찾을 수 없습니다."}
-    if not parse_date(date):
-        return {"status": "failed", "error": "날짜 형식은 YYYY-MM-DD 입니다."}
     old = event_span(ev)
     if parse_time(start) is not None and parse_time(end) is None and old:
         end = end_from(start, old[1] - old[0])           # 시작만 바꾸면 원래 길이 유지
-    ev["date"] = str(date)[:10]
-    ev["start"], ev["end"] = norm_times(start, end)
-    save_data()
-    left = find_conflicts(ev["date"], ev["start"], ev["end"], exclude_id=ev["id"])
-    return {"status": "success", "title": ev["title"], "date": ev["date"], "time": event_time_text(ev),
-            "conflicts": [conflict_text(c) for c in left]}
+    return update_event(event_id, ev["title"], date, start, end, ev["category"], ev["note"])
 
 
 def set_todo_done(todo_id, done=True):
@@ -365,13 +468,18 @@ def fmt_date(d):
     return f"{d.month}/{d.day}({WEEKDAYS[d.weekday()]})"
 
 
-# 예전 버전에서 저장한 일정·연락처·대화도 새 형식으로 읽기
+# 예전 버전에서 저장한 일정·할 일·연락처·대화도 새 형식으로 읽기 (시간 없는 일정은 종일 일정으로 그대로 유지)
 for _e in data["events"]:
     _e.setdefault("note", "")
     _e.setdefault("source", "")
-    _e["start"], _e["end"] = norm_times(_e.get("start", ""), _e.get("end", ""))
-    if _e.get("category") not in EVENT_CATS:
-        _e["category"] = guess_category(_e.get("title", ""))
+    _cat = LEGACY_CATS.get(_e.get("category"), _e.get("category"))
+    _e["category"] = _cat if _cat in EVENT_TYPES else guess_category(_e.get("title", ""))
+    _e["start"], _e["end"] = norm_times(_e.get("start", ""), _e.get("end", ""), _e["category"])
+for _t in data["todos"]:
+    _t.setdefault("detail", "")
+    _t.setdefault("source", "")
+    if _t.get("category") not in TODO_CATS:
+        _t["category"] = guess_todo_cat(_t.get("title", ""))
 for _c in data["contacts"]:
     _c.setdefault("id", uuid.uuid4().hex[:8])
     for _k in ("name", "role", "team", "alias", "email", "memo"):
@@ -810,11 +918,15 @@ APP_CSS = [
     ".able-chip {display:inline-block; font-size:.78rem; padding:3px 10px; margin:2px 6px 2px 0;"
     " border-radius:999px; background:rgba(128,128,128,.16);}",
     ".able-chip.warn {background:rgba(229,72,77,.2);}",
+    ".able-badge {display:inline-block; padding:1px 8px; border-radius:999px; font-size:.72rem;"
+    " font-weight:600; margin-right:4px; vertical-align:1px;}",
+    ".able-meta {opacity:.75; font-size:.83rem;}",
+    ".able-warn {color:#e5484d; font-size:.8rem;}",
     ".able-cal .pill {display:block; font-size:.7rem; line-height:1.35; margin-top:2px; padding:1px 4px;"
     " border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}",
     ".able-cal .pill.done {text-decoration:line-through; opacity:.45;}",
     ".able-cal .more {font-size:.68rem; opacity:.6; margin-top:2px;}",
-    ".legend span {font-size:.75rem; margin-right:12px; white-space:nowrap;}",
+    ".legend {margin-top:4px;} .legend span {font-size:.74rem; margin-right:10px; white-space:nowrap;}",
     ".cal-head {text-align:center; font-size:.8rem; font-weight:600; opacity:.8; padding-bottom:2px;}",
     ".cal-cell {height:58px; overflow:hidden; margin-top:-10px;}",
     ".cal-cell.other {opacity:.35;}",
@@ -824,20 +936,29 @@ APP_CSS = [
 st.markdown("<style>" + " ".join(APP_CSS) + "</style>", unsafe_allow_html=True)
 
 
+def ev_color(e):
+    return EVENT_TYPES.get(e["category"], EVENT_TYPES["기타"])["color"]
+
+
+def badge(text, color):
+    return (f'<span class="able-badge" style="color:{color}; background:{color}1f; '
+            f'border:1px solid {color}66">{html.escape(text)}</span>')
+
+
 def items_by_date():
-    # 날짜별 캘린더 표시 항목: (정렬 키, 종류, 글자, 색)
+    # 날짜별 캘린더 표시 항목: (정렬 키, 종류, 글자, 색) — 이모티콘 없이 분류 색으로 구분
     m = {}
     for e in data["events"]:
         d = parse_date(e["date"])
         if d:
             label = (e["start"] + " " if e["start"] else "") + e["title"]
-            m.setdefault(d, []).append((e["start"] or "00:00", "event", label, CAT_COLOR[e["category"]]))
+            m.setdefault(d, []).append((e["start"] or "00:00", "event", label, ev_color(e)))
     for t in data["todos"]:
         d = parse_date(t["due"])
         if d:
-            kind = "done" if t["done"] else ("over" if d < today else "todo")
-            color = {"done": "#9ca3af", "over": "#e5484d", "todo": CAT_COLOR["업무"]}[kind]
-            m.setdefault(d, []).append(("99:99", kind, "⏰ " + t["title"], color))
+            kind = "done" if t["done"] else "todo"
+            color = "#9ca3af" if t["done"] else TODO_CATS.get(t["category"], "#4f46e5")
+            m.setdefault(d, []).append(("99:99", kind, "마감 " + t["title"], color))
     for v in m.values():
         v.sort(key=lambda x: x[0])
     return m
@@ -845,15 +966,103 @@ def items_by_date():
 
 def pill_html(kind, label, color):
     t = html.escape(label)
-    line = "dashed" if kind in ("todo", "over", "done") else "solid"      # 할 일 마감은 점선
+    line = "solid" if kind == "event" else "dashed"            # 할 일 마감은 점선
     return (f'<span class="pill {kind}" title="{t}" '
-            f'style="border-left:3px {line} {color}; background:{color}29">{t}</span>')
+            f'style="border-left:3px {line} {color}; background:{color}24">{t}</span>')
 
 
 def legend_html():
-    cats = "".join(f'<span><b style="color:{CAT_COLOR[c]}">■</b> {c}</span>' for c in EVENT_CATS)
-    return (f'<div class="legend">{cats}<span>⏰ 할 일 마감(점선)</span>'
-            f'<span><b style="color:#e5484d">■</b> 기한 지남</span></div>')
+    ev = "".join(f'<span><b style="color:{v["color"]}">■</b> {k}</span>' for k, v in EVENT_TYPES.items())
+    td = "".join(f'<span><b style="color:{c}">┆</b> {k}</span>' for k, c in TODO_CATS.items())
+    return (f'<div class="legend"><span><b>일정</b></span>{ev}</div>'
+            f'<div class="legend"><span><b>할 일 마감(점선)</b></span>{td}</div>')
+
+
+def event_html(e, show_date=True):
+    d = parse_date(e["date"])
+    color = "#e5484d" if d <= today else ("#d97706" if (d - today).days <= 3 else "#2563eb")
+    when = (f'<b style="color:{color}">{d_day(d)}</b> · {fmt_date(d)} ' if show_date else "") + event_time_text(e)
+    out = (f'{badge(e["category"], ev_color(e))}<b>{html.escape(e["title"])}</b>'
+           f'<br><span class="able-meta">{when}</span>')
+    conf = find_conflicts(e["date"], e["start"], e["end"], e["id"])
+    if conf:
+        out += '<br><span class="able-warn">충돌: ' + html.escape(", ".join(conflict_text(c) for c in conf)) + "</span>"
+    return out
+
+
+def todo_html(t):
+    d = parse_date(t["due"])
+    title = html.escape(t["title"])
+    if t["done"]:
+        title = f"<s>{title}</s>"
+    if d:
+        color = "#9ca3af" if t["done"] else ("#e5484d" if d < today else "#d97706" if (d - today).days <= 3 else "#2563eb")
+        due = f'<b style="color:{color}">{d_day(d)}</b> · 마감 {fmt_date(d)}'
+    else:
+        due = "기한 없음"
+    return (f'{badge(t["category"], TODO_CATS.get(t["category"], "#4f46e5"))}'
+            f'{badge(t["priority"], PRIORITY_COLOR[t["priority"]])}<b>{title}</b>'
+            f'<br><span class="able-meta">{due}</span>')
+
+
+def time_index(options, value):
+    return options.index(value) if value in options else 0
+
+
+def event_form(key, ev=None, default_date=None):
+    # 일정 추가/수정 폼. 제출하면 일정 정보(dict)를 돌려줌
+    with st.form(key, clear_on_submit=ev is None):
+        title = st.text_input("일정 제목", value=ev["title"] if ev else "")
+        c1, c2 = st.columns(2)
+        date = c1.date_input("날짜", value=parse_date(ev["date"]) if ev else (default_date or today))
+        cat_opts = ["자동 (제목으로 추정)"] + EVENT_CATS
+        cat = c2.selectbox("종류", cat_opts, index=cat_opts.index(ev["category"]) if ev else 0)
+        c3, c4 = st.columns(2)
+        t_opts = list(TIME_OPTIONS)
+        cur = (ev["start"] or "종일") if ev else "10:00"
+        if cur not in t_opts:
+            t_opts.insert(1, cur)
+        stime = c3.selectbox("시작 시간", t_opts, index=time_index(t_opts, cur))
+        d_opts = dict(DURATIONS)
+        d_idx = 0
+        if ev and event_span(ev):
+            sp = event_span(ev)
+            length = sp[1] - sp[0]
+            match = [k for k, v in d_opts.items() if v == length]
+            if not match:
+                d_opts[f"지금 길이 ({length}분)"] = length
+                match = [f"지금 길이 ({length}분)"]
+            d_idx = list(d_opts).index(match[0])
+        dur = c4.selectbox("소요 시간", list(d_opts), index=d_idx)
+        note = st.text_input("메모", value=ev["note"] if ev else "")
+        st.caption("소요 시간을 '자동'으로 두면 내부 체크인 20분 · 일반 회의 30분 · 온라인 회의 45분 · 고객사 미팅 60분으로 "
+                   "계산해요. 기존 일정과 겹치거나 간격이 10분 미만이면 알려 드려요.")
+        if st.form_submit_button("저장" if ev else "추가", type="primary"):
+            if not title.strip():
+                st.warning("제목을 입력하세요.")
+                return None
+            s = "" if stime == "종일" else stime
+            return {"title": title, "date": date.isoformat(), "start": s,
+                    "end": end_from(s, d_opts[dur]), "category": "" if cat.startswith("자동") else cat, "note": note}
+    return None
+
+
+def todo_form(key, t=None, default_due=None):
+    with st.form(key, clear_on_submit=t is None):
+        title = st.text_input("할 일", value=t["title"] if t else "")
+        c1, c2, c3 = st.columns(3)
+        due = c1.date_input("마감일", value=(parse_date(t["due"]) if t else default_due))
+        prio = c2.selectbox("우선순위", PRIORITIES, index=PRIORITIES.index(t["priority"]) if t else 1)
+        cat_opts = ["자동 (제목으로 추정)"] + list(TODO_CATS)
+        cat = c3.selectbox("분류", cat_opts, index=cat_opts.index(t["category"]) if t else 0)
+        detail = st.text_input("세부 내용", value=t["detail"] if t else "")
+        if st.form_submit_button("저장" if t else "추가", type="primary"):
+            if not title.strip():
+                st.warning("할 일을 입력하세요.")
+                return None
+            return {"title": title, "due": due.isoformat() if due else "", "priority": prio,
+                    "category": "" if cat.startswith("자동") else cat, "detail": detail}
+    return None
 
 
 def _toggle_from_dialog(todo_id):
@@ -862,69 +1071,68 @@ def _toggle_from_dialog(todo_id):
     st.session_state[f"chk_{todo_id}"] = done  # 대시보드 목록의 체크박스도 같이 맞춤
 
 
-@st.dialog("📅 하루 일정", width="large")
+@st.dialog("하루 일정", width="large")
 def day_dialog(d):
     iso = d.isoformat()
     st.markdown(f"### {d.year}년 {d.month}월 {d.day}일 ({WEEKDAYS[d.weekday()]}) · {d_day(d)}")
 
-    # --- 일정 (시간순, 분류 색상) ---
     events = sorted([e for e in data["events"] if e["date"] == iso], key=lambda e: e["start"] or "00:00")
-    st.markdown(f"#### 📌 일정 ({len(events)}건)")
+    st.markdown(f"#### 일정 ({len(events)}건)")
     if not events:
         st.caption("등록된 일정이 없습니다.")
     for e in events:
-        a, b = st.columns([7, 1])
-        over = [c for c in find_conflicts(e["date"], e["start"], e["end"], e["id"]) if c["kind"] == "overlap"]
-        a.markdown(f"{CAT_ICON[e['category']]} **{event_time_text(e)}** · {e['title']} "
-                   f":gray[({e['category']})]" + (" ⚠️시간 겹침" if over else ""))
-        if e["note"]:
-            a.caption(e["note"])
-        if b.button("🗑️", key=f"dlg_del_ev_{e['id']}", help="일정 삭제"):
-            delete_item("events", e["id"])
-            st.rerun(scope="fragment")
+        with st.container(border=True):
+            if st.session_state.get("dlg_edit") == e["id"]:
+                f = event_form(f"dlg_ev_edit_{e['id']}", e)
+                if f:
+                    r = update_event(e["id"], **f)
+                    st.session_state.dlg_edit = None
+                    if r["status"] == "needs_approval":
+                        st.rerun()             # 충돌 → 창을 닫고 화면 위에서 시간 선택
+                    st.rerun(scope="fragment")
+                if st.button("취소", key=f"dlg_edit_cancel_{e['id']}"):
+                    st.session_state.dlg_edit = None
+                    st.rerun(scope="fragment")
+            else:
+                a, b, c = st.columns([6, 1, 1])
+                a.markdown(event_html(e, show_date=False), unsafe_allow_html=True)
+                if e["note"]:
+                    a.caption(e["note"])
+                if b.button("수정", key=f"dlg_ed_ev_{e['id']}"):
+                    st.session_state.dlg_edit = e["id"]
+                    st.rerun(scope="fragment")
+                if c.button("삭제", key=f"dlg_del_ev_{e['id']}"):
+                    delete_item("events", e["id"])
+                    st.rerun(scope="fragment")
 
-    # --- 이 날 마감인 할 일 ---
     todos = [t for t in data["todos"] if t["due"] == iso]
-    st.markdown(f"#### ⏰ 이 날 마감인 할 일 ({len(todos)}건)")
+    st.markdown(f"#### 이 날 마감인 할 일 ({len(todos)}건)")
     if not todos:
         st.caption("이 날 마감인 할 일이 없습니다.")
     for t in todos:
         a, b, c = st.columns([0.6, 6.4, 1])
         a.checkbox("완료", value=t["done"], key=f"dlg_chk_{t['id']}",
                    on_change=_toggle_from_dialog, args=(t["id"],), label_visibility="collapsed")
-        title = f"~~{t['title']}~~" if t["done"] else f"**{t['title']}**"
-        b.markdown(f"{PRIORITY_ICON[t['priority']]} {title}")
-        if t["detail"]:
-            b.caption(t["detail"])
-        if c.button("🗑️", key=f"dlg_del_td_{t['id']}", help="할 일 삭제"):
+        b.markdown(todo_html(t), unsafe_allow_html=True)
+        if c.button("삭제", key=f"dlg_del_td_{t['id']}"):
             delete_item("todos", t["id"])
             st.rerun(scope="fragment")
 
-    # --- 추가 ---
-    st.markdown("#### ➕ 이 날에 추가")
-    with st.form(f"dlg_add_{iso}", clear_on_submit=True):
-        kind = st.radio("종류", ["일정", "할 일(마감)"], horizontal=True)
-        title = st.text_input("제목")
-        c1, c2, c3 = st.columns(3)
-        cat = c1.selectbox("분류 (일정)", ["자동 분류"] + EVENT_CATS)
-        stime = c2.selectbox("시작 시간 (일정)", TIME_OPTIONS, index=TIME_OPTIONS.index("10:00"))
-        dur = c3.selectbox("소요 시간 (일정)", list(DURATIONS), index=1)
-        c4, c5 = st.columns([1, 2])
-        prio = c4.selectbox("우선순위 (할 일)", PRIORITIES, index=1)
-        note = c5.text_input("메모 / 세부 내용")
-        if st.form_submit_button("추가", type="primary"):
-            if not title.strip():
-                st.warning("제목을 입력하세요.")
-            elif kind == "일정":
-                s = "" if stime == "종일" else stime
-                r = add_event(title, iso, note, "직접 입력", s, end_from(s, DURATIONS[dur]),
-                              "" if cat == "자동 분류" else cat)
-                if r["conflicts"]:
-                    st.rerun()                  # 겹치면 창을 닫고 화면 위 알림으로 대체 시간 안내
-                st.rerun(scope="fragment")
-            else:
-                add_todo(title, iso, prio, note)
-                st.rerun(scope="fragment")
+    st.markdown("#### 이 날에 추가")
+    kind = st.radio("종류", ["일정", "할 일(마감)"], horizontal=True, key=f"dlg_kind_{iso}",
+                    label_visibility="collapsed")
+    if kind == "일정":
+        f = event_form(f"dlg_add_ev_{iso}", default_date=d)
+        if f:
+            r = add_event(f["title"], f["date"], f["note"], "직접 입력", f["start"], f["end"], f["category"])
+            if r["status"] == "needs_approval":
+                st.rerun()
+            st.rerun(scope="fragment")
+    else:
+        f = todo_form(f"dlg_add_td_{iso}", default_due=d)
+        if f:
+            add_todo(f["title"], f["due"], f["priority"], f["detail"], "직접 입력", f["category"])
+            st.rerun(scope="fragment")
 
     st.divider()
     if st.button("닫고 캘린더에 반영", type="primary", use_container_width=True):
@@ -949,7 +1157,7 @@ def render_calendar(year, month):
                     if st.button(str(d.day), key=f"day_{d.isoformat()}",
                                  type="primary" if d == today else "secondary",
                                  use_container_width=True,
-                                 help=f"{d.month}월 {d.day}일 일정 보기·추가·삭제"):
+                                 help=f"{d.month}월 {d.day}일 일정 보기·추가·수정·삭제"):
                         day_dialog(d)
                     pills = "".join(pill_html(k, lb, c) for _, k, lb, c in items[:2])
                     if len(items) > 2:
@@ -957,70 +1165,59 @@ def render_calendar(year, month):
                     other = " other" if d.month != month else ""
                     st.markdown(f'<div class="able-cal cal-cell{other}">{pills}</div>', unsafe_allow_html=True)
 
-    st.markdown(legend_html() + '<div class="legend"><span>👆 날짜를 누르면 그 날 일정을 보고 추가·삭제할 수 있어요</span></div>',
-                unsafe_allow_html=True)
+    st.markdown(legend_html(), unsafe_allow_html=True)
+    st.caption("날짜를 누르면 그 날 일정을 보고 추가·수정·삭제할 수 있어요.")
 
 
 def count_overlaps():
     n = 0
     for e in data["events"]:
         d = parse_date(e["date"])
-        if d and d >= today and any(c["kind"] == "overlap"
-                                    for c in find_conflicts(e["date"], e["start"], e["end"], e["id"])):
+        if d and d >= today and find_conflicts(e["date"], e["start"], e["end"], e["id"]):
             n += 1
     return n
 
 
-def _move_cb(event_id, slot):
-    r = move_event(event_id, slot["date"], slot["start"], slot["end"])
-    st.session_state.pop("conflict_alert", None)
-    st.session_state.pending_toast = (f"'{r['title']}' 일정을 {slot_text(slot)}(으)로 옮겼어요."
-                                      if r["status"] == "success" else f"⚠️ {r['error']}")
+def _decide_cb(choice):
+    r = decide_pending(choice)
+    if r["status"] == "success":
+        st.session_state.pending_toast = (f"'{r['title']}' 일정 등록을 취소했어요." if r["decision"] == "취소"
+                                          else f"'{r['title']}' 일정을 {r['date']} {r['time']}에 등록했어요.")
+    else:
+        st.session_state.pending_toast = f"⚠️ {r['error']}"
 
 
-def _keep_cb():
-    st.session_state.pop("conflict_alert", None)
-
-
-def _cancel_event_cb(event_id):
-    delete_item("events", event_id)
-    st.session_state.pop("conflict_alert", None)
-    st.session_state.pending_toast = "새로 추가한 일정을 취소했어요."
-
-
-def render_conflict_alert():
-    # 일정이 겹치면 모든 탭 위에 알림 + 대체 시간 버튼
-    ca = st.session_state.get("conflict_alert")
-    if not ca:
+def render_pending_event():
+    # 일정 충돌 → 사용자 승인: 대체 시간 선택 / 원래 시간으로 등록 / 취소
+    p = st.session_state.get("pending_event")
+    if not p:
         return
-    ev = next((e for e in data["events"] if e["id"] == ca["event_id"]), None)
-    conflicts = find_conflicts(ev["date"], ev["start"], ev["end"], ev["id"]) if ev else []
-    if not conflicts:
-        st.session_state.pop("conflict_alert", None)
-        return
-    overlap = any(c["kind"] == "overlap" for c in conflicts)
+    f = p["fields"]
+    conflicts = find_conflicts(f["date"], f["start"], f["end"], p["event_id"])
     with st.container(border=True):
-        head = f"**'{ev['title']}'** ({fmt_date(parse_date(ev['date']))} {event_time_text(ev)}) 일정이 "
-        if overlap:
-            st.warning("⚠️ " + head + "기존 일정과 시간이 겹쳐요.")
+        what = "수정" if p["mode"] == "edit" else "추가"
+        st.warning(f"⚠️ 일정 충돌 감지 — {what}하려는 '{f['title']}' "
+                   f"({fmt_date(parse_date(f['date']))} {event_time_text(f)}, {f['category']})")
+        if conflicts:
+            st.markdown("<br>".join(f"{badge(c['category'], ev_color(c))}{html.escape(c['title'])} · "
+                                    f"{event_time_text(c)} — <b>{c['reason']}</b>" for c in conflicts),
+                        unsafe_allow_html=True)
+            st.caption("기존 일정과 겹치거나 앞뒤 간격이 10분 미만이에요. 어떻게 할까요?")
         else:
-            st.info("ℹ️ " + head + "같은 날 종일 일정과 겹쳐요.")
-        for c in conflicts:
-            st.markdown(f"- {CAT_ICON[c['category']]} {c['title']} · {event_time_text(c)}"
-                        + (" (시간 겹침)" if c["kind"] == "overlap" else " (종일 일정)"))
-        sugg = [s for s in ca.get("suggestions", []) if slot_ok(s, ev["id"])]
+            st.caption("지금은 겹치는 일정이 없어졌어요. 원래 시간으로 등록할 수 있어요.")
+        sugg = p["suggestions"]
         if sugg:
-            st.markdown("**💡 에이블이 찾은 비어 있는 시간** · 업무 시간 9~18시, 점심 12~13시 제외")
+            st.markdown("**대체 시간 추천** · 업무 시간 9~18시, 점심 12~13시 제외, 앞뒤 10분 여유")
             cols = st.columns(len(sugg))
             for i, s in enumerate(sugg):
-                cols[i].button(f"🕑 {slot_text(s)}로 옮기기", key=f"ca_mv_{i}", on_click=_move_cb,
-                               args=(ev["id"], s), use_container_width=True)
+                ok = is_free(s["date"], parse_time(s["start"]), parse_time(s["end"]), p["event_id"])
+                cols[i].button(f"{i + 1}. {slot_text(s)}", key=f"pe_s{i}", on_click=_decide_cb, args=(str(i + 1),),
+                               use_container_width=True, disabled=not ok, type="primary" if i == 0 else "secondary")
         else:
-            st.caption("2주 안에서 비어 있는 업무 시간을 찾지 못했어요.")
-        a, b, _ = st.columns([1.2, 1.2, 3])
-        a.button("그대로 두기", key="ca_keep", on_click=_keep_cb, use_container_width=True)
-        b.button("🗑️ 이 일정 취소", key="ca_del", on_click=_cancel_event_cb, args=(ev["id"],),
-                 use_container_width=True)
+            st.caption("2주 안에서 충돌하지 않는 업무 시간을 찾지 못했어요.")
+        a, b, _ = st.columns([1.4, 1, 3])
+        a.button("원래 시간으로 등록", key="pe_orig", on_click=_decide_cb, args=("original",), use_container_width=True)
+        b.button("취소", key="pe_cancel", on_click=_decide_cb, args=("cancel",), use_container_width=True)
 
 
 # ─────────────────────────────────────────────
@@ -1032,20 +1229,20 @@ if st.session_state.get("pending_toast"):
     st.toast(_msg.lstrip("⚠️ ") if _warn else _msg, icon="⚠️" if _warn else "✅")
 
 _undone = [t for t in data["todos"] if not t["done"]]
-_chips = [f"📅 오늘 일정 {sum(e['date'] == today.isoformat() for e in data['events'])}건",
-          f"⏰ 오늘 마감 {sum(t['due'] == today.isoformat() for t in _undone)}건",
-          f"✅ 남은 할 일 {len(_undone)}건"]
+_chips = [f"오늘 일정 {sum(e['date'] == today.isoformat() for e in data['events'])}건",
+          f"오늘 마감 {sum(t['due'] == today.isoformat() for t in _undone)}건",
+          f"남은 할 일 {len(_undone)}건"]
 _chip_html = "".join(f'<span class="able-chip">{html.escape(c)}</span>' for c in _chips)
 _ov = count_overlaps()
 if _ov:
-    _chip_html += f'<span class="able-chip warn">⚠️ 겹치는 일정 {_ov}건</span>'
+    _chip_html += f'<span class="able-chip warn">충돌 일정 {_ov}건</span>'
 st.markdown(
     f'<div class="able-hero"><div class="able-title">🤖 AI 개인비서 에이블</div>'
     f'<div class="able-sub">김 대리님의 업무를 돕는 음성 AI 비서 · {today.year}년 {today.month}월 {today.day}일 '
     f'{WEEKDAYS[today.weekday()]}요일</div>{_chip_html}</div>',
     unsafe_allow_html=True)
 
-render_conflict_alert()
+render_pending_event()
 
 tab_chat, tab_dash, tab_meet, tab_mail = st.tabs(["🤖 에이블 비서", "📊 대시보드", "🎙️ 회의 분석", "📥 메일 비서"])
 
@@ -1064,7 +1261,7 @@ with tab_dash:
     c2.metric("남은 할 일", f"{len(undone)}건",
               delta=f"기한 지남 {len(overdue)}건" if overdue else None, delta_color="inverse")
     c3.metric("이번 주 마감", f"{len(due_this_week)}건")
-    c4.metric("겹치는 일정", f"{_ov}건")
+    c4.metric("충돌 일정", f"{_ov}건")
     c5.metric("완료율", f"{rate}%")
 
     left, right = st.columns([3, 2], gap="large")
@@ -1078,7 +1275,7 @@ with tab_dash:
         if n1.button("◀", key="prev_m"):
             st.session_state.cal_ym = (y - 1, 12) if mth == 1 else (y, mth - 1)
             st.rerun()
-        n2.markdown(f"### 📅 {y}년 {mth}월")
+        n2.markdown(f"### {y}년 {mth}월")
         if n3.button("오늘", key="today_m"):
             st.session_state.cal_ym = (today.year, today.month)
             st.rerun()
@@ -1087,108 +1284,97 @@ with tab_dash:
             st.rerun()
         render_calendar(y, mth)
 
-    # --- 주요 일정 ---
+    # --- 오른쪽: 주요 일정 / 할 일 목록 (나란히 놓고 골라 보기) ---
     with right:
-        st.markdown("### ⭐ 주요 일정")
-        horizon = today + dt.timedelta(days=30)
-        upcoming = []
-        for e in data["events"]:
-            d = parse_date(e["date"])
-            if d and today <= d <= horizon:
-                upcoming.append((d, e["start"] or "00:00", "event", e))
-        for t in undone:
-            d = parse_date(t["due"])
-            if d and d <= horizon:
-                upcoming.append((d, "99:99", "todo", t))
-        upcoming.sort(key=lambda x: (x[0], x[1]))
+        rt_ev, rt_td = st.tabs([f"주요 일정 ({sum(1 for e in data['events'] if (d := parse_date(e['date'])) and today <= d <= today + dt.timedelta(days=30))})",
+                                f"할 일 목록 ({len(undone)})"])
 
-        if not upcoming:
-            st.info("앞으로 30일 안에 예정된 일정이 없습니다.")
-        for d, _, kind, obj in upcoming:
-            with st.container(border=True):
-                a, b = st.columns([5, 1])
-                color = "red" if d <= today else ("orange" if (d - today).days <= 3 else "blue")
-                if kind == "event":
-                    over = [c for c in find_conflicts(obj["date"], obj["start"], obj["end"], obj["id"])
-                            if c["kind"] == "overlap"]
-                    a.markdown(f"{CAT_ICON[obj['category']]} **{obj['title']}**" + (" ⚠️" if over else "")
-                               + f"  \n:{color}[**{d_day(d)}**] · {fmt_date(d)} {event_time_text(obj)}"
-                               + f" · {obj['category']}")
-                    if over:
-                        a.caption("⚠️ 시간이 겹침: " + ", ".join(c["title"] for c in over))
-                    elif obj["note"]:
-                        a.caption(obj["note"])
-                    if b.button("🗑️", key=f"del_ev_{obj['id']}", help="일정 삭제"):
-                        delete_item("events", obj["id"])
-                        st.rerun()
-                else:
-                    a.markdown(f"⏰ **[마감] {obj['title']}**  \n:{color}[**{d_day(d)}**] · {fmt_date(d)}")
-                    if obj["detail"]:
-                        a.caption(obj["detail"])
-
-        with st.expander("➕ 일정 추가"):
-            with st.form("add_event", clear_on_submit=True):
-                et = st.text_input("일정 제목")
-                a, b = st.columns(2)
-                ed = a.date_input("날짜", value=today)
-                ecat = b.selectbox("분류", ["자동 분류"] + EVENT_CATS)
-                c, d_ = st.columns(2)
-                est = c.selectbox("시작 시간", TIME_OPTIONS, index=TIME_OPTIONS.index("10:00"))
-                edu = d_.selectbox("소요 시간", list(DURATIONS), index=1)
-                en = st.text_input("메모")
-                if st.form_submit_button("추가", type="primary") and et.strip():
-                    s = "" if est == "종일" else est
-                    add_event(et, ed.isoformat(), en, "직접 입력", s, end_from(s, DURATIONS[edu]),
-                              "" if ecat == "자동 분류" else ecat)
+        with rt_ev:
+            horizon = today + dt.timedelta(days=30)
+            upcoming = sorted([e for e in data["events"] if (d := parse_date(e["date"])) and today <= d <= horizon],
+                              key=lambda e: (e["date"], e["start"] or "00:00"))
+            if not upcoming:
+                st.info("앞으로 30일 안에 예정된 일정이 없습니다.")
+            for e in upcoming:
+                with st.container(border=True):
+                    if st.session_state.get("edit_ev") == e["id"]:
+                        st.caption(f"일정 수정 · 등록: {e['source'] or '직접 입력'}")
+                        f = event_form(f"ev_edit_{e['id']}", e)
+                        if f:
+                            r = update_event(e["id"], **f)
+                            st.session_state.edit_ev = None
+                            if r["status"] == "success":
+                                st.session_state.pending_toast = f"'{r['title']}' 일정을 수정했어요."
+                            st.rerun()
+                        if st.button("수정 취소", key=f"ev_edit_cancel_{e['id']}"):
+                            st.session_state.edit_ev = None
+                            st.rerun()
+                    else:
+                        a, b, c = st.columns([5, 1.1, 1.1])
+                        a.markdown(event_html(e), unsafe_allow_html=True)
+                        if e["note"]:
+                            a.caption(e["note"])
+                        if e["source"] in ("에이블", "회의 분석") or e["source"].startswith("메일"):
+                            a.caption(f"AI 등록 ({e['source']}) · 수정할 수 있어요")
+                        if b.button("수정", key=f"ed_ev_{e['id']}", use_container_width=True):
+                            st.session_state.edit_ev = e["id"]
+                            st.rerun()
+                        if c.button("삭제", key=f"del_ev_{e['id']}", use_container_width=True):
+                            delete_item("events", e["id"])
+                            st.rerun()
+            with st.expander("일정 추가"):
+                f = event_form("add_event")
+                if f:
+                    r = add_event(f["title"], f["date"], f["note"], "직접 입력", f["start"], f["end"], f["category"])
+                    if r["status"] == "success":
+                        st.session_state.pending_toast = f"'{r['title']}' 일정을 {event_time_text(r)}에 등록했어요."
                     st.rerun()
 
-    # --- 할 일 목록 ---
-    st.markdown("### ✅ 해야 할 일")
-    f1, f2 = st.columns([3, 2])
-    view = f1.radio("보기", ["진행 중", "완료", "전체"], horizontal=True, label_visibility="collapsed")
+        with rt_td:
+            view = st.radio("보기", ["진행 중", "완료", "전체"], horizontal=True, label_visibility="collapsed")
 
-    def toggle(todo_id):
-        set_todo_done(todo_id, st.session_state[f"chk_{todo_id}"])
+            def toggle(todo_id):
+                set_todo_done(todo_id, st.session_state[f"chk_{todo_id}"])
 
-    todos = data["todos"]
-    if view == "진행 중":
-        todos = [t for t in todos if not t["done"]]
-    elif view == "완료":
-        todos = [t for t in todos if t["done"]]
-    todos = sorted(todos, key=lambda t: (t["done"], t["due"] or "9999", PRIORITY_ORDER[t["priority"]]))
-
-    if not todos:
-        st.info("표시할 할 일이 없습니다. '🎙️ 회의 분석'이나 '📥 메일 비서'에서 업무를 가져오거나 직접 추가해 보세요.")
-    for t in todos:
-        d = parse_date(t["due"])
-        with st.container(border=True):
-            c0, c1, c2, c3 = st.columns([0.5, 6, 2, 0.7])
-            c0.checkbox("완료", value=t["done"], key=f"chk_{t['id']}", on_change=toggle,
-                        args=(t["id"],), label_visibility="collapsed")
-            title = f"~~{t['title']}~~" if t["done"] else f"**{t['title']}**"
-            c1.markdown(f"{PRIORITY_ICON[t['priority']]} {title}")
-            if t["detail"]:
-                c1.caption(t["detail"])
-            if d:
-                color = "gray" if t["done"] else ("red" if d < today else
-                                                  "orange" if (d - today).days <= 3 else "blue")
-                c2.markdown(f":{color}[{fmt_date(d)} · {d_day(d)}]")
-            else:
-                c2.caption("기한 없음")
-            if c3.button("🗑️", key=f"del_td_{t['id']}", help="삭제"):
-                delete_item("todos", t["id"])
-                st.rerun()
-
-    with st.expander("➕ 할 일 추가"):
-        with st.form("add_todo", clear_on_submit=True):
-            tt = st.text_input("할 일")
-            a, b = st.columns(2)
-            td = a.date_input("마감일", value=None)
-            tp = b.selectbox("우선순위", PRIORITIES, index=1)
-            tdt = st.text_input("세부 내용")
-            if st.form_submit_button("추가") and tt:
-                add_todo(tt, td.isoformat() if td else "", tp, tdt)
-                st.rerun()
+            todos = data["todos"]
+            if view == "진행 중":
+                todos = [t for t in todos if not t["done"]]
+            elif view == "완료":
+                todos = [t for t in todos if t["done"]]
+            todos = sorted(todos, key=lambda t: (t["done"], t["due"] or "9999", PRIORITY_ORDER[t["priority"]]))
+            if not todos:
+                st.info("표시할 할 일이 없습니다. '회의 분석'이나 '메일 비서'에서 업무를 가져오거나 직접 추가해 보세요.")
+            for t in todos:
+                with st.container(border=True):
+                    if st.session_state.get("edit_td") == t["id"]:
+                        st.caption(f"할 일 수정 · 등록: {t['source'] or '직접 입력'}")
+                        f = todo_form(f"td_edit_{t['id']}", t)
+                        if f:
+                            update_todo(t["id"], **f)
+                            st.session_state.edit_td = None
+                            st.session_state.pending_toast = "할 일을 수정했어요."
+                            st.rerun()
+                        if st.button("수정 취소", key=f"td_edit_cancel_{t['id']}"):
+                            st.session_state.edit_td = None
+                            st.rerun()
+                    else:
+                        c0, c1, c2, c3 = st.columns([0.5, 5, 1.1, 1.1])
+                        c0.checkbox("완료", value=t["done"], key=f"chk_{t['id']}", on_change=toggle,
+                                    args=(t["id"],), label_visibility="collapsed")
+                        c1.markdown(todo_html(t), unsafe_allow_html=True)
+                        if t["detail"]:
+                            c1.caption(t["detail"])
+                        if c2.button("수정", key=f"ed_td_{t['id']}", use_container_width=True):
+                            st.session_state.edit_td = t["id"]
+                            st.rerun()
+                        if c3.button("삭제", key=f"del_td_{t['id']}", use_container_width=True):
+                            delete_item("todos", t["id"])
+                            st.rerun()
+            with st.expander("할 일 추가"):
+                f = todo_form("add_todo")
+                if f:
+                    add_todo(f["title"], f["due"], f["priority"], f["detail"], "직접 입력", f["category"])
+                    st.rerun()
 
 # ===== 에이블 비서 도구 (이메일 발송 · 할 일/일정 관리) =====
 TOOLS = [
@@ -1218,22 +1404,26 @@ TOOLS = [
                 "due": {"type": "string", "description": "마감일 YYYY-MM-DD, 없으면 빈 문자열"},
                 "priority": {"type": "string", "enum": PRIORITIES},
                 "detail": {"type": "string", "description": "세부 내용, 없으면 빈 문자열"},
+                "category": {"type": "string", "enum": list(TODO_CATS), "description": "할 일 분류"},
             },
-            "required": ["title", "due", "priority", "detail"], "additionalProperties": False,
+            "required": ["title", "due", "priority", "detail", "category"], "additionalProperties": False,
         },
         "strict": True,
     },
     {
         "type": "function", "name": "add_event",
-        "description": "캘린더에 일정을 추가합니다. 결과에 conflicts가 있으면 기존 일정과 겹친 것입니다.",
+        "description": "캘린더에 일정을 추가합니다. 기존 일정과 겹치거나 간격이 10분 미만이면 등록하지 않고 "
+                       "status=needs_approval과 대체 시간(suggestions)을 돌려줍니다.",
         "parameters": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "일정 제목"},
                 "date": {"type": "string", "description": "날짜 YYYY-MM-DD"},
                 "start": {"type": "string", "description": "시작 시간 HH:MM (24시간), 종일 일정이면 빈 문자열"},
-                "end": {"type": "string", "description": "끝나는 시간 HH:MM, 모르면 빈 문자열(1시간으로 계산)"},
-                "category": {"type": "string", "enum": EVENT_CATS, "description": "회의/업무/개인/기타"},
+                "end": {"type": "string",
+                        "description": "끝나는 시간 HH:MM. 말하지 않았으면 빈 문자열 → 종류별 자동 "
+                                       "(내부 체크인 20분, 일반 회의 30분, 온라인 회의 45분, 고객사 미팅 60분)"},
+                "category": {"type": "string", "enum": EVENT_CATS, "description": "일정 종류"},
                 "note": {"type": "string", "description": "메모, 없으면 빈 문자열"},
             },
             "required": ["title", "date", "start", "end", "category", "note"], "additionalProperties": False,
@@ -1242,7 +1432,8 @@ TOOLS = [
     },
     {
         "type": "function", "name": "move_event",
-        "description": "기존 일정의 날짜·시간을 옮깁니다. id는 [현재 업무 데이터]의 일정 id를 사용합니다.",
+        "description": "기존 일정의 날짜·시간을 옮깁니다. id는 [현재 업무 데이터]의 일정 id를 사용합니다. "
+                       "옮긴 시간이 충돌하면 needs_approval을 돌려줍니다.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1252,6 +1443,17 @@ TOOLS = [
                 "end": {"type": "string", "description": "HH:MM, 모르면 빈 문자열(원래 길이 유지)"},
             },
             "required": ["id", "date", "start", "end"], "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function", "name": "decide_pending_event",
+        "description": "충돌로 승인 대기 중인 일정을 김 대리의 선택대로 처리합니다. "
+                       "1~3: 그 번호의 대체 시간으로 등록, original: 원래 시간으로 등록, cancel: 취소.",
+        "parameters": {
+            "type": "object",
+            "properties": {"choice": {"type": "string", "enum": ["1", "2", "3", "original", "cancel"]}},
+            "required": ["choice"], "additionalProperties": False,
         },
         "strict": True,
     },
@@ -1267,18 +1469,20 @@ TOOLS = [
     },
 ]
 
-TOOL_LABEL = {"send_email": "📧 메일", "add_todo": "✅ 할 일 추가", "add_event": "📅 일정 추가",
-              "move_event": "🕑 일정 변경", "complete_todo": "☑️ 완료 처리"}
+TOOL_LABEL = {"send_email": "메일", "add_todo": "할 일 추가", "add_event": "일정 추가",
+              "move_event": "일정 변경", "complete_todo": "완료 처리", "decide_pending_event": "일정 승인"}
 
 
 def run_tool(name, args):
     if name == "add_todo":
-        return add_todo(args["title"], args["due"], args["priority"], args["detail"], "에이블")
+        return add_todo(args["title"], args["due"], args["priority"], args["detail"], "에이블", args["category"])
     if name == "add_event":
         return add_event(args["title"], args["date"], args["note"], "에이블", args["start"], args["end"],
                          args["category"])
     if name == "move_event":
         return move_event(args["id"], args["date"], args["start"], args["end"])
+    if name == "decide_pending_event":
+        return decide_pending(args["choice"])
     if name == "complete_todo":
         return set_todo_done(args["id"], True)
     return {"status": "failed", "error": f"알 수 없는 도구: {name}"}
@@ -1288,16 +1492,19 @@ def action_of(name, args, result):
     label = TOOL_LABEL.get(name, name)
     if not isinstance(result, dict) or result.get("status") == "failed":
         return {"ok": False, "text": f"{label} 실패 ({(result or {}).get('error', '')})"}
-    if name == "add_event":
-        txt = (f"{label} 완료 → {CAT_ICON[result['category']]} {result['title']} "
-               f"({fmt_date(parse_date(result['date']))} {event_time_text(result)})")
-        if result["conflicts"]:
-            return {"ok": True, "warn": True, "text": txt + f" · ⚠️ 겹치는 일정 {len(result['conflicts'])}건"}
-        return {"ok": True, "text": txt}
-    if name == "move_event":
-        return {"ok": True, "text": f"{label} 완료 → {result['title']} ({result['date']} {result['time']})"}
+    if result.get("status") == "needs_approval":
+        return {"ok": True, "warn": True,
+                "text": f"일정 충돌 감지 → 승인 대기: {result['title']} ({result['requested']}) · "
+                        f"겹치는 일정 {len(result['conflicts'])}건, 대체 시간 {len(result['suggestions'])}개"}
+    if name in ("add_event", "move_event"):
+        return {"ok": True, "text": f"{label} 완료 → {result['title']} "
+                                    f"({fmt_date(parse_date(result['date']))} {event_time_text(result)}, {result['category']})"}
+    if name == "decide_pending_event":
+        if result["decision"] == "취소":
+            return {"ok": True, "text": f"{label} → '{result['title']}' 등록 취소"}
+        return {"ok": True, "text": f"{label} → {result['title']} {result['date']} {result['time']} 등록 ({result['decision']})"}
     if name == "add_todo":
-        return {"ok": True, "text": f"{label} 완료 → {args['title']}"}
+        return {"ok": True, "text": f"{label} 완료 → {result['title']} ({result['category']})"}
     return {"ok": True, "text": f"{label} 완료 → {result.get('todo', '')}"}
 
 
@@ -1307,7 +1514,8 @@ def show_action(a):
 
 def system_prompt():
     snapshot = {
-        "todos": [{k: t[k] for k in ("id", "title", "due", "priority", "done", "detail")} for t in data["todos"]],
+        "todos": [{k: t[k] for k in ("id", "title", "due", "priority", "category", "done", "detail")}
+                  for t in data["todos"]],
         "events": [{k: e[k] for k in ("id", "title", "date", "start", "end", "category", "note")}
                    for e in data["events"]],
         "contacts": [{"name": c["name"], "role": c["role"], "team": c["team"], "alias": c["alias"],
@@ -1322,10 +1530,13 @@ def system_prompt():
         "- [현재 업무 데이터], [최근 회의], 첨부 파일, 이전 대화에 있는 내용만 근거로 답합니다.",
         "  근거가 없는 내용은 지어내지 말고 '확인되지 않는 내용입니다'라고 말합니다.",
         "- '다음 주 금요일', '모레 오후 3시' 같은 표현은 오늘 기준 YYYY-MM-DD, HH:MM으로 바꿔 도구에 넘깁니다.",
-        "- 할 일/일정 추가, 일정 변경, 완료 처리를 요청하면 해당 도구를 사용합니다.",
-        "  일정 분류는 회의/업무/개인/기타 중 내용에 맞게 고릅니다.",
-        "- add_event 결과에 conflicts가 있으면 겹치는 일정을 알려 주고, suggestions에 있는 시간만 대체 시간으로 제안합니다.",
-        "  다른 시간을 지어내지 않습니다. 김 대리가 고르면 move_event로 옮깁니다.",
+        "- 할 일/일정 추가, 일정 변경, 완료 처리를 요청하면 해당 도구를 사용합니다. 제목에 이모티콘을 넣지 않습니다.",
+        "- 일정 종류: 내부 체크인 / 일반 회의 / 온라인 회의 / 고객사 미팅 / 업무 / 개인 / 기타 중 내용에 맞게 고릅니다.",
+        "  끝나는 시간을 말하지 않았으면 end는 빈 문자열로 둡니다(종류별 소요시간 자동 추정).",
+        "- add_event·move_event 결과가 needs_approval이면 아직 등록되지 않은 것입니다.",
+        "  어떤 일정과 왜 충돌하는지(시간 겹침/간격 n분) 알리고, suggestions의 번호와 시간만 제시한 뒤",
+        "  '대체 시간 번호 선택, 원래 시간으로 등록, 취소' 중 고르게 합니다. 다른 시간을 지어내지 않습니다.",
+        "  김 대리가 고르면(예: '2번으로', '그냥 원래대로', '취소해') decide_pending_event를 사용합니다.",
         "- 이메일로 보내 달라는 명시적 요청이 있을 때만 send_email을 사용합니다.",
         "  받는 사람을 말하지 않으면 to에 '나'를 넣습니다. 연락처에 있는 사람은 이름으로 넣을 수 있고,",
         "  연락처에 없는 사람의 이메일 주소는 절대 지어내지 않습니다.",
@@ -1339,6 +1550,12 @@ def system_prompt():
         json.dumps(snapshot, ensure_ascii=False),
         "",
     ]
+    p = st.session_state.get("pending_event")
+    if p:
+        f = p["fields"]
+        lines += ["[승인 대기 중인 일정]",
+                  f"{f['title']} ({f['date']} {event_time_text(f)}, {f['category']}) — 대체 시간: "
+                  + ", ".join(f"{i + 1}) {slot_text(x)}" for i, x in enumerate(p["suggestions"])), ""]
     note = latest_note()
     if note:
         lines += [f"[최근 회의] {note['title']} ({note['when']})", "요약:"]
@@ -1358,7 +1575,7 @@ def system_prompt():
 MAX_TURNS = 10   # 대화마다 기억할 질문+답변 개수
 MAX_CHATS = 10   # 보관할 대화 개수
 VOICES = {"alloy": "기본", "nova": "밝은", "shimmer": "부드러운", "echo": "차분한", "onyx": "낮은"}
-QUICK_ASKS = ["📝 최근 회의 내용 요약해줘", "📅 내일 오후 2시에 팀 회의 일정 잡아줘", "📧 오늘 할 일을 내 메일로 보내줘"]
+QUICK_ASKS = ["📝 최근 회의 내용 요약해줘", "📅 내일 오후 2시에 고객사 미팅 잡아줘", "📧 오늘 할 일을 내 메일로 보내줘"]
 
 
 def clean_for_tts(text):
@@ -1375,9 +1592,11 @@ def current_chat():
     return next((c for c in data["chats"] if c["id"] == cid), None)
 
 
-def new_chat_cb():
+def new_chat_cb(notify=True):
     st.session_state.chat_id = None
-    st.session_state.chat_n = st.session_state.get("chat_n", 0) + 1
+    st.session_state.chat_n = st.session_state.get("chat_n", 0) + 1     # 녹음기·입력칸 새로
+    if notify:
+        st.session_state.pending_toast = "새 채팅을 시작했어요. 에이블 비서 탭에서 마이크를 눌러 말로 요청해 보세요."
 
 
 def open_chat_cb(cid):
@@ -1389,7 +1608,7 @@ def delete_chat_cb(cid):
     data["chats"] = [c for c in data["chats"] if c["id"] != cid]
     save_data()
     if st.session_state.get("chat_id") == cid:
-        new_chat_cb()
+        new_chat_cb(notify=False)
 
 
 def save_turn(chat, turn):
@@ -1524,20 +1743,28 @@ with tab_chat:
     h3.download_button("⬇️ 대화 저장", history_text(chat) if chat else "", file_name="에이블_대화기록.txt",
                        mime="text/plain", use_container_width=True, disabled=not turns)
 
+    voice_in = None
+    has_mic = hasattr(st, "audio_input")
     if not turns:
+        # 새 채팅: 바로 말로 요청할 수 있게 녹음기를 맨 위에 크게
         with st.container(border=True):
-            st.markdown("**무엇을 도와드릴까요, 김 대리님? 에이블이 할 수 있는 일**")
-            st.markdown("- 📝 첨부한 파일이나 최근 회의 내용 요약, 김 대리 업무 정리\n"
-                        "- 📅 일정 추가·변경 (겹치면 알려 드리고 비어 있는 시간을 제안해요)\n"
-                        "- 📧 요청하면 메일 작성·발송 (연락처 이름으로 보내기, 보내기 전에 한 번 더 확인)\n"
-                        "- 💬 이전 질문을 기억해서 이어서 대화 · 🔊 답변을 바로 음성으로 읽어 드려요")
+            st.markdown("### 🎙️ 말로 요청해 보세요")
+            st.caption("마이크 버튼을 눌러 말하고 다시 누르면 바로 에이블에게 전달돼요. "
+                       "예) 내일 오후 2시에 고객사 미팅 잡아줘 · 최근 회의 요약해서 박과장님께 메일 보내줘")
+            if has_mic:
+                voice_in = st.audio_input("음성으로 요청하기", key=f"chat_mic_{n}", label_visibility="collapsed")
+            else:
+                st.warning("실시간 녹음을 쓰려면 `!pip install -q -U streamlit`으로 업데이트하세요.")
+        st.markdown("**에이블이 할 수 있는 일**  \n"
+                    "회의·파일 요약과 김 대리 업무 정리 · 일정 추가/변경(충돌 감지와 대체 시간 추천) · "
+                    "연락처로 메일 작성·발송(보내기 전 확인) · 이전 질문을 기억하는 대화 · 답변 음성 재생")
 
     for t in turns:
         with st.chat_message("user", avatar="🧑‍💼"):
             if t["via"] == "voice":
                 st.caption("🎙️ 음성 인식 결과 (STT) — 말씀하신 내용이 맞는지 확인하세요")
             st.markdown(t["q"])
-            st.caption(t["time"] + (f" · 📎 {t['file']}" if t["file"] else ""))
+            st.caption(t["time"] + (f" · 첨부 {t['file']}" if t["file"] else ""))
         with st.chat_message("assistant", avatar="🤖"):
             st.markdown(t["a"])
             for a in t["actions"]:
@@ -1552,6 +1779,10 @@ with tab_chat:
 
     # --- 입력 카드 ---
     with st.container(border=True):
+        if turns and has_mic:
+            voice_in = st.audio_input("🎙️ 말로 이어서 요청하기", key=f"chat_mic_{n}")
+        typed = st.text_input("⌨️ 글로 입력", key=f"chat_text_{n}",
+                              placeholder="예) 박과장님께 회의 요약 메일 보내줘 / 금요일 오후 3시 온라인 회의 잡아줘")
         up_txt = st.file_uploader("📎 텍스트 파일 첨부 (회의록, 메모 등)", type=["txt", "md", "csv"], key="chat_file")
         file_name, file_text = "", ""
         if up_txt is not None:
@@ -1559,36 +1790,34 @@ with tab_chat:
             file_text = up_txt.getvalue().decode("utf-8", errors="ignore")
             st.caption(f"📎 **{file_name}** 첨부됨 · {len(file_text):,}자 — 이 내용을 참고해 답변합니다.")
 
-        voice_in = None
-        if hasattr(st, "audio_input"):
-            voice_in = st.audio_input("🎙️ 무엇을 도와드릴까요? (마이크를 눌러 말씀하세요)", key=f"chat_mic_{n}")
-        else:
-            st.warning("실시간 녹음을 쓰려면 `!pip install -q -U streamlit`으로 업데이트하세요.")
-        typed = st.text_input("⌨️ 또는 글로 입력", key=f"chat_text_{n}",
-                              placeholder="예) 박과장님께 회의 요약 메일 보내줘 / 금요일 오후 3시 거래처 미팅 잡아줘")
-
         qc = st.columns(len(QUICK_ASKS))
         for col, qa in zip(qc, QUICK_ASKS):
             col.button(qa, key=f"quick_{qa}", on_click=set_quick, args=(qa,), use_container_width=True)
 
-        b1, b2, b3 = st.columns([1.2, 1.5, 1.6])
+        b1, b2, b3, b4 = st.columns([1.1, 1.5, 1.6, 1.4])
         run_clicked = b1.button("▶ 실행", type="primary", use_container_width=True)
-        tts_on = b2.toggle("🔊 답변 음성 재생", value=True, key="chat_tts")
-        voice = b3.selectbox("목소리", list(VOICES), format_func=lambda v: f"{VOICES[v]} ({v})",
+        auto_voice = b2.toggle("녹음 끝나면 바로 요청", value=True, key="chat_auto")
+        tts_on = b3.toggle("🔊 답변 음성 재생", value=True, key="chat_tts")
+        voice = b4.selectbox("목소리", list(VOICES), format_func=lambda v: f"{VOICES[v]} ({v})",
                              key="chat_voice", label_visibility="collapsed")
 
     quick = st.session_state.pop("chat_quick", None)
-    if run_clicked or quick:
+    voice_bytes = voice_in.getvalue() if voice_in is not None else None
+    voice_hash = hashlib.md5(voice_bytes).hexdigest() if voice_bytes else None
+    new_voice = bool(voice_hash) and voice_hash != st.session_state.get("voice_done")
+    if run_clicked or quick or (auto_voice and new_voice):
         question = quick.split(" ", 1)[1] if quick else typed.strip()
-        if not quick and voice_in is None and not question:
+        if not quick and not voice_bytes and not question:
             st.warning("음성을 녹음하거나 질문을 입력한 뒤 실행을 눌러 주세요.")
         else:
             done = False
+            if voice_hash:
+                st.session_state.voice_done = voice_hash          # 같은 녹음을 두 번 보내지 않게
             try:
                 with st.spinner("답변을 준비하고 있습니다.."):
                     stt = None
-                    if voice_in is not None and not quick:
-                        stt = speech_to_text(voice_in.getvalue())                   # 음성 → 텍스트 (STT)
+                    if voice_bytes and not quick:
+                        stt = speech_to_text(voice_bytes)                            # 음성 → 텍스트 (STT)
                         question = (stt + " " + question).strip()
                     answer, actions, mail = ask_assistant(chat, question, file_name, file_text)   # LLM 호출
                     reply_audio = text_to_speech(clean_for_tts(answer), voice) if tts_on and answer else None
@@ -1601,7 +1830,7 @@ with tab_chat:
                     for k in list(cache)[:-30]:
                         del cache[k]
                 st.session_state.chat_autoplay = turn["id"]                       # 답변 음성 즉시 재생
-                st.session_state.chat_n += 1                                      # 입력칸 비우기
+                st.session_state.chat_n += 1                                      # 녹음기·입력칸 비우기
                 done = True
             except Exception as e:
                 st.error(f"답변을 만들지 못했습니다: {e}")
@@ -1801,8 +2030,10 @@ with tab_meet:
             st.caption("이 회의에서 김 대리에게 맡겨진 업무는 없습니다.")
         for i, t in enumerate(n["kim_tasks"]):
             with st.container(border=True):
-                st.markdown(f"{PRIORITY_ICON.get(t['priority'], '')} **{t['title']}**"
-                            + (f"  ·  요청: {t['requester']}" if t["requester"] else ""))
+                st.markdown(badge(t["priority"], PRIORITY_COLOR.get(t["priority"], "#6b7280"))
+                            + f"<b>{html.escape(t['title'])}</b>"
+                            + (f" · 요청: {html.escape(t['requester'])}" if t["requester"] else ""),
+                            unsafe_allow_html=True)
                 if t["detail"]:
                     st.write(t["detail"])
                 msg = task_status_line(t)
@@ -2244,15 +2475,16 @@ with st.sidebar:
     soon = {d: [t for t in undone_all if parse_date(t["due"]) == d] for d in days3}
     n_soon = sum(len(v) for v in soon.values())
     with st.expander(f"✅ 앞으로 3일 할 일 ({n_soon}건)"):
+        st.caption("분류별 색으로 구분해요.")
         if overdue:
-            st.markdown("**⏰ 기한 지남**")
+            st.markdown("**기한 지남**")
             for t in overdue:
-                st.markdown(f"- {PRIORITY_ICON[t['priority']]} {t['title']} :red[{d_day(parse_date(t['due']))}]")
+                st.markdown(todo_html(t), unsafe_allow_html=True)
         for d, label in zip(days3, ["오늘", "내일", "모레"]):
             st.markdown(f"**{label} · {fmt_date(d)}**")
             if soon[d]:
                 for t in sorted(soon[d], key=lambda x: PRIORITY_ORDER[x["priority"]]):
-                    st.markdown(f"- {PRIORITY_ICON[t['priority']]} {t['title']}")
+                    st.markdown(todo_html(t), unsafe_allow_html=True)
             else:
                 st.caption("마감인 할 일 없음")
         no_due = sum(1 for t in undone_all if not t["due"])
