@@ -1496,6 +1496,17 @@ TOOLS = [
         "strict": True,
     },
     {
+        "type": "function", "name": "get_recent_mails",
+        "description": "김 대리 받은편지함의 최근 메일을 가져옵니다(보낸 사람, 시각, 제목, 본문 일부, 캘린더 추가 제안 여부). "
+                       "'최근 메일 요약해줘', '메일 온 거 있어?' 같은 요청에 사용합니다.",
+        "parameters": {
+            "type": "object",
+            "properties": {"count": {"type": "integer", "description": "가져올 메일 수 (1~10, 말하지 않으면 5)"}},
+            "required": ["count"], "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
         "type": "function", "name": "confirm_pending_email",
         "description": "보내기를 기다리는 메일(send_email 결과가 needs_confirmation)을 김 대리 말대로 처리합니다. "
                        "'보내줘', '그래도 보내' → send, '보내지 마', '취소' → cancel.",
@@ -1520,7 +1531,25 @@ TOOLS = [
 
 TOOL_LABEL = {"send_email": "메일", "add_todo": "할 일 추가", "add_event": "일정 추가",
               "move_event": "일정 변경", "complete_todo": "완료 처리", "decide_pending_event": "일정 승인",
-              "confirm_pending_email": "메일 발송"}
+              "confirm_pending_email": "메일 발송", "get_recent_mails": "받은 메일"}
+
+
+def recent_mails_for_chat(count=5):
+    # 에이블 비서가 받은 메일을 읽을 수 있게: 본문은 일부만 넘기고 요약은 AI가 본문 내용만으로 작성
+    if not gmail_ready():
+        return {"status": "failed", "error": "Gmail 설정(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)이 없어 메일을 읽을 수 없습니다."}
+    got = fetch_mails(max(1, min(int(count or 5), 10)))
+    if "error" in got:
+        return {"status": "failed", "error": f"메일을 불러오지 못했습니다: {got['error']}"}
+    analyzed = {m["msg_id"]: m for m in data["mail_analysis"]["mails"]}
+    out = []
+    for m in got["mails"]:
+        a = analyzed.get(m["msg_id"])
+        out.append({"from": m["from"], "date": m["date"], "subject": m["subject"], "unread": m["unread"],
+                    "body": m["body"][:800],
+                    "calendar_proposal": ({"pending": "캘린더 추가 여부를 묻는 중", "added": "추가함",
+                                           "declined": "추가 안 함"}.get(a["proposal"]["decision"], "없음") if a else "분석 전")})
+    return {"status": "success", "count": len(out), "mails": out}
 
 
 def run_tool(name, args):
@@ -1533,6 +1562,8 @@ def run_tool(name, args):
         return move_event(args["id"], args["date"], args["start"], args["end"])
     if name == "decide_pending_event":
         return decide_pending(args["choice"])
+    if name == "get_recent_mails":
+        return recent_mails_for_chat(args["count"])
     if name == "complete_todo":
         return set_todo_done(args["id"], True)
     return {"status": "failed", "error": f"알 수 없는 도구: {name}"}
@@ -1555,6 +1586,8 @@ def action_of(name, args, result):
         return {"ok": True, "text": f"{label} → {result['title']} {result['date']} {result['time']} 등록 ({result['decision']})"}
     if name == "add_todo":
         return {"ok": True, "text": f"{label} 완료 → {result['title']} ({result['category']})"}
+    if name == "get_recent_mails":
+        return {"ok": True, "text": f"{label} → 최근 메일 {result['count']}통 확인"}
     return {"ok": True, "text": f"{label} 완료 → {result.get('todo', '')}"}
 
 
@@ -1590,6 +1623,9 @@ def system_prompt():
         "- 이메일로 보내 달라는 명시적 요청이 있을 때만 send_email을 사용합니다.",
         "  받는 사람을 말하지 않으면 to에 '나'를 넣습니다. 연락처에 있는 사람은 이름으로 넣을 수 있고,",
         "  연락처에 없는 사람의 이메일 주소는 절대 지어내지 않습니다.",
+        "- 받은 메일을 물으면(예: '최근 받은 메일 5개 요약해줘') get_recent_mails로 가져와,",
+        "  메일마다 보낸 사람·제목과 본문에 있는 내용만으로 한두 문장씩 요약합니다. 본문에 없는 내용은 지어내지 않습니다.",
+        "  calendar_proposal이 '캘린더 추가 여부를 묻는 중'이면 메일 비서 탭에서 추가할지 고를 수 있다고 알려 줍니다.",
         "- 메일을 보내 달라고 하면 메일을 쓰고 send_email까지 반드시 호출합니다. 보낼지 다시 묻지 않습니다.",
         "- send_email 결과가 success면 '메일을 보냈습니다'라고 받는 사람과 제목을 알려 줍니다.",
         "- needs_confirmation이면 아직 보내지 않은 것입니다. AI 확인에서 나온 확인할 점(issues)을 짧게 말하고",
@@ -1628,7 +1664,7 @@ def system_prompt():
 MAX_TURNS = 10   # 대화마다 기억할 질문+답변 개수
 MAX_CHATS = 10   # 보관할 대화 개수
 VOICES = {"alloy": "기본", "nova": "밝은", "shimmer": "부드러운", "echo": "차분한", "onyx": "낮은"}
-QUICK_ASKS = ["📝 최근 회의 내용 요약해줘", "📧 오늘 할 일을 내 메일로 보내줘"]
+QUICK_ASKS = ["📝 최근 회의 내용 요약해줘", "📥 최근 받은 메일 5개 요약해줘", "📧 오늘 할 일을 내 메일로 보내줘"]
 
 
 def clean_for_tts(text):
@@ -1838,6 +1874,7 @@ with tab_chat:
                        "예) 내일 오후 2시에 고객사 미팅 잡아줘 · 최근 회의 요약해서 박과장님께 메일 보내줘")
             if has_mic:
                 voice_in = st.audio_input("음성으로 요청하기", key=f"chat_mic_{n}", label_visibility="collapsed")
+                st.caption("녹음기에 'An error has occurred'가 뜨면 페이지를 새로고침한 뒤 다시 녹음하거나, 아래에 글로 입력해 주세요.")
             else:
                 st.warning("실시간 녹음을 쓰려면 `!pip install -q -U streamlit`으로 업데이트하세요.")
 
