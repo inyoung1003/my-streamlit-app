@@ -1,3 +1,5 @@
+# 1104
+
 # AI 개인비서 '에이블' (Streamlit)
 # 실행: streamlit run app.py
 # 같은 폴더에 필요한 파일:
@@ -5,10 +7,11 @@
 #   - meeting.txt : (선택) 회의 분석 탭에서 기본으로 불러올 회의록
 #
 # 화면 구성
-#   메인 탭  : 🤖 에이블 비서 (음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴)
+#   메인 탭  : 🤖 에이블 비서 (음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
-#              / 📥 메일 비서(메일 발송·받은 메일 요약)
-#   사이드바 : 앞으로 3일 할 일 / 최근 회의록 요약 / 최근 받은 메일 5개 요약 (눌러서 펼치기)
+#              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
+#   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 할 일 / 최근 회의록 요약 / 최근 받은 메일 5개 요약
+#   일정     : 회의·업무·개인·기타 색상 구분, 겹치면 알림 + 비어 있는 대체 시간 제안
 import os
 import re
 import json
@@ -30,11 +33,6 @@ from email.utils import parseaddr, parsedate_to_datetime
 import streamlit as st
 from openai import OpenAI
 
-# 페이지 설정
-st.set_page_config(page_title="음성 AI 서비스", page_icon="🤖", layout="wide")
-st.title("음성 인식 AI 서비스")
-st.write("음성으로 질문하시면 답변해 드립니다.")
-
 # ─────────────────────────────────────────────
 # 기본 설정
 # ─────────────────────────────────────────────
@@ -47,6 +45,13 @@ WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 PRIORITIES = ["높음", "보통", "낮음"]
 PRIORITY_ORDER = {p: i for i, p in enumerate(PRIORITIES)}
 PRIORITY_ICON = {"높음": "🔴", "보통": "🟡", "낮음": "🟢"}
+# 일정 분류별 색상 (회의·업무·개인·기타)
+EVENT_CATS = ["회의", "업무", "개인", "기타"]
+CAT_COLOR = {"회의": "#3e7bfa", "업무": "#f59e0b", "개인": "#22a06b", "기타": "#8b5cf6"}
+CAT_ICON = {"회의": "🟦", "업무": "🟧", "개인": "🟩", "기타": "🟪"}
+WORK_START, WORK_END, LUNCH = 9 * 60, 18 * 60, (12 * 60, 13 * 60)   # 대체 시간 제안 범위
+TIME_OPTIONS = ["종일"] + [f"{h:02d}:{m:02d}" for h in range(7, 22) for m in (0, 30)]
+DURATIONS = {"30분": 30, "1시간": 60, "1시간 30분": 90, "2시간": 120, "3시간": 180}
 
 st.set_page_config(page_title="AI 개인비서 에이블", page_icon="🤖", layout="wide")
 
@@ -83,7 +88,7 @@ def gmail_ready():
 # 데이터 저장/불러오기
 # ─────────────────────────────────────────────
 DATA_DEFAULTS = {"todos": [], "events": [], "meeting_notes": [], "mail_summaries": {},
-                 "processed_mails": [], "settings": {}}
+                 "processed_mails": [], "settings": {}, "contacts": [], "chats": []}
 
 
 def load_data():
@@ -165,19 +170,174 @@ def add_todo(title, due="", priority="보통", detail="", source="직접 입력"
     return item
 
 
-def add_event(title, date, note="", source="직접 입력"):
+def parse_time(s):
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(s or ""))
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    return h * 60 + mi if h < 24 and mi < 60 else None
+
+
+def hhmm(minutes):
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def end_from(start, minutes):
+    s = parse_time(start)
+    return hhmm(min(s + minutes, 24 * 60 - 1)) if s is not None else ""
+
+
+def guess_category(title):
+    # 제목으로 분류 추측 (사용자가 고르지 않았을 때만 사용)
+    if re.search(r"회의|미팅|면담|보고회|워크숍|세미나|컨퍼런스|간담회", title or ""):
+        return "회의"
+    if re.search(r"병원|생일|약속|휴가|연차|반차|운동|가족|여행|결혼|개인", title or ""):
+        return "개인"
+    return "업무"
+
+
+def norm_times(start, end):
+    s = parse_time(start)
+    if s is None:
+        return "", ""
+    e = parse_time(end)
+    if e is None or e <= s:
+        e = min(s + 60, 24 * 60 - 1)
+    return hhmm(s), hhmm(e)
+
+
+def event_span(e):
+    s, en = parse_time(e.get("start")), parse_time(e.get("end"))
+    if s is None:
+        return None
+    if en is None or en <= s:
+        en = min(s + 60, 24 * 60 - 1)
+    return s, en
+
+
+def event_time_text(e):
+    sp = event_span(e)
+    return "종일" if sp is None else f"{hhmm(sp[0])}–{hhmm(sp[1])}"
+
+
+def find_conflicts(date, start="", end="", exclude_id=None):
+    # 같은 날 시간이 겹치는 일정(overlap), 또는 종일 일정과 같은 날인 경우(allday)
+    mine = event_span({"start": start, "end": end})
+    out = []
+    for e in data["events"]:
+        if e["id"] == exclude_id or e["date"] != date:
+            continue
+        other = event_span(e)
+        if mine and other:
+            if mine[0] < other[1] and other[0] < mine[1]:
+                out.append(dict(e, kind="overlap"))
+        else:
+            out.append(dict(e, kind="allday"))
+    return out
+
+
+def is_free(date_iso, s, e, exclude_id=None):
+    for ev in data["events"]:
+        if ev["id"] == exclude_id or ev["date"] != date_iso:
+            continue
+        sp = event_span(ev)
+        if sp is None or (s < sp[1] and sp[0] < e):
+            return False
+    return True
+
+
+def slot_ok(slot, exclude_id=None):
+    if not slot["start"]:
+        return not any(ev["date"] == slot["date"] and ev["id"] != exclude_id for ev in data["events"])
+    return is_free(slot["date"], parse_time(slot["start"]), parse_time(slot["end"]), exclude_id)
+
+
+def suggest_slots(date_iso, start="", end="", exclude_id=None, n=3):
+    # 대체 시간 찾기: 같은 날 → 이후 평일 순서로, 업무 시간(9~18시, 점심 12~13시 제외) 중 비어 있는 시간
+    span = event_span({"start": start, "end": end})
+    base = parse_date(date_iso) or today
+    first = max(base, today)
+    now = dt.datetime.now(KST)
+    out = []
+    for i in range(14):
+        d = first + dt.timedelta(days=i)
+        if d.weekday() >= 5 and d != base:
+            continue
+        iso = d.isoformat()
+        if span is None:          # 종일 일정 → 다른 일정이 없는 날
+            if d != base and slot_ok({"date": iso, "start": "", "end": ""}, exclude_id):
+                out.append({"date": iso, "start": "", "end": ""})
+        else:
+            dur = span[1] - span[0]
+            t = WORK_START
+            if d == today:
+                t = max(t, ((now.hour * 60 + now.minute) // 30 + 1) * 30)
+            cands = []
+            while t + dur <= WORK_END:
+                if not (t < LUNCH[1] and LUNCH[0] < t + dur) and is_free(iso, t, t + dur, exclude_id):
+                    cands.append(t)
+                t += 30
+            cands.sort(key=lambda x: abs(x - span[0]))      # 원래 시간과 가까운 순
+            for t0 in cands[:2 if d == base else 1]:
+                out.append({"date": iso, "start": hhmm(t0), "end": hhmm(t0 + dur)})
+        if len(out) >= n:
+            break
+    return out[:n]
+
+
+def slot_text(s):
+    d = parse_date(s["date"])
+    return f"{fmt_date(d)} " + (f"{s['start']}–{s['end']}" if s["start"] else "종일")
+
+
+def conflict_text(c):
+    return f"{c['title']} ({fmt_date(parse_date(c['date']))} {event_time_text(c)})"
+
+
+def add_event(title, date, note="", source="직접 입력", start="", end="", category=""):
     if not parse_date(date):
         return {"status": "failed", "error": "날짜 형식은 YYYY-MM-DD 입니다."}
+    start, end = norm_times(start, end)
     item = {
         "id": uuid.uuid4().hex[:8],
         "title": title.strip(),
-        "date": date[:10],
+        "date": str(date)[:10],
+        "start": start,
+        "end": end,
+        "category": category if category in EVENT_CATS else guess_category(title),
         "note": note.strip(),
         "source": source,
     }
+    conflicts = find_conflicts(item["date"], start, end)
     data["events"].append(item)
     save_data()
-    return item
+    result = dict(item, status="success", conflicts=[], suggestions=[])
+    if conflicts:
+        # 겹치면 화면 위 알림 + 대체 시간 제안
+        sugg = suggest_slots(item["date"], start, end, exclude_id=item["id"])
+        result["conflicts"] = [conflict_text(c) for c in conflicts]
+        result["suggestions"] = [slot_text(x) for x in sugg]
+        st.session_state.conflict_alert = {"event_id": item["id"], "suggestions": sugg}
+        st.session_state.pending_toast = (f"⚠️ '{item['title']}' 일정이 기존 일정과 겹쳐요. "
+                                          "화면 위 알림에서 대체 시간을 확인하세요.")
+    return result
+
+
+def move_event(event_id, date, start="", end=""):
+    ev = next((e for e in data["events"] if e["id"] == event_id), None)
+    if ev is None:
+        return {"status": "failed", "error": "일정을 찾을 수 없습니다."}
+    if not parse_date(date):
+        return {"status": "failed", "error": "날짜 형식은 YYYY-MM-DD 입니다."}
+    old = event_span(ev)
+    if parse_time(start) is not None and parse_time(end) is None and old:
+        end = end_from(start, old[1] - old[0])           # 시작만 바꾸면 원래 길이 유지
+    ev["date"] = str(date)[:10]
+    ev["start"], ev["end"] = norm_times(start, end)
+    save_data()
+    left = find_conflicts(ev["date"], ev["start"], ev["end"], exclude_id=ev["id"])
+    return {"status": "success", "title": ev["title"], "date": ev["date"], "time": event_time_text(ev),
+            "conflicts": [conflict_text(c) for c in left]}
 
 
 def set_todo_done(todo_id, done=True):
@@ -203,6 +363,30 @@ def d_day(d):
 
 def fmt_date(d):
     return f"{d.month}/{d.day}({WEEKDAYS[d.weekday()]})"
+
+
+# 예전 버전에서 저장한 일정·연락처·대화도 새 형식으로 읽기
+for _e in data["events"]:
+    _e.setdefault("note", "")
+    _e.setdefault("source", "")
+    _e["start"], _e["end"] = norm_times(_e.get("start", ""), _e.get("end", ""))
+    if _e.get("category") not in EVENT_CATS:
+        _e["category"] = guess_category(_e.get("title", ""))
+for _c in data["contacts"]:
+    _c.setdefault("id", uuid.uuid4().hex[:8])
+    for _k in ("name", "role", "team", "alias", "email", "memo"):
+        _c.setdefault(_k, "")
+data["chats"] = [c for c in data["chats"] if isinstance(c, dict) and c.get("id")]
+for _ch in data["chats"]:
+    _ch.setdefault("title", "대화")
+    _ch.setdefault("created", "")
+    _ch.setdefault("updated", _ch["created"])
+    _ch.setdefault("turns", [])
+    for _t in _ch["turns"]:
+        _t.setdefault("id", uuid.uuid4().hex[:8])
+        for _k, _v in {"q": "", "a": "", "stt": None, "via": "text", "file": "", "actions": [],
+                       "mail": None, "time": ""}.items():
+            _t.setdefault(_k, _v)
 
 
 
@@ -420,59 +604,256 @@ def status_report_text():
         if t["detail"]:
             lines.append(f"     {t['detail']}")
     upcoming = sorted([e for e in data["events"] if parse_date(e["date"]) and parse_date(e["date"]) >= today],
-                      key=lambda e: e["date"])
+                      key=lambda e: (e["date"], e["start"] or "00:00"))
     lines += ["", f"■ 다가오는 일정 ({len(upcoming)}건)"]
     for e in upcoming:
-        lines.append(f" - {e['date']} {e['title']} ({d_day(parse_date(e['date']))})")
+        lines.append(f" - {e['date']} {event_time_text(e)} [{e['category']}] {e['title']} ({d_day(parse_date(e['date']))})")
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────
-# 캘린더 렌더링
+# 연락처 · 메일 보내기 전 AI 확인
 # ─────────────────────────────────────────────
-CALENDAR_CSS = [
-    ".able-cal {width:100%; border-collapse:collapse; table-layout:fixed;}",
-    ".able-cal th {font-size:.8rem; font-weight:600; padding:6px 0; opacity:.75; text-align:center;}",
-    ".able-cal td {vertical-align:top; height:96px; padding:4px; border:1px solid rgba(128,128,128,.22);}",
-    ".able-cal .num {font-size:.8rem; font-weight:600; display:inline-block; min-width:22px; text-align:center;}",
-    ".able-cal .other {opacity:.35;}",
-    ".able-cal .today .num {background:#ff4b4b; color:#fff; border-radius:999px;}",
-    ".able-cal .sun {color:#e5484d;} .able-cal .sat {color:#3e7bfa;}",
-    ".able-cal .pill {display:block; font-size:.7rem; line-height:1.35; margin-top:2px; padding:1px 4px; border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}",
-    ".able-cal .pill.event {background:rgba(62,123,250,.16); border-left:3px solid #3e7bfa;}",
-    ".able-cal .pill.todo  {background:rgba(245,158,11,.18); border-left:3px solid #f59e0b;}",
-    ".able-cal .pill.over  {background:rgba(229,72,77,.16); border-left:3px solid #e5484d;}",
-    ".able-cal .pill.done  {text-decoration:line-through; opacity:.45;}",
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+SELF_WORDS = {"나", "내", "저", "제", "나에게", "내메일", "제메일", "김대리", "본인", "나한테"}
+REVIEW_ITEMS = ["받는 사람", "내용 정확성", "빠진 내용", "말투·맞춤법", "민감 정보"]
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "checks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "item": {"type": "string", "enum": REVIEW_ITEMS},
+                    "ok": {"type": "boolean"},
+                    "comment": {"type": "string"},
+                },
+                "required": ["item", "ok", "comment"],
+                "additionalProperties": False,
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["checks", "summary"],
+    "additionalProperties": False,
+}
+
+
+def latest_note():
+    return data["meeting_notes"][0] if data["meeting_notes"] else None
+
+
+def contact_label(c):
+    label = f"{c['name']} {c['role']}".strip()
+    return label + (f" ({c['team']})" if c["team"] else "")
+
+
+def upsert_contact(name, email_addr, role="", team="", alias="", memo=""):
+    email_addr = email_addr.strip()
+    fields = {"name": name.strip(), "email": email_addr, "role": role.strip(), "team": team.strip(),
+              "alias": alias.strip(), "memo": memo.strip()}
+    c = next((x for x in data["contacts"] if x["email"].lower() == email_addr.lower()), None)
+    if c:
+        c.update({k: v for k, v in fields.items() if v})
+    else:
+        c = {"id": uuid.uuid4().hex[:8], **fields}
+        data["contacts"].append(c)
+    save_data()
+    return c
+
+
+def contact_keys(c):
+    n = re.sub(r"\s", "", c["name"])
+    r = re.sub(r"\s", "", c["role"])
+    keys = {n, n + r, re.sub(r"\s", "", c["alias"])}
+    if n and r:
+        keys.add(n[0] + r)                 # 박민수 + 과장 → 박과장
+    return {k for k in keys if k}
+
+
+def resolve_recipient(to):
+    # 받는 사람(이메일 주소 또는 연락처 이름) → 실제 주소. 찾지 못하면 주소를 지어내지 않고 이유를 돌려줌
+    raw = (to or "").strip()
+    m = EMAIL_RE.search(raw)               # "박과장 <park@x.com>" 형식도 허용
+    if m:
+        addr = m.group(0).strip("<>.,;:()\"'")
+        c = next((x for x in data["contacts"] if x["email"].lower() == addr.lower()), None)
+        is_me = addr.lower() == my_email().lower()
+        return {"email": addr, "name": contact_label(c) if c else ("나(김 대리)" if is_me else ""), "contact": c}, ""
+    key = re.sub(r"(님|씨|에게|께|한테)$", "", re.sub(r"\s", "", raw))
+    if not key or key in SELF_WORDS:
+        if not my_email():
+            return None, "내 이메일 주소가 설정되지 않았습니다. 📥 메일 비서 탭에서 저장해 주세요."
+        return {"email": my_email(), "name": "나(김 대리)", "contact": None}, ""
+    hits = [c for c in data["contacts"] if key in contact_keys(c)]
+    if not hits and len(key) >= 2:
+        hits = [c for c in data["contacts"] if any(key in k for k in contact_keys(c))]
+    if len(hits) == 1:
+        return {"email": hits[0]["email"], "name": contact_label(hits[0]), "contact": hits[0]}, ""
+    if len(hits) > 1:
+        return None, (f"'{raw}'에 해당하는 연락처가 여러 명입니다: "
+                      + ", ".join(f"{contact_label(c)} <{c['email']}>" for c in hits) + ". 누구에게 보낼지 알려 주세요.")
+    return None, f"연락처에서 '{raw}'을(를) 찾지 못했습니다. 이메일 주소를 알려 주시거나 📇 연락처에 먼저 추가해 주세요."
+
+
+def brief_context():
+    # 메일 점검·대화에 쓰는 업무 자료 요약 (지어낸 내용인지 비교하는 기준)
+    undone = [t for t in data["todos"] if not t["done"]]
+    lines = ["[할 일]"] + [f"- {t['title']} (마감 {t['due'] or '없음'})" for t in undone[:20]]
+    up = sorted([e for e in data["events"] if parse_date(e["date"]) and parse_date(e["date"]) >= today],
+                key=lambda e: (e["date"], e["start"] or "00:00"))[:15]
+    lines += ["[다가오는 일정]"] + [f"- {e['date']} {event_time_text(e)} {e['title']}" for e in up]
+    note = latest_note()
+    if note:
+        lines += [f"[최근 회의] {note['title']}"] + [f"- {s}" for s in note["summary"]]
+        lines += [f"- 김 대리 업무: {t['title']} (기한: {t['due_text'] or '언급 없음'})" for t in note["kim_tasks"]]
+    return "\n".join(lines)
+
+
+def review_email(rcpt, subject, body, context=""):
+    # 1) 코드로 확인할 수 있는 것 + 2) AI가 한 번 더 점검
+    checks = []
+    if rcpt["contact"]:
+        checks.append({"item": "연락처 확인", "ok": True,
+                       "comment": f"연락처에 있는 {contact_label(rcpt['contact'])}님 주소예요."})
+    elif rcpt["name"].startswith("나("):
+        checks.append({"item": "연락처 확인", "ok": True, "comment": "김 대리님 본인 주소예요."})
+    else:
+        checks.append({"item": "연락처 확인", "ok": False,
+                       "comment": "연락처에 없는 주소예요. 주소가 맞는지 확인해 주세요."})
+    if not subject.strip():
+        checks.append({"item": "제목", "ok": False, "comment": "제목이 비어 있어요."})
+    summary = ""
+    who = rcpt["name"] or "(이름 모름)"
+    if rcpt["contact"]:
+        c = rcpt["contact"]
+        who += f" / 직함: {c['role'] or '-'} / 소속: {c['team'] or '-'} / 메모: {c['memo'] or '-'}"
+    try:
+        resp = get_client().responses.create(
+            model=MODEL,
+            instructions="\n".join([
+                "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 메일을 보내기 전에 마지막으로 점검합니다.",
+                "아래 다섯 항목을 모두 점검해 항목마다 ok(true/false)와 짧은 comment를 씁니다.",
+                "- 받는 사람: [요청/상황]에서 의도한 사람과 [받는 사람] 정보가 맞는지. 요청에 받는 사람 언급이 없으면 ok.",
+                "- 내용 정확성: 본문에 [요청/상황]·[참고 자료]에 없는 날짜·숫자·약속·사실이 들어갔는지. 지어낸 내용이 있으면 false.",
+                "- 빠진 내용: 요청한 내용이 빠졌는지, '첨부'를 언급했는데 실제 첨부가 없는지(이 메일은 첨부를 보낼 수 없음).",
+                "- 말투·맞춤법: 받는 사람에게 맞는 정중한 말투인지, 오탈자가 있는지.",
+                "- 민감 정보: 비밀번호·주민번호·계좌번호 같은 민감 정보가 들어 있는지.",
+                "비교할 자료가 없어 판단할 수 없으면 추측하지 말고 ok=true, comment에 '비교할 자료 없음'이라고 씁니다.",
+                "summary: 김 대리에게 하는 한 문장 결론 (예: '보내도 괜찮아 보여요.' / '요청에 없는 날짜가 있어 확인이 필요해요.').",
+            ]),
+            input=(f"[받는 사람] {who} <{rcpt['email']}>\n\n[요청/상황]\n{context or '(없음)'}\n\n"
+                   f"[제목] {subject}\n\n[본문]\n{body}"),
+            text={"format": {"type": "json_schema", "name": "mail_review", "schema": REVIEW_SCHEMA, "strict": True}},
+        )
+        r = json.loads(resp.output_text)
+        checks += r["checks"]
+        summary = r["summary"]
+    except Exception as e:
+        checks.append({"item": "AI 확인", "ok": False, "comment": f"AI 확인을 하지 못했어요 ({e}). 직접 한 번 더 확인해 주세요."})
+    ok = all(c["ok"] for c in checks)
+    return {"email": rcpt["email"], "name": rcpt["name"], "ok": ok, "checks": checks,
+            "summary": summary or ("보내도 괜찮아 보여요." if ok else "확인할 점이 있어요.")}
+
+
+def show_review(rv):
+    (st.success if rv["ok"] else st.warning)(("✅ " if rv["ok"] else "⚠️ ") + rv["summary"])
+    for c in rv["checks"]:
+        st.markdown(f"{'✅' if c['ok'] else '⚠️'} **{c['item']}** — {c['comment']}")
+
+
+def confirm_and_send(key, to_raw, subject, body, context="", reply_to_id=""):
+    # 보내기 전 AI 확인 → 김 대리가 확인 후 발송. 발송하면 "sent" 반환
+    rcpt, err = resolve_recipient(to_raw)
+    if err:
+        st.error(err)
+        return None
+    st.caption(f"받는 사람: {rcpt['name'] + ' ' if rcpt['name'] else ''}<{rcpt['email']}>")
+    sig = json.dumps([to_raw, subject, body], ensure_ascii=False)
+    rv = st.session_state.get(f"rv_{key}")
+    if rv and rv.get("sig") != sig:          # 내용을 고치면 다시 확인해야 함
+        rv = None
+    if rv is None:
+        if st.button("🔍 AI 확인 후 보내기", key=f"rvbtn_{key}", type="primary",
+                     disabled=not (subject.strip() and body.strip())):
+            with st.spinner("에이블이 보내기 전에 한 번 더 확인하고 있어요..."):
+                rv = review_email(rcpt, subject, body, context)
+            rv["sig"] = sig
+            st.session_state[f"rv_{key}"] = rv
+    if rv:
+        with st.container(border=True):
+            st.markdown("**🔍 에이블의 발송 전 확인**")
+            show_review(rv)
+            a, b = st.columns(2)
+            if a.button("✅ 확인했어요, 보내기" if rv["ok"] else "⚠️ 그래도 보내기", key=f"sendbtn_{key}",
+                        type="primary", use_container_width=True):
+                sr = send_email(rcpt["email"], subject, body, reply_to_id)
+                if sr["status"] == "success":
+                    st.session_state.pop(f"rv_{key}", None)
+                    return "sent"
+                st.error(f"발송 실패: {sr['error']}")
+            if b.button("✏️ 고칠게요", key=f"fixbtn_{key}", use_container_width=True):
+                st.session_state.pop(f"rv_{key}", None)
+                st.rerun()
+    return None
+
+
+# ─────────────────────────────────────────────
+# 캘린더 · 화면 스타일
+# ─────────────────────────────────────────────
+APP_CSS = [
+    ".able-hero {padding:18px 22px; border-radius:16px; margin-bottom:10px;"
+    " background:linear-gradient(135deg, rgba(62,123,250,.16), rgba(139,92,246,.12));"
+    " border:1px solid rgba(128,128,128,.2);}",
+    ".able-title {font-size:1.65rem; font-weight:700; line-height:1.3;}",
+    ".able-sub {opacity:.75; font-size:.9rem; margin:2px 0 10px;}",
+    ".able-chip {display:inline-block; font-size:.78rem; padding:3px 10px; margin:2px 6px 2px 0;"
+    " border-radius:999px; background:rgba(128,128,128,.16);}",
+    ".able-chip.warn {background:rgba(229,72,77,.2);}",
+    ".able-cal .pill {display:block; font-size:.7rem; line-height:1.35; margin-top:2px; padding:1px 4px;"
+    " border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}",
+    ".able-cal .pill.done {text-decoration:line-through; opacity:.45;}",
     ".able-cal .more {font-size:.68rem; opacity:.6; margin-top:2px;}",
-    ".legend span {font-size:.75rem; margin-right:12px;}",
+    ".legend span {font-size:.75rem; margin-right:12px; white-space:nowrap;}",
+    ".cal-head {text-align:center; font-size:.8rem; font-weight:600; opacity:.8; padding-bottom:2px;}",
+    ".cal-cell {height:58px; overflow:hidden; margin-top:-10px;}",
+    ".cal-cell.other {opacity:.35;}",
+    ".st-key-able_cal button {padding:0 4px; min-height:32px;}",
+    ".st-key-able_cal [data-testid='stHorizontalBlock'] {gap:.35rem;}",
 ]
-st.markdown("<style>" + " ".join(CALENDAR_CSS) + "</style>", unsafe_allow_html=True)
+st.markdown("<style>" + " ".join(APP_CSS) + "</style>", unsafe_allow_html=True)
 
 
 def items_by_date():
+    # 날짜별 캘린더 표시 항목: (정렬 키, 종류, 글자, 색)
     m = {}
     for e in data["events"]:
         d = parse_date(e["date"])
         if d:
-            m.setdefault(d, []).append(("event", e["title"]))
+            label = (e["start"] + " " if e["start"] else "") + e["title"]
+            m.setdefault(d, []).append((e["start"] or "00:00", "event", label, CAT_COLOR[e["category"]]))
     for t in data["todos"]:
         d = parse_date(t["due"])
         if d:
             kind = "done" if t["done"] else ("over" if d < today else "todo")
-            m.setdefault(d, []).append((f"todo {kind}", "마감: " + t["title"]))
+            color = {"done": "#9ca3af", "over": "#e5484d", "todo": CAT_COLOR["업무"]}[kind]
+            m.setdefault(d, []).append(("99:99", kind, "⏰ " + t["title"], color))
+    for v in m.values():
+        v.sort(key=lambda x: x[0])
     return m
 
 
-# 캘린더 셀 스타일 (클릭형 캘린더용)
-st.markdown(
-    "<style>"
-    ".cal-head {text-align:center; font-size:.8rem; font-weight:600; opacity:.8; padding-bottom:2px;}"
-    ".cal-cell {height:54px; overflow:hidden; margin-top:-10px;}"
-    ".cal-cell.other {opacity:.35;}"
-    ".st-key-able_cal button {padding:0 4px; min-height:32px;}"
-    ".st-key-able_cal [data-testid='stHorizontalBlock'] {gap:.35rem;}"
-    "</style>",
-    unsafe_allow_html=True,
-)
+def pill_html(kind, label, color):
+    t = html.escape(label)
+    line = "dashed" if kind in ("todo", "over", "done") else "solid"      # 할 일 마감은 점선
+    return (f'<span class="pill {kind}" title="{t}" '
+            f'style="border-left:3px {line} {color}; background:{color}29">{t}</span>')
+
+
+def legend_html():
+    cats = "".join(f'<span><b style="color:{CAT_COLOR[c]}">■</b> {c}</span>' for c in EVENT_CATS)
+    return (f'<div class="legend">{cats}<span>⏰ 할 일 마감(점선)</span>'
+            f'<span><b style="color:#e5484d">■</b> 기한 지남</span></div>')
 
 
 def _toggle_from_dialog(todo_id):
@@ -486,14 +867,16 @@ def day_dialog(d):
     iso = d.isoformat()
     st.markdown(f"### {d.year}년 {d.month}월 {d.day}일 ({WEEKDAYS[d.weekday()]}) · {d_day(d)}")
 
-    # --- 일정 ---
-    events = [e for e in data["events"] if e["date"] == iso]
+    # --- 일정 (시간순, 분류 색상) ---
+    events = sorted([e for e in data["events"] if e["date"] == iso], key=lambda e: e["start"] or "00:00")
     st.markdown(f"#### 📌 일정 ({len(events)}건)")
     if not events:
         st.caption("등록된 일정이 없습니다.")
     for e in events:
         a, b = st.columns([7, 1])
-        a.markdown(f"**{e['title']}**")
+        over = [c for c in find_conflicts(e["date"], e["start"], e["end"], e["id"]) if c["kind"] == "overlap"]
+        a.markdown(f"{CAT_ICON[e['category']]} **{event_time_text(e)}** · {e['title']} "
+                   f":gray[({e['category']})]" + (" ⚠️시간 겹침" if over else ""))
         if e["note"]:
             a.caption(e["note"])
         if b.button("🗑️", key=f"dlg_del_ev_{e['id']}", help="일정 삭제"):
@@ -522,17 +905,25 @@ def day_dialog(d):
     with st.form(f"dlg_add_{iso}", clear_on_submit=True):
         kind = st.radio("종류", ["일정", "할 일(마감)"], horizontal=True)
         title = st.text_input("제목")
-        c1, c2 = st.columns([1, 2])
-        prio = c1.selectbox("우선순위 (할 일만)", PRIORITIES, index=1)
-        note = c2.text_input("메모 / 세부 내용")
+        c1, c2, c3 = st.columns(3)
+        cat = c1.selectbox("분류 (일정)", ["자동 분류"] + EVENT_CATS)
+        stime = c2.selectbox("시작 시간 (일정)", TIME_OPTIONS, index=TIME_OPTIONS.index("10:00"))
+        dur = c3.selectbox("소요 시간 (일정)", list(DURATIONS), index=1)
+        c4, c5 = st.columns([1, 2])
+        prio = c4.selectbox("우선순위 (할 일)", PRIORITIES, index=1)
+        note = c5.text_input("메모 / 세부 내용")
         if st.form_submit_button("추가", type="primary"):
             if not title.strip():
                 st.warning("제목을 입력하세요.")
+            elif kind == "일정":
+                s = "" if stime == "종일" else stime
+                r = add_event(title, iso, note, "직접 입력", s, end_from(s, DURATIONS[dur]),
+                              "" if cat == "자동 분류" else cat)
+                if r["conflicts"]:
+                    st.rerun()                  # 겹치면 창을 닫고 화면 위 알림으로 대체 시간 안내
+                st.rerun(scope="fragment")
             else:
-                if kind == "일정":
-                    add_event(title, iso, note)
-                else:
-                    add_todo(title, iso, prio, note)
+                add_todo(title, iso, prio, note)
                 st.rerun(scope="fragment")
 
     st.divider()
@@ -547,8 +938,7 @@ def render_calendar(year, month):
     head = st.columns(7)
     for i, w in enumerate(["일", "월", "화", "수", "목", "금", "토"]):
         color = "#e5484d" if i == 0 else "#3e7bfa" if i == 6 else "inherit"
-        head[i].markdown(f'<div class="cal-head" style="color:{color}">{w}</div>',
-                         unsafe_allow_html=True)
+        head[i].markdown(f'<div class="cal-head" style="color:{color}">{w}</div>', unsafe_allow_html=True)
 
     with st.container(key="able_cal"):
         for week in weeks:
@@ -561,30 +951,101 @@ def render_calendar(year, month):
                                  use_container_width=True,
                                  help=f"{d.month}월 {d.day}일 일정 보기·추가·삭제"):
                         day_dialog(d)
-                    pills = ""
-                    for kind, title in items[:2]:
-                        t = html.escape(title)
-                        pills += f'<span class="pill {kind}" title="{t}">{t}</span>'
+                    pills = "".join(pill_html(k, lb, c) for _, k, lb, c in items[:2])
                     if len(items) > 2:
                         pills += f'<div class="more">+{len(items) - 2}건</div>'
                     other = " other" if d.month != month else ""
-                    st.markdown(f'<div class="able-cal cal-cell{other}">{pills}</div>',
-                                unsafe_allow_html=True)
+                    st.markdown(f'<div class="able-cal cal-cell{other}">{pills}</div>', unsafe_allow_html=True)
 
-    st.markdown(
-        '<div class="legend"><span>🟦 일정</span><span>🟧 할 일 마감</span>'
-        '<span>🟥 기한 지남</span><span>👆 날짜를 누르면 그 날 일정을 보고 추가·삭제할 수 있어요</span></div>',
-        unsafe_allow_html=True)
+    st.markdown(legend_html() + '<div class="legend"><span>👆 날짜를 누르면 그 날 일정을 보고 추가·삭제할 수 있어요</span></div>',
+                unsafe_allow_html=True)
+
+
+def count_overlaps():
+    n = 0
+    for e in data["events"]:
+        d = parse_date(e["date"])
+        if d and d >= today and any(c["kind"] == "overlap"
+                                    for c in find_conflicts(e["date"], e["start"], e["end"], e["id"])):
+            n += 1
+    return n
+
+
+def _move_cb(event_id, slot):
+    r = move_event(event_id, slot["date"], slot["start"], slot["end"])
+    st.session_state.pop("conflict_alert", None)
+    st.session_state.pending_toast = (f"'{r['title']}' 일정을 {slot_text(slot)}(으)로 옮겼어요."
+                                      if r["status"] == "success" else f"⚠️ {r['error']}")
+
+
+def _keep_cb():
+    st.session_state.pop("conflict_alert", None)
+
+
+def _cancel_event_cb(event_id):
+    delete_item("events", event_id)
+    st.session_state.pop("conflict_alert", None)
+    st.session_state.pending_toast = "새로 추가한 일정을 취소했어요."
+
+
+def render_conflict_alert():
+    # 일정이 겹치면 모든 탭 위에 알림 + 대체 시간 버튼
+    ca = st.session_state.get("conflict_alert")
+    if not ca:
+        return
+    ev = next((e for e in data["events"] if e["id"] == ca["event_id"]), None)
+    conflicts = find_conflicts(ev["date"], ev["start"], ev["end"], ev["id"]) if ev else []
+    if not conflicts:
+        st.session_state.pop("conflict_alert", None)
+        return
+    overlap = any(c["kind"] == "overlap" for c in conflicts)
+    with st.container(border=True):
+        head = f"**'{ev['title']}'** ({fmt_date(parse_date(ev['date']))} {event_time_text(ev)}) 일정이 "
+        if overlap:
+            st.warning("⚠️ " + head + "기존 일정과 시간이 겹쳐요.")
+        else:
+            st.info("ℹ️ " + head + "같은 날 종일 일정과 겹쳐요.")
+        for c in conflicts:
+            st.markdown(f"- {CAT_ICON[c['category']]} {c['title']} · {event_time_text(c)}"
+                        + (" (시간 겹침)" if c["kind"] == "overlap" else " (종일 일정)"))
+        sugg = [s for s in ca.get("suggestions", []) if slot_ok(s, ev["id"])]
+        if sugg:
+            st.markdown("**💡 에이블이 찾은 비어 있는 시간** · 업무 시간 9~18시, 점심 12~13시 제외")
+            cols = st.columns(len(sugg))
+            for i, s in enumerate(sugg):
+                cols[i].button(f"🕑 {slot_text(s)}로 옮기기", key=f"ca_mv_{i}", on_click=_move_cb,
+                               args=(ev["id"], s), use_container_width=True)
+        else:
+            st.caption("2주 안에서 비어 있는 업무 시간을 찾지 못했어요.")
+        a, b, _ = st.columns([1.2, 1.2, 3])
+        a.button("그대로 두기", key="ca_keep", on_click=_keep_cb, use_container_width=True)
+        b.button("🗑️ 이 일정 취소", key="ca_del", on_click=_cancel_event_cb, args=(ev["id"],),
+                 use_container_width=True)
+
 
 # ─────────────────────────────────────────────
 # 화면
 # ─────────────────────────────────────────────
 if st.session_state.get("pending_toast"):
-    st.toast(st.session_state.pop("pending_toast"), icon="✅")
+    _msg = st.session_state.pop("pending_toast")
+    _warn = _msg.startswith("⚠️")
+    st.toast(_msg.lstrip("⚠️ ") if _warn else _msg, icon="⚠️" if _warn else "✅")
 
-st.title("🤖 AI 개인비서 에이블")
-st.caption(f"김 대리님의 업무를 돕는 음성 AI 비서 · 오늘은 {today.year}년 {today.month}월 {today.day}일 "
-           f"{WEEKDAYS[today.weekday()]}요일입니다.")
+_undone = [t for t in data["todos"] if not t["done"]]
+_chips = [f"📅 오늘 일정 {sum(e['date'] == today.isoformat() for e in data['events'])}건",
+          f"⏰ 오늘 마감 {sum(t['due'] == today.isoformat() for t in _undone)}건",
+          f"✅ 남은 할 일 {len(_undone)}건"]
+_chip_html = "".join(f'<span class="able-chip">{html.escape(c)}</span>' for c in _chips)
+_ov = count_overlaps()
+if _ov:
+    _chip_html += f'<span class="able-chip warn">⚠️ 겹치는 일정 {_ov}건</span>'
+st.markdown(
+    f'<div class="able-hero"><div class="able-title">🤖 AI 개인비서 에이블</div>'
+    f'<div class="able-sub">김 대리님의 업무를 돕는 음성 AI 비서 · {today.year}년 {today.month}월 {today.day}일 '
+    f'{WEEKDAYS[today.weekday()]}요일</div>{_chip_html}</div>',
+    unsafe_allow_html=True)
+
+render_conflict_alert()
 
 tab_chat, tab_dash, tab_meet, tab_mail = st.tabs(["🤖 에이블 비서", "📊 대시보드", "🎙️ 회의 분석", "📥 메일 비서"])
 
@@ -598,12 +1059,13 @@ with tab_dash:
     total = len(data["todos"])
     rate = round(100 * (total - len(undone)) / total) if total else 0
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("오늘 일정", f"{len(today_events)}건")
     c2.metric("남은 할 일", f"{len(undone)}건",
               delta=f"기한 지남 {len(overdue)}건" if overdue else None, delta_color="inverse")
     c3.metric("이번 주 마감", f"{len(due_this_week)}건")
-    c4.metric("완료율", f"{rate}%")
+    c4.metric("겹치는 일정", f"{_ov}건")
+    c5.metric("완료율", f"{rate}%")
 
     left, right = st.columns([3, 2], gap="large")
 
@@ -633,34 +1095,51 @@ with tab_dash:
         for e in data["events"]:
             d = parse_date(e["date"])
             if d and today <= d <= horizon:
-                upcoming.append((d, "📌", e["title"], e.get("note", ""), "events", e["id"]))
+                upcoming.append((d, e["start"] or "00:00", "event", e))
         for t in undone:
             d = parse_date(t["due"])
             if d and d <= horizon:
-                upcoming.append((d, "⏰", f"[마감] {t['title']}", t["detail"], None, t["id"]))
-        upcoming.sort(key=lambda x: x[0])
+                upcoming.append((d, "99:99", "todo", t))
+        upcoming.sort(key=lambda x: (x[0], x[1]))
 
         if not upcoming:
             st.info("앞으로 30일 안에 예정된 일정이 없습니다.")
-        for d, icon, title, note, kind, iid in upcoming:
+        for d, _, kind, obj in upcoming:
             with st.container(border=True):
                 a, b = st.columns([5, 1])
-                badge = d_day(d)
                 color = "red" if d <= today else ("orange" if (d - today).days <= 3 else "blue")
-                a.markdown(f"{icon} **{title}**  \n:{color}[**{badge}**] · {fmt_date(d)}")
-                if note:
-                    a.caption(note)
-                if kind and b.button("🗑️", key=f"del_ev_{iid}", help="일정 삭제"):
-                    delete_item("events", iid)
-                    st.rerun()
+                if kind == "event":
+                    over = [c for c in find_conflicts(obj["date"], obj["start"], obj["end"], obj["id"])
+                            if c["kind"] == "overlap"]
+                    a.markdown(f"{CAT_ICON[obj['category']]} **{obj['title']}**" + (" ⚠️" if over else "")
+                               + f"  \n:{color}[**{d_day(d)}**] · {fmt_date(d)} {event_time_text(obj)}"
+                               + f" · {obj['category']}")
+                    if over:
+                        a.caption("⚠️ 시간이 겹침: " + ", ".join(c["title"] for c in over))
+                    elif obj["note"]:
+                        a.caption(obj["note"])
+                    if b.button("🗑️", key=f"del_ev_{obj['id']}", help="일정 삭제"):
+                        delete_item("events", obj["id"])
+                        st.rerun()
+                else:
+                    a.markdown(f"⏰ **[마감] {obj['title']}**  \n:{color}[**{d_day(d)}**] · {fmt_date(d)}")
+                    if obj["detail"]:
+                        a.caption(obj["detail"])
 
         with st.expander("➕ 일정 추가"):
             with st.form("add_event", clear_on_submit=True):
                 et = st.text_input("일정 제목")
-                ed = st.date_input("날짜", value=today)
+                a, b = st.columns(2)
+                ed = a.date_input("날짜", value=today)
+                ecat = b.selectbox("분류", ["자동 분류"] + EVENT_CATS)
+                c, d_ = st.columns(2)
+                est = c.selectbox("시작 시간", TIME_OPTIONS, index=TIME_OPTIONS.index("10:00"))
+                edu = d_.selectbox("소요 시간", list(DURATIONS), index=1)
                 en = st.text_input("메모")
-                if st.form_submit_button("추가") and et:
-                    add_event(et, ed.isoformat(), en)
+                if st.form_submit_button("추가", type="primary") and et.strip():
+                    s = "" if est == "종일" else est
+                    add_event(et, ed.isoformat(), en, "직접 입력", s, end_from(s, DURATIONS[edu]),
+                              "" if ecat == "자동 분류" else ecat)
                     st.rerun()
 
     # --- 할 일 목록 ---
@@ -715,11 +1194,13 @@ with tab_dash:
 TOOLS = [
     {
         "type": "function", "name": "send_email",
-        "description": "이메일을 발송합니다. 사용자가 이메일로 보내 달라고 명시적으로 요청할 때만 사용합니다.",
+        "description": "이메일을 보냅니다. 사용자가 이메일/메일로 보내 달라고 명시적으로 요청할 때만 사용합니다. "
+                       "보내기 전에 에이블의 확인 단계를 거칩니다.",
         "parameters": {
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "수신자 이메일 주소"},
+                "to": {"type": "string",
+                       "description": "받는 사람 이메일 주소 또는 연락처에 있는 이름(예: 박과장). 김 대리 본인이면 '나'"},
                 "subject": {"type": "string", "description": "이메일 제목"},
                 "body": {"type": "string", "description": "이메일 본문"},
             },
@@ -744,15 +1225,33 @@ TOOLS = [
     },
     {
         "type": "function", "name": "add_event",
-        "description": "캘린더에 일정을 추가합니다.",
+        "description": "캘린더에 일정을 추가합니다. 결과에 conflicts가 있으면 기존 일정과 겹친 것입니다.",
         "parameters": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "일정 제목"},
                 "date": {"type": "string", "description": "날짜 YYYY-MM-DD"},
+                "start": {"type": "string", "description": "시작 시간 HH:MM (24시간), 종일 일정이면 빈 문자열"},
+                "end": {"type": "string", "description": "끝나는 시간 HH:MM, 모르면 빈 문자열(1시간으로 계산)"},
+                "category": {"type": "string", "enum": EVENT_CATS, "description": "회의/업무/개인/기타"},
                 "note": {"type": "string", "description": "메모, 없으면 빈 문자열"},
             },
-            "required": ["title", "date", "note"], "additionalProperties": False,
+            "required": ["title", "date", "start", "end", "category", "note"], "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function", "name": "move_event",
+        "description": "기존 일정의 날짜·시간을 옮깁니다. id는 [현재 업무 데이터]의 일정 id를 사용합니다.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+                "start": {"type": "string", "description": "HH:MM, 종일이면 빈 문자열"},
+                "end": {"type": "string", "description": "HH:MM, 모르면 빈 문자열(원래 길이 유지)"},
+            },
+            "required": ["id", "date", "start", "end"], "additionalProperties": False,
         },
         "strict": True,
     },
@@ -768,44 +1267,71 @@ TOOLS = [
     },
 ]
 
-TOOL_LABEL = {"send_email": "📧 메일 발송", "add_todo": "✅ 할 일 추가",
-              "add_event": "📅 일정 추가", "complete_todo": "☑️ 완료 처리"}
+TOOL_LABEL = {"send_email": "📧 메일", "add_todo": "✅ 할 일 추가", "add_event": "📅 일정 추가",
+              "move_event": "🕑 일정 변경", "complete_todo": "☑️ 완료 처리"}
 
 
 def run_tool(name, args):
-    if name == "send_email":
-        return send_email(**args)
     if name == "add_todo":
         return add_todo(args["title"], args["due"], args["priority"], args["detail"], "에이블")
     if name == "add_event":
-        return add_event(args["title"], args["date"], args["note"], "에이블")
+        return add_event(args["title"], args["date"], args["note"], "에이블", args["start"], args["end"],
+                         args["category"])
+    if name == "move_event":
+        return move_event(args["id"], args["date"], args["start"], args["end"])
     if name == "complete_todo":
         return set_todo_done(args["id"], True)
     return {"status": "failed", "error": f"알 수 없는 도구: {name}"}
 
 
+def action_of(name, args, result):
+    label = TOOL_LABEL.get(name, name)
+    if not isinstance(result, dict) or result.get("status") == "failed":
+        return {"ok": False, "text": f"{label} 실패 ({(result or {}).get('error', '')})"}
+    if name == "add_event":
+        txt = (f"{label} 완료 → {CAT_ICON[result['category']]} {result['title']} "
+               f"({fmt_date(parse_date(result['date']))} {event_time_text(result)})")
+        if result["conflicts"]:
+            return {"ok": True, "warn": True, "text": txt + f" · ⚠️ 겹치는 일정 {len(result['conflicts'])}건"}
+        return {"ok": True, "text": txt}
+    if name == "move_event":
+        return {"ok": True, "text": f"{label} 완료 → {result['title']} ({result['date']} {result['time']})"}
+    if name == "add_todo":
+        return {"ok": True, "text": f"{label} 완료 → {args['title']}"}
+    return {"ok": True, "text": f"{label} 완료 → {result.get('todo', '')}"}
 
-def latest_note():
-    return data["meeting_notes"][0] if data["meeting_notes"] else None
+
+def show_action(a):
+    (st.error if not a["ok"] else st.warning if a.get("warn") else st.success)(a["text"])
 
 
 def system_prompt():
     snapshot = {
         "todos": [{k: t[k] for k in ("id", "title", "due", "priority", "done", "detail")} for t in data["todos"]],
-        "events": [{k: e[k] for k in ("id", "title", "date", "note")} for e in data["events"]],
+        "events": [{k: e[k] for k in ("id", "title", "date", "start", "end", "category", "note")}
+                   for e in data["events"]],
+        "contacts": [{"name": c["name"], "role": c["role"], "team": c["team"], "alias": c["alias"],
+                      "email": c["email"]} for c in data["contacts"]],
     }
     lines = [
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 요청한 업무를 최선을 다해 처리합니다.",
-        f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일)",
-        f"김 대리 이메일(‘내 메일로 보내줘’의 받는 사람): {my_email() or '(미설정 - 주소를 물어보세요)'}",
+        f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일), 현재 시각: {now_kst()[11:]}",
+        f"김 대리 이메일: {my_email() or '(미설정)'}",
         "",
         "규칙",
         "- [현재 업무 데이터], [최근 회의], 첨부 파일, 이전 대화에 있는 내용만 근거로 답합니다.",
         "  근거가 없는 내용은 지어내지 말고 '확인되지 않는 내용입니다'라고 말합니다.",
-        "- '다음 주 금요일', '모레' 같은 표현은 오늘 날짜 기준 YYYY-MM-DD로 바꿔 도구에 넘깁니다.",
-        "- 할 일/일정 추가, 완료 처리를 요청하면 해당 도구를 사용합니다.",
+        "- '다음 주 금요일', '모레 오후 3시' 같은 표현은 오늘 기준 YYYY-MM-DD, HH:MM으로 바꿔 도구에 넘깁니다.",
+        "- 할 일/일정 추가, 일정 변경, 완료 처리를 요청하면 해당 도구를 사용합니다.",
+        "  일정 분류는 회의/업무/개인/기타 중 내용에 맞게 고릅니다.",
+        "- add_event 결과에 conflicts가 있으면 겹치는 일정을 알려 주고, suggestions에 있는 시간만 대체 시간으로 제안합니다.",
+        "  다른 시간을 지어내지 않습니다. 김 대리가 고르면 move_event로 옮깁니다.",
         "- 이메일로 보내 달라는 명시적 요청이 있을 때만 send_email을 사용합니다.",
-        "  받는 사람을 따로 말하지 않으면 김 대리 이메일로 보냅니다.",
+        "  받는 사람을 말하지 않으면 to에 '나'를 넣습니다. 연락처에 있는 사람은 이름으로 넣을 수 있고,",
+        "  연락처에 없는 사람의 이메일 주소는 절대 지어내지 않습니다.",
+        "- send_email 결과가 needs_confirmation이면 아직 보내지 않은 것입니다.",
+        "  '보내기 전 확인 카드를 확인하고 보내기 버튼을 눌러 주세요'라고 안내하고 review 내용을 짧게 전합니다.",
+        "  failed면 이유를 알리고 필요한 정보를 묻습니다.",
         "- 도구를 사용한 뒤에는 무엇을 했는지 짧게 보고합니다.",
         "- 공손한 한국어 존댓말로 간결하게 답합니다.",
         "",
@@ -823,27 +1349,90 @@ def system_prompt():
         lines.append("[최근 회의] (없음)")
     return "\n".join(lines)
 
+
 # ─────────────────────────────────────────────
 # 에이블 비서 (과제 8: 음성 인식 AI 개인비서)
 #   텍스트 파일 첨부 · 실시간 녹음(STT) · 실행 버튼 · 스피너 · LLM 호출(도구 사용)
-#   · 응답 화면 출력 · 응답 음성 즉시 재생(TTS) · 멀티턴 상태 관리(최근 10개)
+#   · 응답 화면 출력 · 응답 음성 즉시 재생(TTS) · 멀티턴 상태 관리 · GPT처럼 대화 기록/새 채팅
 # ─────────────────────────────────────────────
-MAX_TURNS = 10   # 기억할 대화(질문+답변) 개수
+MAX_TURNS = 10   # 대화마다 기억할 질문+답변 개수
+MAX_CHATS = 10   # 보관할 대화 개수
 VOICES = {"alloy": "기본", "nova": "밝은", "shimmer": "부드러운", "echo": "차분한", "onyx": "낮은"}
-QUICK_ASKS = ["📝 최근 회의 내용 요약해줘", "✅ 나에게 배정된 업무만 알려줘", "📧 오늘 할 일을 내 메일로 보내줘"]
+QUICK_ASKS = ["📝 최근 회의 내용 요약해줘", "📅 내일 오후 2시에 팀 회의 일정 잡아줘", "📧 오늘 할 일을 내 메일로 보내줘"]
 
 
 def clean_for_tts(text):
     # 마크다운 기호를 빼고 읽기 좋은 문장으로 (TTS가 '#', '*' 등을 읽지 않게)
-    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)          # [링크](url) → 링크
-    t = re.sub(r"^\s*\|?[-:| ]+\|?\s*$", "", t, flags=re.M)     # 표 구분선 제거
-    t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.M)              # 목록 기호
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    t = re.sub(r"^\s*\|?[-:| ]+\|?\s*$", "", t, flags=re.M)
+    t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.M)
     t = re.sub(r"[#*`>|_~]", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
-def ask_assistant(question, file_name="", file_text=""):
-    # 최근 대화(멀티턴) + 첨부 파일 + 업무 데이터로 LLM 호출, 필요하면 도구(이메일 등) 실행
+def current_chat():
+    cid = st.session_state.get("chat_id")
+    return next((c for c in data["chats"] if c["id"] == cid), None)
+
+
+def new_chat_cb():
+    st.session_state.chat_id = None
+    st.session_state.chat_n = st.session_state.get("chat_n", 0) + 1
+
+
+def open_chat_cb(cid):
+    st.session_state.chat_id = cid
+    st.session_state.chat_n = st.session_state.get("chat_n", 0) + 1
+
+
+def delete_chat_cb(cid):
+    data["chats"] = [c for c in data["chats"] if c["id"] != cid]
+    save_data()
+    if st.session_state.get("chat_id") == cid:
+        new_chat_cb()
+
+
+def save_turn(chat, turn):
+    # 상태 관리: 질문·답변을 대화에 저장 (대화마다 최근 10개, 대화는 최근 10개까지)
+    if chat is None:
+        title = turn["q"][:22] + ("…" if len(turn["q"]) > 22 else "")
+        chat = {"id": uuid.uuid4().hex[:8], "title": title or "새 채팅", "created": now_kst(),
+                "updated": now_kst(), "turns": []}
+        data["chats"].insert(0, chat)
+    chat["turns"].append(turn)
+    chat["turns"] = chat["turns"][-MAX_TURNS:]
+    chat["updated"] = now_kst()
+    data["chats"].sort(key=lambda c: c["updated"], reverse=True)
+    del data["chats"][MAX_CHATS:]
+    save_data()
+    st.session_state.chat_id = chat["id"]
+    return chat
+
+
+def prepare_email(args, question):
+    # send_email 도구: 바로 보내지 않고 받는 사람 확인 → AI 점검 → (설정에 따라) 김 대리 확인 후 발송
+    rcpt, err = resolve_recipient(args["to"])
+    if err:
+        return {"status": "failed", "error": err}, None, {"ok": False, "text": f"📧 메일 준비 실패 ({err})"}
+    ctx = f"[김 대리 요청]\n{question}\n\n[참고 자료]\n{brief_context()}"
+    rv = review_email(rcpt, args["subject"], args["body"], ctx)
+    who = f"{rcpt['name']} <{rcpt['email']}>" if rcpt["name"] else rcpt["email"]
+    if not data["settings"].get("confirm_before_send", True) and rv["ok"]:
+        sr = send_email(rcpt["email"], args["subject"], args["body"])
+        if sr["status"] == "success":
+            return ({"status": "success", "to": rcpt["email"], "review": rv["summary"]}, None,
+                    {"ok": True, "text": f"📧 AI 확인 후 발송 완료 → {who} · '{args['subject']}'"})
+        return sr, None, {"ok": False, "text": f"📧 메일 발송 실패 ({sr['error']})"}
+    mail = {"to": rcpt["email"], "name": rcpt["name"], "subject": args["subject"], "body": args["body"],
+            "review": rv, "context": ctx, "status": "pending"}
+    result = {"status": "needs_confirmation", "to": rcpt["email"], "name": rcpt["name"], "review": rv["summary"],
+              "issues": [c["comment"] for c in rv["checks"] if not c["ok"]],
+              "message": "아직 보내지 않았습니다. 화면의 '보내기 전 확인' 카드에서 김 대리가 보내기를 눌러야 발송됩니다."}
+    return result, mail, {"ok": True, "warn": True, "text": f"📧 보내기 전 확인 대기 → {who} · '{args['subject']}'"}
+
+
+def ask_assistant(chat, question, file_name="", file_text=""):
+    # 이 대화의 최근 질문·답변(멀티턴) + 첨부 파일 + 업무 데이터로 LLM 호출, 필요하면 도구 실행
     instructions = system_prompt() + "\n" + "\n".join([
         "",
         "[답변 방식]",
@@ -855,61 +1444,120 @@ def ask_assistant(question, file_name="", file_text=""):
         file_text[:12000] if file_text else "",
     ])
     inputs = []
-    for t in st.session_state.chat[-MAX_TURNS:]:
+    for t in (chat["turns"] if chat else [])[-MAX_TURNS:]:
         inputs.append({"role": "user", "content": t["q"]})
         inputs.append({"role": "assistant", "content": t["a"]})
     inputs.append({"role": "user", "content": question})
 
     client = get_client()
-    actions = []
+    actions, mail = [], None
     for _ in range(5):  # 도구 호출은 최대 5회 반복
         resp = client.responses.create(model=MODEL, instructions=instructions, input=inputs, tools=TOOLS)
         calls = [i for i in resp.output if i.type == "function_call"]
         if not calls:
-            return resp.output_text, actions
+            return resp.output_text, actions, mail
         inputs += resp.output
         for c in calls:
             args = json.loads(c.arguments)
-            result = run_tool(c.name, args)
-            ok = isinstance(result, dict) and result.get("status") != "failed"
-            detail = f" → {args['to']} · '{args['subject']}'" if c.name == "send_email" else ""
-            detail += f" → {args.get('title', '')}" if c.name in ("add_todo", "add_event") else ""
-            actions.append({"ok": ok, "text": f"{TOOL_LABEL.get(c.name, c.name)} {'완료' if ok else '실패'}{detail}"
-                                              + ("" if ok else f" ({result.get('error')})")})
+            if c.name == "send_email":
+                result, new_mail, act = prepare_email(args, question)
+                mail = new_mail or mail
+            else:
+                result = run_tool(c.name, args)
+                act = action_of(c.name, args, result)
+            actions.append(act)
             inputs.append({"type": "function_call_output", "call_id": c.call_id,
                            "output": json.dumps(result, ensure_ascii=False)})
-    return resp.output_text or "요청을 처리했습니다.", actions
+    return resp.output_text or "요청을 처리했습니다.", actions, mail
 
 
 def set_quick(q):
     st.session_state.chat_quick = q
 
 
-def history_text():
-    lines = []
-    for t in st.session_state.chat:
+def history_text(chat):
+    lines = [f"# {chat['title']} ({chat['created']})", ""]
+    for t in chat["turns"]:
         lines += [f"[{t['time']}] 김 대리: {t['q']}", f"[{t['time']}] 에이블: {t['a']}", ""]
     return "\n".join(lines)
 
 
-with tab_chat:
-    st.session_state.setdefault("chat", [])
-    st.session_state.setdefault("chat_n", 0)       # 입력칸 초기화용 번호
-    n = st.session_state.chat_n
-
-    st.markdown("#### 🤖 무엇을 도와드릴까요, 김 대리님?")
-    st.caption("말로 물어보거나 글로 입력하세요. 에이블이 답을 화면에 보여 주고 바로 읽어 드립니다. "
-               "텍스트 파일을 올리면 그 내용을 참고해 답합니다.")
-
+def render_mail_confirm(t):
+    # 에이블 비서가 쓴 메일: AI 확인 결과를 보여 주고 김 대리가 확인 후 발송
+    m, tid = t["mail"], t["id"]
+    key = f"chat_{tid}"
     with st.container(border=True):
-        up_txt = st.file_uploader("📎 텍스트 파일 업로드 (회의록, 메모 등)", type=["txt", "md", "csv"], key="chat_file")
+        st.markdown("#### 📧 보내기 전 확인")
+        st.caption("에이블이 메일을 한 번 더 점검했어요. 내용을 고칠 수 있고, 보내기를 눌러야 발송됩니다.")
+        to_raw = st.text_input("받는 사람 (이메일 또는 연락처 이름)", value=m["to"], key=f"cm_to_{tid}")
+        subj = st.text_input("제목", value=m["subject"], key=f"cm_sub_{tid}")
+        body = st.text_area("본문", value=m["body"], height=220, key=f"cm_body_{tid}")
+        if f"rv_{key}" not in st.session_state and m.get("review"):
+            st.session_state[f"rv_{key}"] = dict(m["review"],
+                                                 sig=json.dumps([m["to"], m["subject"], m["body"]], ensure_ascii=False))
+        r = confirm_and_send(key, to_raw, subj, body, m.get("context", ""))
+        if r == "sent":
+            m.update(status="sent", to=to_raw, subject=subj, body=body)
+            t["actions"].append({"ok": True, "text": f"📧 메일 발송 완료 → {to_raw} · '{subj}'"})
+            save_data()
+            st.session_state.pending_toast = "메일을 보냈어요."
+            st.rerun()
+        if st.button("✖ 보내지 않기", key=f"cm_cancel_{tid}"):
+            m["status"] = "canceled"
+            t["actions"].append({"ok": True, "warn": True, "text": "📧 메일 발송을 취소했어요."})
+            save_data()
+            st.rerun()
+
+
+with tab_chat:
+    st.session_state.setdefault("chat_n", 0)
+    st.session_state.setdefault("audio_cache", {})
+    n = st.session_state.chat_n
+    chat = current_chat()
+    turns = chat["turns"] if chat else []
+    autoplay_id = st.session_state.pop("chat_autoplay", None)
+
+    h1, h2, h3 = st.columns([5, 1.3, 1.3])
+    h1.markdown(f"#### 💬 {chat['title'] if chat else '새 채팅'}")
+    h1.caption(f"🧠 이 대화에서 기억 중인 질문·답변 {len(turns)}/{MAX_TURNS} · 대화 기록은 왼쪽 사이드바에 있어요")
+    h2.button("➕ 새 채팅", key="new_chat_main", on_click=new_chat_cb, use_container_width=True)
+    h3.download_button("⬇️ 대화 저장", history_text(chat) if chat else "", file_name="에이블_대화기록.txt",
+                       mime="text/plain", use_container_width=True, disabled=not turns)
+
+    if not turns:
+        with st.container(border=True):
+            st.markdown("**무엇을 도와드릴까요, 김 대리님? 에이블이 할 수 있는 일**")
+            st.markdown("- 📝 첨부한 파일이나 최근 회의 내용 요약, 김 대리 업무 정리\n"
+                        "- 📅 일정 추가·변경 (겹치면 알려 드리고 비어 있는 시간을 제안해요)\n"
+                        "- 📧 요청하면 메일 작성·발송 (연락처 이름으로 보내기, 보내기 전에 한 번 더 확인)\n"
+                        "- 💬 이전 질문을 기억해서 이어서 대화 · 🔊 답변을 바로 음성으로 읽어 드려요")
+
+    for t in turns:
+        with st.chat_message("user", avatar="🧑‍💼"):
+            if t["via"] == "voice":
+                st.caption("🎙️ 음성 인식 결과 (STT) — 말씀하신 내용이 맞는지 확인하세요")
+            st.markdown(t["q"])
+            st.caption(t["time"] + (f" · 📎 {t['file']}" if t["file"] else ""))
+        with st.chat_message("assistant", avatar="🤖"):
+            st.markdown(t["a"])
+            for a in t["actions"]:
+                show_action(a)
+            audio = st.session_state.audio_cache.get(t["id"])
+            if audio:
+                st.audio(audio, format="audio/mp3", autoplay=(t["id"] == autoplay_id))
+
+    for t in turns:
+        if t.get("mail") and t["mail"]["status"] == "pending":
+            render_mail_confirm(t)
+
+    # --- 입력 카드 ---
+    with st.container(border=True):
+        up_txt = st.file_uploader("📎 텍스트 파일 첨부 (회의록, 메모 등)", type=["txt", "md", "csv"], key="chat_file")
         file_name, file_text = "", ""
         if up_txt is not None:
             file_name = up_txt.name
             file_text = up_txt.getvalue().decode("utf-8", errors="ignore")
             st.caption(f"📎 **{file_name}** 첨부됨 · {len(file_text):,}자 — 이 내용을 참고해 답변합니다.")
-            with st.expander("첨부 파일 미리보기"):
-                st.text(file_text[:1500] + ("\n…" if len(file_text) > 1500 else ""))
 
         voice_in = None
         if hasattr(st, "audio_input"):
@@ -917,20 +1565,16 @@ with tab_chat:
         else:
             st.warning("실시간 녹음을 쓰려면 `!pip install -q -U streamlit`으로 업데이트하세요.")
         typed = st.text_input("⌨️ 또는 글로 입력", key=f"chat_text_{n}",
-                              placeholder="예) 회의 내용 요약해서 내 메일로 보내줘")
+                              placeholder="예) 박과장님께 회의 요약 메일 보내줘 / 금요일 오후 3시 거래처 미팅 잡아줘")
 
         qc = st.columns(len(QUICK_ASKS))
         for col, qa in zip(qc, QUICK_ASKS):
             col.button(qa, key=f"quick_{qa}", on_click=set_quick, args=(qa,), use_container_width=True)
 
-        b1, b2, b3, b4 = st.columns([1.1, 1, 1.4, 1.5])
+        b1, b2, b3 = st.columns([1.2, 1.5, 1.6])
         run_clicked = b1.button("▶ 실행", type="primary", use_container_width=True)
-        if b2.button("🧹 새 대화", use_container_width=True):
-            st.session_state.chat = []
-            st.session_state.chat_n += 1
-            st.rerun()
-        tts_on = b3.toggle("🔊 답변 음성 재생", value=True, key="chat_tts")
-        voice = b4.selectbox("목소리", list(VOICES), format_func=lambda v: f"{VOICES[v]} ({v})",
+        tts_on = b2.toggle("🔊 답변 음성 재생", value=True, key="chat_tts")
+        voice = b3.selectbox("목소리", list(VOICES), format_func=lambda v: f"{VOICES[v]} ({v})",
                              key="chat_voice", label_visibility="collapsed")
 
     quick = st.session_state.pop("chat_quick", None)
@@ -944,69 +1588,25 @@ with tab_chat:
                 with st.spinner("답변을 준비하고 있습니다.."):
                     stt = None
                     if voice_in is not None and not quick:
-                        stt = speech_to_text(voice_in.getvalue())          # 음성 → 텍스트 (STT)
+                        stt = speech_to_text(voice_in.getvalue())                   # 음성 → 텍스트 (STT)
                         question = (stt + " " + question).strip()
-                    answer, actions = ask_assistant(question, file_name, file_text)   # LLM 호출
+                    answer, actions, mail = ask_assistant(chat, question, file_name, file_text)   # LLM 호출
                     reply_audio = text_to_speech(clean_for_tts(answer), voice) if tts_on and answer else None
-                st.session_state.chat.append({
-                    "q": question, "stt": stt, "via": "voice" if stt else "text", "file": file_name,
-                    "a": answer, "actions": actions, "audio": reply_audio,
-                    "time": dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).strftime("%H:%M"),
-                })
-                st.session_state.chat = st.session_state.chat[-MAX_TURNS:]   # 최근 10개만 저장
-                st.session_state.chat_n += 1                                  # 입력칸 비우기
-                st.session_state.chat_autoplay = True
+                turn = {"id": uuid.uuid4().hex[:8], "q": question, "stt": stt, "via": "voice" if stt else "text",
+                        "file": file_name, "a": answer, "actions": actions, "mail": mail, "time": now_kst()[11:]}
+                save_turn(chat, turn)                                            # 상태 저장 (멀티턴)
+                if reply_audio:
+                    cache = st.session_state.audio_cache
+                    cache[turn["id"]] = reply_audio
+                    for k in list(cache)[:-30]:
+                        del cache[k]
+                st.session_state.chat_autoplay = turn["id"]                       # 답변 음성 즉시 재생
+                st.session_state.chat_n += 1                                      # 입력칸 비우기
                 done = True
             except Exception as e:
                 st.error(f"답변을 만들지 못했습니다: {e}")
             if done:
                 st.rerun()   # try 밖에서 호출해야 화면 새로고침 신호가 막히지 않음
-
-    chat = st.session_state.chat
-    if not chat:
-        with st.container(border=True):
-            st.markdown("**에이블이 할 수 있는 일**")
-            st.markdown("- 📝 첨부한 파일이나 최근 회의 내용 요약, 김 대리 업무 정리\n"
-                        f"- 📧 요청하면 요약·정리 내용을 이메일로 발송 (내 주소: {my_email() or '메일 비서 탭에서 설정'})\n"
-                        "- 📅 일정·할 일 추가, 완료 처리, 이번 주 마감 확인\n"
-                        "- 💬 이전 대화를 기억해서 이어서 질문 가능 (최근 10개)")
-    else:
-        last = chat[-1]
-        st.markdown("### 💬 AI 답변")
-        with st.container(border=True):
-            if last["via"] == "voice":
-                st.caption("🎙️ 음성 인식 결과 (STT) — 말씀하신 내용이 맞는지 확인하세요")
-                st.info(last["stt"])
-            else:
-                st.caption("⌨️ 질문")
-                st.info(last["q"])
-            if last["file"]:
-                st.caption(f"📎 참고한 파일: {last['file']}")
-            st.markdown(last["a"])
-            for a in last["actions"]:
-                (st.success if a["ok"] else st.error)(a["text"])
-            if last["audio"]:
-                st.audio(last["audio"], format="audio/mp3",
-                         autoplay=st.session_state.pop("chat_autoplay", False))
-
-        h1, h2 = st.columns([3, 1])
-        h1.caption(f"🧠 기억 중인 대화 {len(chat)}/{MAX_TURNS} — 이어서 질문하면 앞의 대화를 참고해 답합니다.")
-        h2.download_button("⬇️ 대화 저장", history_text(), file_name="에이블_대화기록.txt",
-                           mime="text/plain", use_container_width=True)
-
-        if len(chat) > 1:
-            with st.expander(f"🗂️ 이전 대화 {len(chat) - 1}개 보기", expanded=False):
-                for t in reversed(chat[:-1]):
-                    with st.chat_message("user", avatar="🧑‍💼"):
-                        st.markdown(("🎙️ " if t["via"] == "voice" else "") + t["q"])
-                        st.caption(t["time"] + (f" · 📎 {t['file']}" if t["file"] else ""))
-                    with st.chat_message("assistant", avatar="🤖"):
-                        st.markdown(t["a"])
-                        for a in t["actions"]:
-                            st.caption(a["text"])
-                        if t["audio"]:
-                            st.audio(t["audio"], format="audio/mp3")
-
 
 
 # ─────────────────────────────────────────────
@@ -1363,24 +1963,49 @@ def fill_mail(kind):
     if kind == "status":
         st.session_state.mail_subject = f"[에이블] {today.isoformat()} 업무 현황"
         st.session_state.mail_body = status_report_text()
+        st.session_state.mail_context = "[참고 자료]\n" + brief_context()
     elif kind == "meeting" and latest_note():
         n = latest_note()
         st.session_state.mail_subject = f"[에이블] 회의록 - {n['title']}"
         st.session_state.mail_body = note_markdown(n)
+        st.session_state.mail_context = "[참고 자료: 회의 원문]\n" + n["text"][:6000]
     elif kind == "clear":
         st.session_state.mail_subject = ""
         st.session_state.mail_body = ""
+        st.session_state.mail_context = ""
     st.session_state.mail_to = my_email()
 
 
-with tab_mail:
-    st.markdown("메일을 쓰고 보내거나, 받은 메일을 에이블이 요약하고 **김 대리에게 요청된 일**을 할 일에 올립니다.")
+def _pick_contact():
+    c = next((x for x in data["contacts"] if x["id"] == st.session_state.get("mail_pick")), None)
+    if c:
+        st.session_state.mail_to = c["email"]
 
-    with st.expander(f"⚙️ 내 이메일 주소: {my_email() or '미설정'}"):
+
+def _write_to(email_addr):
+    st.session_state.mail_to = email_addr
+    st.session_state.pending_toast = "✉️ 메일 보내기 탭의 받는 사람에 넣었어요."
+
+
+def _save_confirm():
+    data["settings"]["confirm_before_send"] = st.session_state.set_confirm
+    save_data()
+
+
+def _add_sender(name, addr):
+    upsert_contact(name or addr.split("@")[0], addr, memo="받은 메일에서 추가")
+    st.session_state.pending_toast = f"📇 {name or addr}님을 연락처에 추가했어요."
+
+
+with tab_mail:
+    st.markdown("연락처로 메일을 보내고(보내기 전에 에이블이 한 번 더 확인), 받은 메일을 요약해 "
+                "**김 대리에게 요청된 일**을 할 일에 올립니다.")
+
+    with st.expander(f"⚙️ 메일 설정 · 내 이메일: {my_email() or '미설정'}"):
         new_addr = st.text_input("내 이메일 주소", value=my_email(), key="set_my_email")
         st.caption("한 번 저장하면 메일 보내기의 기본 받는 사람, 회의록 메일, 에이블 비서의 ‘내 메일로 보내줘’에 항상 적용됩니다.")
         if st.button("저장", key="save_my_email"):
-            if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", new_addr.strip()):
+            if EMAIL_RE.fullmatch(new_addr.strip()):
                 data["settings"]["my_email"] = new_addr.strip()
                 save_data()
                 st.session_state.mail_to = new_addr.strip()
@@ -1388,12 +2013,16 @@ with tab_mail:
                 st.rerun()
             else:
                 st.error("이메일 주소 형식을 확인해 주세요.")
+        st.toggle("💬 에이블 비서가 메일을 보낼 때, AI 확인 후 내가 한 번 더 보고 보내기",
+                  value=data["settings"].get("confirm_before_send", True), key="set_confirm", on_change=_save_confirm)
+        st.caption("끄면 AI 확인에서 문제가 없을 때만 바로 발송하고, 확인할 점이 있으면 확인 카드를 띄웁니다.")
 
     if not gmail_ready():
         st.warning("api_key.txt에 GMAIL_ADDRESS, GMAIL_APP_PASSWORD가 있어야 메일을 보내고 받을 수 있습니다.")
 
-    sub_send, sub_inbox = st.tabs(["✉️ 메일 보내기", "📥 받은 메일 요약"])
+    sub_send, sub_inbox, sub_contacts = st.tabs(["✉️ 메일 보내기", "📥 받은 메일 요약", f"📇 연락처 ({len(data['contacts'])})"])
 
+    # --- 메일 보내기 ---
     with sub_send:
         st.session_state.setdefault("mail_to", my_email())
         if st.session_state.pop("mail_clear", False):
@@ -1410,34 +2039,36 @@ with tab_mail:
                                   placeholder="예) 경쟁사 분석 보고서 다음 주까지 공유 예정, 자료 요청 감사 인사")
             situation = st.text_input("받는 사람 / 상황 (선택)", key="mail_situation", placeholder="예) 팀장님께 보고")
             if st.button("✍️ 초안 작성", disabled=not points.strip()):
+                ok_draft = False
                 try:
                     with st.spinner("초안을 쓰는 중..."):
                         dr = draft_mail(points, situation)
                     st.session_state.mail_subject = dr["subject"]
                     st.session_state.mail_body = dr["body"]
+                    st.session_state.mail_context = f"[김 대리가 준 요점]\n{points}\n[상황] {situation or '-'}"
                     st.session_state.pending_toast = "초안을 아래에 채워 넣었어요. 확인 후 보내세요."
                     ok_draft = True
                 except Exception as e:
                     st.error(f"초안을 만들지 못했습니다: {e}")
-                    ok_draft = False
                 if ok_draft:
                     st.rerun()
 
-        to = st.text_input("받는 사람", key="mail_to")
+        cmap = {c["id"]: c for c in data["contacts"]}
+        if cmap:
+            st.selectbox("📇 연락처에서 받는 사람 고르기", [""] + list(cmap), key="mail_pick", on_change=_pick_contact,
+                         format_func=lambda i: "선택하세요" if not i else f"{contact_label(cmap[i])} <{cmap[i]['email']}>")
+        to = st.text_input("받는 사람 (이메일 주소 또는 연락처 이름)", key="mail_to")
         subject = st.text_input("제목", key="mail_subject")
         body = st.text_area("본문", key="mail_body", height=260)
-        if st.button("📨 보내기", type="primary", disabled=not (to.strip() and subject.strip() and body.strip())):
-            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", to.strip()):
-                st.error("받는 사람 이메일 주소 형식을 확인해 주세요.")
-            else:
-                sr = send_email(to.strip(), subject, body)
-                if sr["status"] == "success":
-                    st.session_state.mail_clear = True
-                    st.session_state.pending_toast = f"{to.strip()}로 메일을 보냈어요."
-                    st.rerun()
-                else:
-                    st.error(f"발송 실패: {sr['error']}")
+        if to.strip():
+            sent = confirm_and_send("compose", to, subject, body,
+                                    st.session_state.get("mail_context") or "(김 대리가 직접 작성한 메일)")
+            if sent == "sent":
+                st.session_state.mail_clear = True
+                st.session_state.pending_toast = "메일을 보냈어요."
+                st.rerun()
 
+    # --- 받은 메일 요약 ---
     with sub_inbox:
         processed = data["processed_mails"]
         o1, o2 = st.columns([2, 3])
@@ -1480,12 +2111,17 @@ with tab_mail:
 
         res = st.session_state.get("mail_result")
         if res and res["mails"]:
+            known = {c["email"].lower() for c in data["contacts"]}
             work = [m for m in res["mails"] if m["category"] != "광고/알림"]
             ads = [m for m in res["mails"] if m["category"] == "광고/알림"]
-            for m in work:
+            for i, m in enumerate(work):
                 with st.container(border=True):
-                    st.markdown(f"{CATEGORY_ICON[m['category']]} **{m['subject']}**  \n"
-                                f":gray[{m['from']} · {m['date']} · {m['category']}]")
+                    a, b = st.columns([5, 1.4])
+                    a.markdown(f"{CATEGORY_ICON[m['category']]} **{m['subject']}**  \n"
+                               f":gray[{m['from']} · {m['date']} · {m['category']}]")
+                    if m["addr"].lower() not in known:
+                        b.button("📇 연락처에 추가", key=f"addc_{i}", on_click=_add_sender, args=(m["from"], m["addr"]),
+                                 use_container_width=True)
                     st.write(m["summary"])
                     for t in m["kim_tasks"]:
                         st.markdown(f"- **{t['title']}** — {task_status_line(t)}")
@@ -1495,21 +2131,88 @@ with tab_mail:
                         else:
                             with st.expander(f"✉️ {m['from']}님께 보낼 답장 초안 보기·수정"):
                                 draft = st.text_area("답장", value=m["reply_draft"], height=200,
-                                                     key=f"reply_{m['msg_id']}", label_visibility="collapsed")
-                                st.caption(f"받는 사람: {m['addr']} · 제목: Re: {m['subject']}")
-                                if st.button("📨 이 내용으로 답장 보내기", key=f"send_{m['msg_id']}", type="primary"):
-                                    subj = m["subject"] if m["subject"].lower().startswith("re:") else "Re: " + m["subject"]
-                                    sr = send_email(m["addr"], subj, draft, m["msg_id"])
-                                    if sr["status"] == "success":
-                                        res["sent"].append(m["msg_id"])
-                                        st.session_state.pending_toast = f"{m['from']}님께 답장을 보냈어요."
-                                        st.rerun()
-                                    else:
-                                        st.error(f"발송 실패: {sr['error']}")
+                                                     key=f"reply_{i}", label_visibility="collapsed")
+                                subj = m["subject"] if m["subject"].lower().startswith("re:") else "Re: " + m["subject"]
+                                sent = confirm_and_send(
+                                    f"reply_{i}", m["addr"], subj, draft,
+                                    f"[받은 메일]\n보낸 사람: {m['from']}\n제목: {m['subject']}\n본문: {m['body']}",
+                                    m["msg_id"])
+                                if sent == "sent":
+                                    res["sent"].append(m["msg_id"])
+                                    st.session_state.pending_toast = f"{m['from']}님께 답장을 보냈어요."
+                                    st.rerun()
             if ads:
                 with st.expander(f"📢 광고/알림 메일 {len(ads)}통"):
                     for m in ads:
                         st.markdown(f"- **{m['subject']}** · {m['from']} — {m['summary']}")
+
+    # --- 연락처 ---
+    with sub_contacts:
+        st.caption("연락처에 저장하면 에이블 비서에게 \"박과장님께 회의 요약 메일 보내줘\"처럼 이름만 말해도 보낼 수 있어요. "
+                   "보내기 전에는 에이블이 받는 사람과 내용을 한 번 더 확인합니다.")
+        with st.expander("➕ 연락처 추가", expanded=not data["contacts"]):
+            with st.form("ct_add", clear_on_submit=True):
+                c1, c2, c3 = st.columns(3)
+                nm = c1.text_input("이름 *", placeholder="박민수")
+                rl = c2.text_input("직함", placeholder="과장")
+                tm = c3.text_input("소속", placeholder="마케팅팀")
+                c4, c5 = st.columns(2)
+                em = c4.text_input("이메일 *", placeholder="park@company.com")
+                al = c5.text_input("부르는 호칭 (선택)", placeholder="박과장")
+                mm = st.text_input("메모", placeholder="예: 신제품 마케팅 담당")
+                if st.form_submit_button("저장", type="primary"):
+                    if not nm.strip() or not EMAIL_RE.fullmatch(em.strip()):
+                        st.error("이름과 올바른 이메일 주소를 입력하세요.")
+                    else:
+                        upsert_contact(nm, em, rl, tm, al, mm)
+                        st.session_state.pending_toast = f"📇 {nm.strip()}님을 연락처에 저장했어요."
+                        st.rerun()
+
+        cq = st.text_input("🔍 연락처 검색", key="ct_q", placeholder="이름, 직함, 소속, 이메일")
+        shown = [c for c in data["contacts"]
+                 if cq.strip().lower() in " ".join([c["name"], c["role"], c["team"], c["alias"], c["email"]]).lower()]
+        shown.sort(key=lambda c: c["name"])
+        if not shown:
+            st.info("저장된 연락처가 없습니다." if not cq.strip() else "검색 결과가 없습니다.")
+        for c in shown:
+            with st.container(border=True):
+                if st.session_state.get("ct_edit") == c["id"]:
+                    e1, e2, e3 = st.columns(3)
+                    nm = e1.text_input("이름", value=c["name"], key=f"ce_n_{c['id']}")
+                    rl = e2.text_input("직함", value=c["role"], key=f"ce_r_{c['id']}")
+                    tm = e3.text_input("소속", value=c["team"], key=f"ce_t_{c['id']}")
+                    e4, e5 = st.columns(2)
+                    em = e4.text_input("이메일", value=c["email"], key=f"ce_e_{c['id']}")
+                    al = e5.text_input("호칭", value=c["alias"], key=f"ce_a_{c['id']}")
+                    mm = st.text_input("메모", value=c["memo"], key=f"ce_m_{c['id']}")
+                    s1, s2, _ = st.columns([1, 1, 4])
+                    if s1.button("저장", key=f"ce_save_{c['id']}", type="primary"):
+                        if nm.strip() and EMAIL_RE.fullmatch(em.strip()):
+                            c.update(name=nm.strip(), role=rl.strip(), team=tm.strip(), email=em.strip(),
+                                     alias=al.strip(), memo=mm.strip())
+                            save_data()
+                            st.session_state.ct_edit = None
+                            st.rerun()
+                        else:
+                            st.error("이름과 올바른 이메일 주소를 입력하세요.")
+                    if s2.button("취소", key=f"ce_cancel_{c['id']}"):
+                        st.session_state.ct_edit = None
+                        st.rerun()
+                else:
+                    a, b, c_, d_ = st.columns([5, 1.3, 0.7, 0.7])
+                    a.markdown(f"**{contact_label(c)}**" + (f" · 호칭: {c['alias']}" if c["alias"] else "")
+                               + f"  \n:gray[{c['email']}]")
+                    if c["memo"]:
+                        a.caption(c["memo"])
+                    b.button("✉️ 메일 쓰기", key=f"ct_mail_{c['id']}", on_click=_write_to, args=(c["email"],),
+                             use_container_width=True)
+                    if c_.button("✏️", key=f"ct_edit_{c['id']}", help="수정"):
+                        st.session_state.ct_edit = c["id"]
+                        st.rerun()
+                    if d_.button("🗑️", key=f"ct_del_{c['id']}", help="삭제"):
+                        data["contacts"] = [x for x in data["contacts"] if x["id"] != c["id"]]
+                        save_data()
+                        st.rerun()
 
 
 # ─────────────────────────────────────────────
@@ -1518,6 +2221,20 @@ with tab_mail:
 with st.sidebar:
     st.markdown("## 🤖 에이블")
     st.caption("김 대리님의 AI 개인비서")
+
+    # 0) GPT처럼 새 채팅 + 대화 기록
+    st.button("➕ 새 채팅", key="new_chat_side", on_click=new_chat_cb, type="primary", use_container_width=True)
+    chats = sorted(data["chats"], key=lambda c: c["updated"], reverse=True)
+    with st.expander(f"💬 대화 기록 ({len(chats)}/{MAX_CHATS})", expanded=True):
+        if not chats:
+            st.caption("아직 대화가 없습니다. 🤖 에이블 비서 탭에서 대화를 시작해 보세요.")
+        for c in chats:
+            a, b = st.columns([5, 1])
+            cur = c["id"] == st.session_state.get("chat_id")
+            a.button(("🟢 " if cur else "💬 ") + c["title"], key=f"open_{c['id']}", on_click=open_chat_cb,
+                     args=(c["id"],), use_container_width=True, help=f"{c['updated']} · 질문 {len(c['turns'])}개")
+            b.button("🗑️", key=f"delchat_{c['id']}", on_click=delete_chat_cb, args=(c["id"],), help="대화 삭제")
+        st.caption(f"최근 대화 {MAX_CHATS}개까지 보관하고, 대화마다 최근 질문·답변 {MAX_TURNS}개를 기억해요.")
 
     # 1) 앞으로 3일 할 일
     undone_all = [t for t in data["todos"] if not t["done"]]
