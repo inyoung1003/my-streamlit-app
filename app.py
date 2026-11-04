@@ -1,3 +1,4 @@
+
 # AI 개인비서 '에이블' (Streamlit)
 # 실행: streamlit run app.py
 # 같은 폴더에 필요한 파일:
@@ -101,7 +102,8 @@ def gmail_ready():
 # 데이터 저장/불러오기
 # ─────────────────────────────────────────────
 DATA_DEFAULTS = {"todos": [], "events": [], "meeting_notes": [], "mail_summaries": {},
-                 "processed_mails": [], "settings": {}, "contacts": [], "chats": []}
+                 "processed_mails": [], "settings": {}, "contacts": [], "chats": [],
+                 "mail_analysis": {"when": "", "mails": []}}
 
 
 def load_data():
@@ -483,6 +485,11 @@ for _c in data["contacts"]:
     _c.setdefault("id", uuid.uuid4().hex[:8])
     for _k in ("name", "role", "team", "alias", "email", "memo"):
         _c.setdefault(_k, "")
+if not isinstance(data.get("mail_analysis"), dict):
+    data["mail_analysis"] = {"when": "", "mails": []}
+data["mail_analysis"].setdefault("when", "")
+data["mail_analysis"]["mails"] = [m for m in data["mail_analysis"].get("mails", [])
+                                  if isinstance(m, dict) and isinstance(m.get("proposal"), dict)]
 data["chats"] = [c for c in data["chats"] if isinstance(c, dict) and c.get("id")]
 for _ch in data["chats"]:
     _ch.setdefault("title", "대화")
@@ -1489,6 +1496,17 @@ TOOLS = [
         "strict": True,
     },
     {
+        "type": "function", "name": "confirm_pending_email",
+        "description": "보내기를 기다리는 메일(send_email 결과가 needs_confirmation)을 김 대리 말대로 처리합니다. "
+                       "'보내줘', '그래도 보내' → send, '보내지 마', '취소' → cancel.",
+        "parameters": {
+            "type": "object",
+            "properties": {"action": {"type": "string", "enum": ["send", "cancel"]}},
+            "required": ["action"], "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
         "type": "function", "name": "complete_todo",
         "description": "할 일을 완료 처리합니다. id는 현재 할 일 목록에 있는 값을 사용합니다.",
         "parameters": {
@@ -1501,7 +1519,8 @@ TOOLS = [
 ]
 
 TOOL_LABEL = {"send_email": "메일", "add_todo": "할 일 추가", "add_event": "일정 추가",
-              "move_event": "일정 변경", "complete_todo": "완료 처리", "decide_pending_event": "일정 승인"}
+              "move_event": "일정 변경", "complete_todo": "완료 처리", "decide_pending_event": "일정 승인",
+              "confirm_pending_email": "메일 발송"}
 
 
 def run_tool(name, args):
@@ -1571,9 +1590,12 @@ def system_prompt():
         "- 이메일로 보내 달라는 명시적 요청이 있을 때만 send_email을 사용합니다.",
         "  받는 사람을 말하지 않으면 to에 '나'를 넣습니다. 연락처에 있는 사람은 이름으로 넣을 수 있고,",
         "  연락처에 없는 사람의 이메일 주소는 절대 지어내지 않습니다.",
-        "- send_email 결과가 needs_confirmation이면 아직 보내지 않은 것입니다.",
-        "  '보내기 전 확인 카드를 확인하고 보내기 버튼을 눌러 주세요'라고 안내하고 review 내용을 짧게 전합니다.",
-        "  failed면 이유를 알리고 필요한 정보를 묻습니다.",
+        "- 메일을 보내 달라고 하면 메일을 쓰고 send_email까지 반드시 호출합니다. 보낼지 다시 묻지 않습니다.",
+        "- send_email 결과가 success면 '메일을 보냈습니다'라고 받는 사람과 제목을 알려 줍니다.",
+        "- needs_confirmation이면 아직 보내지 않은 것입니다. AI 확인에서 나온 확인할 점(issues)을 짧게 말하고",
+        "  '그래도 보낼까요?'라고 묻습니다. 김 대리가 '보내줘/그래도 보내'라고 하면 confirm_pending_email(send),",
+        "  '보내지 마/취소'라고 하면 confirm_pending_email(cancel)을 사용합니다.",
+        "- failed면 이유를 알리고 필요한 정보를 묻습니다.",
         "- 도구를 사용한 뒤에는 무엇을 했는지 짧게 보고합니다.",
         "- 공손한 한국어 존댓말로 간결하게 답합니다.",
         "",
@@ -1606,7 +1628,7 @@ def system_prompt():
 MAX_TURNS = 10   # 대화마다 기억할 질문+답변 개수
 MAX_CHATS = 10   # 보관할 대화 개수
 VOICES = {"alloy": "기본", "nova": "밝은", "shimmer": "부드러운", "echo": "차분한", "onyx": "낮은"}
-QUICK_ASKS = ["📝 최근 회의 내용 요약해줘", "📅 내일 오후 2시에 고객사 미팅 잡아줘", "📧 오늘 할 일을 내 메일로 보내줘"]
+QUICK_ASKS = ["📝 최근 회의 내용 요약해줘", "📧 오늘 할 일을 내 메일로 보내줘"]
 
 
 def clean_for_tts(text):
@@ -1659,15 +1681,16 @@ def save_turn(chat, turn):
     return chat
 
 
-def prepare_email(args, question):
-    # send_email 도구: 바로 보내지 않고 받는 사람 확인 → AI 점검 → (설정에 따라) 김 대리 확인 후 발송
+def prepare_email(args, question, via="text"):
+    # send_email 도구: 받는 사람 확인 → AI 점검 → 문제가 없으면 발송
+    #   음성 요청은 AI 확인에서 문제가 없으면 바로 발송, 글 요청은 설정에 따라 김 대리 확인 후 발송
     rcpt, err = resolve_recipient(args["to"])
     if err:
         return {"status": "failed", "error": err}, None, {"ok": False, "text": f"📧 메일 준비 실패 ({err})"}
     ctx = f"[김 대리 요청]\n{question}\n\n[참고 자료]\n{brief_context()}"
     rv = review_email(rcpt, args["subject"], args["body"], ctx)
     who = f"{rcpt['name']} <{rcpt['email']}>" if rcpt["name"] else rcpt["email"]
-    if not data["settings"].get("confirm_before_send", True) and rv["ok"]:
+    if rv["ok"] and (via == "voice" or not data["settings"].get("confirm_before_send", True)):
         sr = send_email(rcpt["email"], args["subject"], args["body"])
         if sr["status"] == "success":
             return ({"status": "success", "to": rcpt["email"], "review": rv["summary"]}, None,
@@ -1677,11 +1700,40 @@ def prepare_email(args, question):
             "review": rv, "context": ctx, "status": "pending"}
     result = {"status": "needs_confirmation", "to": rcpt["email"], "name": rcpt["name"], "review": rv["summary"],
               "issues": [c["comment"] for c in rv["checks"] if not c["ok"]],
-              "message": "아직 보내지 않았습니다. 화면의 '보내기 전 확인' 카드에서 김 대리가 보내기를 눌러야 발송됩니다."}
+              "message": ("아직 보내지 않았습니다. 김 대리가 '보내줘'라고 하면 confirm_pending_email(send)로 보내고, "
+                          "'보내지 마'라고 하면 cancel 합니다. 화면의 '보내기 전 확인' 카드에서 버튼으로 보낼 수도 있습니다.")}
     return result, mail, {"ok": True, "warn": True, "text": f"📧 보내기 전 확인 대기 → {who} · '{args['subject']}'"}
 
 
-def ask_assistant(chat, question, file_name="", file_text=""):
+def confirm_pending_mail(chat, action, current=None):
+    # 말로 "보내줘" / "보내지 마" → 보내기를 기다리는 메일을 발송하거나 취소
+    target, turn = None, None
+    if current and current["status"] == "pending":
+        target = current
+    else:
+        for t in reversed(chat["turns"] if chat else []):
+            if t.get("mail") and t["mail"]["status"] == "pending":
+                target, turn = t["mail"], t
+                break
+    if target is None:
+        return {"status": "failed", "error": "보내기를 기다리는 메일이 없습니다."}, {"ok": False, "text": "메일 발송 실패 (보낼 메일 없음)"}
+    who = f"{target['name']} <{target['to']}>" if target["name"] else target["to"]
+    if action == "cancel":
+        target["status"] = "canceled"
+        save_data()
+        return {"status": "success", "canceled": True}, {"ok": True, "warn": True, "text": "📧 메일 발송을 취소했어요."}
+    sr = send_email(target["to"], target["subject"], target["body"])
+    if sr["status"] != "success":
+        return sr, {"ok": False, "text": f"📧 메일 발송 실패 ({sr['error']})"}
+    target["status"] = "sent"
+    if turn is not None:
+        turn["actions"].append({"ok": True, "text": f"📧 메일 발송 완료 → {who} · '{target['subject']}'"})
+    save_data()
+    return ({"status": "success", "to": target["to"], "subject": target["subject"]},
+            {"ok": True, "text": f"📧 메일 발송 완료 → {who} · '{target['subject']}'"})
+
+
+def ask_assistant(chat, question, file_name="", file_text="", via="text"):
     # 이 대화의 최근 질문·답변(멀티턴) + 첨부 파일 + 업무 데이터로 LLM 호출, 필요하면 도구 실행
     instructions = system_prompt() + "\n" + "\n".join([
         "",
@@ -1710,8 +1762,10 @@ def ask_assistant(chat, question, file_name="", file_text=""):
         for c in calls:
             args = json.loads(c.arguments)
             if c.name == "send_email":
-                result, new_mail, act = prepare_email(args, question)
+                result, new_mail, act = prepare_email(args, question, via)
                 mail = new_mail or mail
+            elif c.name == "confirm_pending_email":
+                result, act = confirm_pending_mail(chat, args["action"], mail)
             else:
                 result = run_tool(c.name, args)
                 act = action_of(c.name, args, result)
@@ -1847,7 +1901,8 @@ with tab_chat:
                     if voice_bytes and not quick:
                         stt = speech_to_text(voice_bytes)                            # 음성 → 텍스트 (STT)
                         question = (stt + " " + question).strip()
-                    answer, actions, mail = ask_assistant(chat, question, file_name, file_text)   # LLM 호출
+                    answer, actions, mail = ask_assistant(chat, question, file_name, file_text,
+                                                          "voice" if stt else "text")   # LLM 호출
                     reply_audio = text_to_speech(clean_for_tts(answer), voice) if tts_on and answer else None
                 turn = {"id": uuid.uuid4().hex[:8], "q": question, "stt": stt, "via": "voice" if stt else "text",
                         "file": file_name, "a": answer, "actions": actions, "mail": mail, "time": now_kst()[11:]}
@@ -2137,10 +2192,23 @@ MAIL_SCHEMA = {
                     "category": {"type": "string", "enum": MAIL_CATEGORIES},
                     "summary": {"type": "string", "description": "메일 핵심 1~2문장"},
                     "kim_tasks": {"type": "array", "items": TASK_ITEM},
+                    "events": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "when_text": {"type": "string", "description": "날짜·시간 표현 원문 그대로"},
+                            "date_type": {"type": "string", "enum": ["exact", "approximate", "none"]},
+                            "date": {"type": "string", "description": "exact일 때만 YYYY-MM-DD"},
+                            "start": {"type": "string", "description": "시간이 나오면 HH:MM, 없으면 빈 문자열"},
+                            "category": {"type": "string", "enum": EVENT_CATS},
+                            "evidence": {"type": "string", "description": "메일에서 그대로 복사한 근거 문장"},
+                        },
+                        "required": ["title", "when_text", "date_type", "date", "start", "category", "evidence"],
+                        "additionalProperties": False}},
                     "needs_reply": {"type": "boolean"},
                     "reply_draft": {"type": "string"},
                 },
-                "required": ["index", "category", "summary", "kim_tasks", "needs_reply", "reply_draft"],
+                "required": ["index", "category", "summary", "kim_tasks", "events", "needs_reply", "reply_draft"],
                 "additionalProperties": False,
             },
         }
@@ -2174,9 +2242,12 @@ def analyze_mails(mails):
     instructions = "\n".join([
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 받은 메일을 분석합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일). 여기서 '원문'은 각 메일의 제목과 본문입니다.",
-        "메일마다 index(입력 번호 그대로), category, summary(1~2문장), kim_tasks, needs_reply, reply_draft를 씁니다.",
+        "메일마다 index(입력 번호 그대로), category, summary(1~2문장), kim_tasks, events, needs_reply, reply_draft를 씁니다.",
         *TASK_RULES,
         "- 메일을 받은 김 대리에게 요청된 일이 kim_tasks입니다. 광고·자동 알림·단순 공유면 빈 배열.",
+        "- events: 김 대리가 참석·진행해야 하는 회의·미팅·행사 일정만 넣습니다(마감 기한은 kim_tasks).",
+        "  date_type/date는 기한 규칙과 같고, 시간이 메일에 있으면 start(HH:MM), 없으면 빈 문자열.",
+        "  category는 내용에 맞게(내부 체크인/일반 회의/온라인 회의/고객사 미팅/업무/개인/기타). 근거 문장 evidence 필수.",
         "- needs_reply: 사람이 보낸 메일이고 회신이 필요하면 true, 광고·자동 알림이면 false.",
         "- reply_draft: needs_reply가 true일 때만 김 대리 입장의 공손한 답장. 메일에 없는 날짜·숫자·약속은 만들지 않고,",
         "  끝에 '김 대리 드림'. false면 빈 문자열.",
@@ -2226,6 +2297,180 @@ def draft_mail(points, situation):
         text={"format": {"type": "json_schema", "name": "mail_draft", "schema": DRAFT_SCHEMA, "strict": True}},
     )
     return json.loads(resp.output_text)
+
+
+def build_proposal(a, m):
+    # 메일에서 찾은 김 대리 할 일·일정을 '제안'으로만 만든다 (사용자가 고르기 전에는 추가하지 않음)
+    src = m["subject"] + " " + m["body"]
+    items = []
+    for t in a["kim_tasks"]:
+        exact = t["due_type"] == "exact" and parse_date(t["due_date"])
+        detail = clean_text(t["detail"])
+        if t["requester"]:
+            detail += f" / 요청: {t['requester']}"
+        if t["due_text"] and not exact:
+            detail += f" / 기한(대략): {t['due_text']}"
+        items.append({"id": uuid.uuid4().hex[:8], "kind": "todo", "title": clean_text(t["title"]),
+                      "detail": detail.strip(" /"), "due": t["due_date"] if exact else "", "due_text": t["due_text"],
+                      "priority": t["priority"], "evidence": t["evidence"],
+                      "verified": found_in(t["evidence"], src), "added": ""})
+    for e in a["events"]:
+        exact = e["date_type"] == "exact" and parse_date(e["date"])
+        items.append({"id": uuid.uuid4().hex[:8], "kind": "event", "title": clean_text(e["title"]),
+                      "date": e["date"] if exact else "", "start": e["start"] if parse_time(e["start"]) is not None else "",
+                      "category": e["category"], "when_text": e["when_text"], "evidence": e["evidence"],
+                      "verified": found_in(e["evidence"], src), "added": ""})
+    ask = any(i["verified"] for i in items)
+    return {"items": items, "decision": "pending" if ask else "none"}
+
+
+def proposal_label(it):
+    if it["kind"] == "todo":
+        due = (f"마감 {fmt_date(parse_date(it['due']))}" if it["due"]
+               else (f"기한 '{it['due_text']}'(대략) — 마감일 없이 할 일 목록에 추가" if it["due_text"]
+                     else "기한 없음 — 할 일 목록에 추가"))
+        return f"[할 일] {it['title']} · {due}"
+    if not it["date"]:
+        return f"[일정·{it['category']}] {it['title']} · '{it['when_text'] or '날짜 미정'}' — 날짜가 정해지지 않아 캘린더에 넣을 수 없어요"
+    return (f"[일정·{it['category']}] {it['title']} · {fmt_date(parse_date(it['date']))} "
+            f"{it['start'] or '시간 미정(종일)'}")
+
+
+def can_add(it):
+    return it["verified"] and (it["kind"] == "todo" or bool(it["date"]))
+
+
+def add_proposal_item(m, it):
+    src = f"메일({m['from']})"
+    if it["kind"] == "todo":
+        t = add_todo(it["title"], it["due"], it["priority"], it["detail"], src)
+        it["added"] = "todo"
+        return "todo", t
+    r = add_event(it["title"], it["date"], f"메일: {m['subject']}", src, it["start"], "", it["category"])
+    it["added"] = {"success": "event", "needs_approval": "approval"}.get(r["status"], "failed")
+    return it["added"], r
+
+
+def apply_mail_proposal(m, selected):
+    n_todo = n_ev = n_wait = 0
+    for it in m["proposal"]["items"]:
+        if it["id"] not in selected or it["added"] or not can_add(it):
+            continue
+        if it["kind"] == "event" and st.session_state.get("pending_event"):
+            it["added"] = "deferred"                 # 다른 일정이 승인 대기 중이면 나중에 추가
+            n_wait += 1
+            continue
+        kind, _ = add_proposal_item(m, it)
+        n_todo += kind == "todo"
+        n_ev += kind == "event"
+        n_wait += kind == "approval"
+    m["proposal"]["decision"] = "added"
+    save_data()
+    msg = f"할 일 {n_todo}건, 일정 {n_ev}건을 추가했어요."
+    if n_wait:
+        msg += f" 충돌 확인이 필요한 일정 {n_wait}건은 화면 위 카드에서 시간을 골라 주세요."
+    if not st.session_state.get("pending_event"):
+        st.session_state.pending_toast = msg
+    return msg
+
+
+def added_line(it):
+    return {"todo": "할 일 목록에 추가됨" + (" (캘린더에 마감 표시)" if it.get("due") else ""),
+            "event": "캘린더에 추가됨",
+            "approval": "기존 일정과 겹쳐 화면 위 카드에서 시간 선택이 필요했어요",
+            "deferred": "다른 일정 승인 대기 중이라 아직 추가하지 않았어요",
+            "failed": "추가하지 못했어요"}.get(it["added"], "추가하지 않음")
+
+
+def render_proposal(m, k):
+    p = m["proposal"]
+    vis = [i for i in p["items"] if i["verified"]]
+    hidden = len(p["items"]) - len(vis)
+    if p["decision"] == "pending" and vis:
+        with st.container(border=True):
+            st.markdown(f"**📅 이 메일에서 김 대리님의 일정·할 일 {len(vis)}건을 찾았어요. 캘린더에 추가할까요?**")
+            for it in vis:
+                st.checkbox(proposal_label(it), value=can_add(it), key=f"mp_{it['id']}", disabled=not can_add(it))
+                st.caption(f"근거: “{it['evidence']}”")
+            a, b, _ = st.columns([1.3, 1.3, 2])
+            if a.button("네, 추가할게요", key=f"mp_yes_{k}", type="primary", use_container_width=True):
+                apply_mail_proposal(m, [it["id"] for it in vis if st.session_state.get(f"mp_{it['id']}")])
+                st.rerun()
+            if b.button("아니요, 추가 안 함", key=f"mp_no_{k}", use_container_width=True):
+                p["decision"] = "declined"
+                save_data()
+                st.session_state.pending_toast = "캘린더에 추가하지 않았어요. 메일 요약에서만 볼 수 있어요."
+                st.rerun()
+    elif p["decision"] == "added":
+        for it in vis:
+            st.markdown(f"- {proposal_label(it).split(' — ')[0]} → **{added_line(it)}**")
+            if it["added"] == "deferred" and st.button("지금 추가", key=f"mp_retry_{it['id']}"):
+                add_proposal_item(m, it)
+                save_data()
+                st.rerun()
+    elif p["decision"] == "declined":
+        st.caption("캘린더에 추가하지 않은 항목 (이 메일 요약에서만 표시)")
+        for it in vis:
+            st.markdown(f"- {proposal_label(it).split(' — ')[0]}")
+        if st.button("다시 물어보기", key=f"mp_again_{k}"):
+            p["decision"] = "pending"
+            save_data()
+            st.rerun()
+    if hidden:
+        st.caption(f"원문에서 근거를 찾지 못한 항목 {hidden}건은 제안하지 않았어요.")
+
+
+def mail_key(m):
+    return hashlib.md5(m["msg_id"].encode("utf-8")).hexdigest()[:10]
+
+
+def run_mail_analysis(n=5, include_done=False):
+    # 최근 받은 메일을 요약·분석해 '캘린더 추가 제안'을 만든다 (자동으로 추가하지 않음)
+    fetch_mails.clear()
+    got = fetch_mails(n)
+    if "error" in got:
+        raise RuntimeError(f"메일을 불러오지 못했습니다: {got['error']}")
+    me = (os.getenv("GMAIL_ADDRESS") or "").lower()
+    processed = data["processed_mails"]
+    targets = [m for m in got["mails"] if m["addr"].lower() != me and (include_done or m["msg_id"] not in processed)]
+    if not targets:
+        data["mail_analysis"]["when"] = now_kst()
+        save_data()
+        return 0, 0
+    results = []
+    for a in analyze_mails(targets):
+        if 0 <= a["index"] < len(targets):
+            m = targets[a["index"]]
+            results.append({**m, "category": a["category"], "summary": a["summary"], "needs_reply": a["needs_reply"],
+                            "reply_draft": a["reply_draft"], "proposal": build_proposal(a, m), "replied": False})
+    for m in targets:
+        if m["msg_id"] not in processed:
+            processed.append(m["msg_id"])
+    del processed[:-500]
+    ids = {r["msg_id"] for r in results}
+    ma = data["mail_analysis"]
+    ma["mails"] = results + [x for x in ma["mails"] if x["msg_id"] not in ids]
+    del ma["mails"][20:]
+    ma["when"] = now_kst()
+    save_data()
+    return len(results), sum(1 for r in results for i in r["proposal"]["items"] if i["verified"])
+
+
+def _save_mail_auto():
+    data["settings"]["mail_auto"] = st.session_state.set_mail_auto
+    save_data()
+
+
+# 앱을 열 때(세션당 한 번) 새 메일이 있으면 자동으로 요약·분석하고 캘린더 추가 여부를 물어봄
+if (gmail_ready() and os.getenv("OPENAI_API_KEY") and data["settings"].get("mail_auto", True)
+        and not st.session_state.get("mail_auto_checked")):
+    st.session_state.mail_auto_checked = True
+    try:
+        _n_m, _n_items = run_mail_analysis(5)
+        if _n_items:
+            st.toast(f"새 메일에서 일정·할 일 {_n_items}건을 찾았어요. 메일 비서 탭에서 캘린더에 추가할지 골라 주세요.", icon="📥")
+    except Exception:
+        pass
 
 
 def fill_mail(kind):
@@ -2284,7 +2529,8 @@ with tab_mail:
                 st.error("이메일 주소 형식을 확인해 주세요.")
         st.toggle("💬 에이블 비서가 메일을 보낼 때, AI 확인 후 내가 한 번 더 보고 보내기",
                   value=data["settings"].get("confirm_before_send", True), key="set_confirm", on_change=_save_confirm)
-        st.caption("끄면 AI 확인에서 문제가 없을 때만 바로 발송하고, 확인할 점이 있으면 확인 카드를 띄웁니다.")
+        st.caption("음성으로 요청한 메일은 AI 확인에서 문제가 없으면 바로 보내요. 이 설정은 글로 요청할 때 적용됩니다. "
+                   "끄면 글로 요청해도 문제가 없을 때 바로 발송해요. 확인할 점이 있으면 \"보내줘\"라고 말해도 보낼 수 있어요.")
 
     if not gmail_ready():
         st.warning("api_key.txt에 GMAIL_ADDRESS, GMAIL_APP_PASSWORD가 있어야 메일을 보내고 받을 수 있습니다.")
@@ -2339,38 +2585,20 @@ with tab_mail:
 
     # --- 받은 메일 요약 ---
     with sub_inbox:
-        processed = data["processed_mails"]
-        o1, o2 = st.columns([2, 3])
-        n_mail = o1.select_slider("요약할 최근 메일 수", options=[5, 10, 15, 20], value=10)
+        res = data["mail_analysis"]
+        st.caption("최근 받은 메일을 에이블이 요약하고, 김 대리가 할 일이나 참석할 일정이 있으면 캘린더에 추가할지 물어봐요. "
+                   "추가하지 않으면 이 화면에서만 볼 수 있어요.")
+        o1, o2, o3 = st.columns(3)
+        n_mail = o1.select_slider("분석할 최근 메일 수", options=[5, 10, 15, 20], value=5)
         include_done = o2.checkbox("이미 분석한 메일도 다시 분석", value=False)
-
-        if st.button("🤖 받은 메일 요약하기", type="primary", disabled=not gmail_ready()):
-            fetch_mails.clear()
+        o3.toggle("앱을 열 때 새 메일 자동 분석", value=data["settings"].get("mail_auto", True), key="set_mail_auto",
+                  on_change=_save_mail_auto)
+        if st.button("받은 메일 요약·분석하기", type="primary", disabled=not gmail_ready()):
             done, msg = False, ""
             try:
-                with st.spinner("메일을 불러와 분석하는 중..."):
-                    got = fetch_mails(n_mail)
-                    if "error" in got:
-                        raise RuntimeError(f"메일을 불러오지 못했습니다: {got['error']}")
-                    me = (os.getenv("GMAIL_ADDRESS") or "").lower()
-                    targets = [m for m in got["mails"]
-                               if m["addr"].lower() != me and (include_done or m["msg_id"] not in processed)]
-                    results = []
-                    if targets:
-                        for a in analyze_mails(targets):
-                            if 0 <= a["index"] < len(targets):
-                                m = targets[a["index"]]
-                                tasks = apply_kim_tasks(a["kim_tasks"], m["subject"] + " " + m["body"],
-                                                        f"메일({m['from']})")
-                                results.append({**m, **a, "kim_tasks": tasks})
-                        for m in targets:
-                            if m["msg_id"] not in processed:
-                                processed.append(m["msg_id"])
-                        del processed[:-500]
-                        save_data()
-                st.session_state.mail_result = {"mails": results, "sent": []}
-                n_add = sum(t["status"] in ("calendar", "approximate", "nodue") for r in results for t in r["kim_tasks"])
-                msg = f"메일 {len(results)}통 요약 · 할 일 {n_add}건 추가" if targets else "새로 분석할 메일이 없습니다."
+                with st.spinner("메일을 불러와 요약·분석하는 중..."):
+                    n_m, n_items = run_mail_analysis(n_mail, include_done)
+                msg = (f"메일 {n_m}통 요약 · 캘린더 추가 제안 {n_items}건" if n_m else "새로 분석할 메일이 없습니다.")
                 done = True
             except Exception as e:
                 st.error(str(e))
@@ -2378,42 +2606,51 @@ with tab_mail:
                 st.session_state.pending_toast = msg
                 st.rerun()
 
-        res = st.session_state.get("mail_result")
-        if res and res["mails"]:
-            known = {c["email"].lower() for c in data["contacts"]}
-            work = [m for m in res["mails"] if m["category"] != "광고/알림"]
-            ads = [m for m in res["mails"] if m["category"] == "광고/알림"]
-            for i, m in enumerate(work):
-                with st.container(border=True):
-                    a, b = st.columns([5, 1.4])
-                    a.markdown(f"{CATEGORY_ICON[m['category']]} **{m['subject']}**  \n"
-                               f":gray[{m['from']} · {m['date']} · {m['category']}]")
-                    if m["addr"].lower() not in known:
-                        b.button("📇 연락처에 추가", key=f"addc_{i}", on_click=_add_sender, args=(m["from"], m["addr"]),
-                                 use_container_width=True)
-                    st.write(m["summary"])
-                    for t in m["kim_tasks"]:
-                        st.markdown(f"- **{t['title']}** — {task_status_line(t)}")
-                    if m["needs_reply"]:
-                        if m["msg_id"] in res["sent"]:
-                            st.success("답장을 보냈습니다.")
-                        else:
-                            with st.expander(f"✉️ {m['from']}님께 보낼 답장 초안 보기·수정"):
-                                draft = st.text_area("답장", value=m["reply_draft"], height=200,
-                                                     key=f"reply_{i}", label_visibility="collapsed")
-                                subj = m["subject"] if m["subject"].lower().startswith("re:") else "Re: " + m["subject"]
-                                sent = confirm_and_send(
-                                    f"reply_{i}", m["addr"], subj, draft,
-                                    f"[받은 메일]\n보낸 사람: {m['from']}\n제목: {m['subject']}\n본문: {m['body']}",
-                                    m["msg_id"])
-                                if sent == "sent":
-                                    res["sent"].append(m["msg_id"])
-                                    st.session_state.pending_toast = f"{m['from']}님께 답장을 보냈어요."
-                                    st.rerun()
-            if ads:
-                with st.expander(f"📢 광고/알림 메일 {len(ads)}통"):
-                    for m in ads:
-                        st.markdown(f"- **{m['subject']}** · {m['from']} — {m['summary']}")
+        mails = res["mails"]
+        if res["when"]:
+            st.caption(f"마지막 분석: {res['when']}")
+        n_ask = sum(1 for m in mails if m["proposal"]["decision"] == "pending")
+        if n_ask:
+            st.info(f"메일 {n_ask}통에서 김 대리님의 일정·할 일을 찾았어요. 아래에서 캘린더에 추가할지 골라 주세요.")
+        if not mails and res["when"]:
+            st.caption("분석한 메일이 없습니다.")
+
+        known = {c["email"].lower() for c in data["contacts"]}
+        work = [m for m in mails if m["category"] != "광고/알림"]
+        ads = [m for m in mails if m["category"] == "광고/알림"]
+        work.sort(key=lambda m: m["proposal"]["decision"] != "pending")     # 물어볼 메일을 위로
+        for m in work:
+            k = mail_key(m)
+            with st.container(border=True):
+                a, b = st.columns([5, 1.4])
+                a.markdown(f"{CATEGORY_ICON[m['category']]} **{m['subject']}**  \n"
+                           f":gray[{m['from']} · {m['date']} · {m['category']}]")
+                if m["addr"].lower() not in known:
+                    b.button("📇 연락처에 추가", key=f"addc_{k}", on_click=_add_sender, args=(m["from"], m["addr"]),
+                             use_container_width=True)
+                st.write(m["summary"])
+                render_proposal(m, k)
+                if m["needs_reply"]:
+                    if m.get("replied"):
+                        st.success("답장을 보냈습니다.")
+                    else:
+                        with st.expander(f"✉️ {m['from']}님께 보낼 답장 초안 보기·수정"):
+                            draft = st.text_area("답장", value=m["reply_draft"], height=200,
+                                                 key=f"reply_{k}", label_visibility="collapsed")
+                            subj = m["subject"] if m["subject"].lower().startswith("re:") else "Re: " + m["subject"]
+                            sent = confirm_and_send(
+                                f"reply_{k}", m["addr"], subj, draft,
+                                f"[받은 메일]\n보낸 사람: {m['from']}\n제목: {m['subject']}\n본문: {m['body']}",
+                                m["msg_id"])
+                            if sent == "sent":
+                                m["replied"] = True
+                                save_data()
+                                st.session_state.pending_toast = f"{m['from']}님께 답장을 보냈어요."
+                                st.rerun()
+        if ads:
+            with st.expander(f"📢 광고/알림 메일 {len(ads)}통"):
+                for m in ads:
+                    st.markdown(f"- **{m['subject']}** · {m['from']} — {m['summary']}")
 
     # --- 연락처 ---
     with sub_contacts:
@@ -2548,7 +2785,10 @@ with st.sidebar:
             st.caption("자세한 내용은 🎙️ 회의 분석 탭에서 볼 수 있어요.")
 
     # 3) 최근 받은 메일 5개 요약
-    with st.expander("📥 최근 받은 메일 5개"):
+    _n_ask = sum(1 for m in data["mail_analysis"]["mails"] if m["proposal"]["decision"] == "pending")
+    with st.expander("📥 최근 받은 메일 5개" + (f" · 캘린더 추가 제안 {_n_ask}" if _n_ask else "")):
+        if _n_ask:
+            st.info(f"메일 {_n_ask}통에서 일정·할 일을 찾았어요. 📥 메일 비서 → 받은 메일 요약에서 추가할지 골라 주세요.")
         if not gmail_ready():
             st.caption("api_key.txt에 GMAIL_ADDRESS, GMAIL_APP_PASSWORD가 있어야 볼 수 있습니다.")
         else:
