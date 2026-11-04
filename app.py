@@ -941,6 +941,8 @@ APP_CSS = [
     "[class*='st-key-act_'] {gap:.3rem;}",
     "[class*='st-key-act_'] button {min-height:28px; padding:2px 6px;}",
     "[class*='st-key-act_'] button p {font-size:.76rem; white-space:nowrap;}",
+    "[class*='st-key-chatdel_'] button {padding:0 !important; min-width:0 !important; min-height:38px;}",
+    "[class*='st-key-chatdel_'] button p {font-size:1rem; line-height:1; margin:0;}",
 ]
 st.markdown("<style>" + " ".join(APP_CSS) + "</style>", unsafe_allow_html=True)
 
@@ -2772,11 +2774,13 @@ with st.sidebar:
         if not chats:
             st.caption("아직 대화가 없습니다. 🤖 에이블 비서 탭에서 대화를 시작해 보세요.")
         for c in chats:
-            a, b = st.columns([5, 1])
+            a, b = st.columns([4, 1], gap="small")
             cur = c["id"] == st.session_state.get("chat_id")
             a.button(("🟢 " if cur else "💬 ") + c["title"], key=f"open_{c['id']}", on_click=open_chat_cb,
                      args=(c["id"],), use_container_width=True, help=f"{c['updated']} · 질문 {len(c['turns'])}개")
-            b.button("🗑️", key=f"delchat_{c['id']}", on_click=delete_chat_cb, args=(c["id"],), help="대화 삭제")
+            with b.container(key=f"chatdel_{c['id']}"):          # 휴지통 아이콘이 잘리지 않게 여백 없이
+                st.button("🗑", key=f"delchat_{c['id']}", on_click=delete_chat_cb, args=(c["id"],),
+                          help="대화 삭제", use_container_width=True)
         st.caption(f"최근 대화 {MAX_CHATS}개까지 보관하고, 대화마다 최근 질문·답변 {MAX_TURNS}개를 기억해요.")
 
     # 1) 앞으로 3일 할 일
