@@ -1,3 +1,5 @@
+from types import NoneType
+
 # AI 개인비서 '에이블' (Streamlit)
 # 실행: streamlit run app.py
 # 같은 폴더에 필요한 파일:
@@ -5,11 +7,10 @@
 #   - meeting.txt : (선택) 회의 분석 탭에서 기본으로 불러올 회의록
 #
 # 화면 구성
-#   메인 탭  : 🤖 에이블 비서 (음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
+#   메인 탭  : 🤖 에이블 비서 (에이블 로고를 눌러 녹음·생각 중·말하는 중 애니메이션, 음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
 #              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
-#   회의 코파일럿: 회의 중 30초~1분 구간 녹음 → 김 대리 업무·일정 충돌·지난 기록 귓속말 → 종료 시 회의록
-#   사이드바 : 🔎 업무 기록 검색(RAG) / 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
+#   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
 #   일정     : 종류별 색상·소요시간 추정(체크인 20/회의 30/온라인 45/고객사 60분), 겹치거나 간격 10분 미만이면
 #              충돌 감지 → 대체 시간 3개 추천 → 승인(대체 시간/원래 시간/취소), 음성·텍스트 요청도 동일하게 검사
 import os
@@ -31,8 +32,10 @@ from email import policy
 from email.mime.text import MIMEText
 from email.utils import parseaddr, parsedate_to_datetime
 
-import numpy as np
+import base64
+import time
 import streamlit as st
+import streamlit.components.v1 as components
 from openai import OpenAI
 
 # ─────────────────────────────────────────────
@@ -102,7 +105,7 @@ def gmail_ready():
 # 데이터 저장/불러오기
 # ─────────────────────────────────────────────
 DATA_DEFAULTS = {"todos": [], "events": [], "meeting_notes": [], "mail_summaries": {},
-                 "processed_mails": [], "settings": {}, "contacts": [], "chats": [], "copilot": {},
+                 "processed_mails": [], "settings": {}, "contacts": [], "chats": [],
                  "mail_analysis": {"when": "", "mails": []}}
 
 
@@ -683,15 +686,320 @@ def shrink_audio(audio_bytes, name):
     return audio_bytes, name
 
 
-def speech_to_text(audio_bytes, name="voice.wav", hint=None):
-    kwargs = {"model": "whisper-1", "file": (name, audio_bytes), "language": "ko"}
-    if hint:
-        kwargs["prompt"] = hint
-    return get_client().audio.transcriptions.create(**kwargs).text
+STT_CHAT_MODELS = ["gpt-4o-transcribe", "whisper-1"]   # 정확도가 높은 모델 먼저, 안 되면 whisper-1로
+
+
+def speech_to_text(audio_bytes, name="voice.wav", hint=None, models=("whisper-1",)):
+    last_err = None
+    for model in models:
+        kwargs = {"model": model, "file": (name, audio_bytes), "language": "ko"}
+        if hint:
+            kwargs["prompt"] = hint
+        try:
+            return get_client().audio.transcriptions.create(**kwargs).text
+        except Exception as e:              # 모델을 쓸 수 없으면 다음 모델로
+            last_err = e
+    raise last_err
+
+
+def stt_hint():
+    # 음성 인식이 이름·고유명사를 잘 받아 적도록, 자주 나올 단어를 힌트로 줌 (연락처·일정 제목·종류)
+    words = ["에이블", "김 대리", "일정", "할 일", "캘린더", "메일", "회의록", "추가해줘", "삭제해줘", "취소해줘",
+             "이번 주", "다음 주", "오전", "오후"]
+    for c in data["contacts"]:
+        words += [c["name"] + c["role"], c["alias"], c["team"]]
+    up = sorted([e for e in data["events"] if (d := parse_date(e["date"])) and d >= today],
+                key=lambda e: e["date"])[:20]
+    words += [e["title"] for e in up] + [t["title"] for t in data["todos"] if not t["done"]][:15]
+    words += EVENT_CATS + list(TODO_CATS)
+    seen, out = set(), []
+    for w in words:
+        w = clean_text(w)
+        if w and w not in seen:
+            seen.add(w)
+            out.append(w)
+    text = ", ".join(out)[:600]               # 힌트가 너무 길면 잘리므로 적당히
+    return f"김 대리가 AI 비서 에이블에게 일정·할 일·메일을 부탁하는 한국어 음성입니다. 자주 나오는 말: {text}"
 
 
 def text_to_speech(text, voice="alloy"):
     return get_client().audio.speech.create(model="gpt-4o-mini-tts", voice=voice, input=text[:4000]).content
+
+
+# ─────────────────────────────────────────────
+# 🎙️ 에이블 로고 녹음기 (Streamlit 커스텀 컴포넌트)
+#   로고 클릭 → 녹음(목소리에 맞춰 파동) → 다시 클릭 → 파이썬으로 전달 → 생각 중 → 답변 음성 재생(말하는 중)
+#   부품 html은 앱이 실행될 때 임시 폴더에 직접 만들어서, GitHub에는 app.py만 올리면 됨
+# ─────────────────────────────────────────────
+ABLE_LOGO_B64 = "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"
+
+ABLE_MIC_HTML = r'''<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  :root { --teal:#0b9ea4; --rec:#ef4f5a; --text:#31333f; --sub:rgba(49,51,63,.6); --btn:#ffffff; --ring:rgba(11,158,164,.25); }
+  html,body { margin:0; padding:0; background:transparent; overflow:hidden;
+              font-family:"Source Sans Pro","Noto Sans KR",sans-serif; color:var(--text); }
+  .wrap { display:flex; align-items:center; gap:14px; padding:4px 2px; }
+  .wrap.big { flex-direction:column; gap:8px; }
+  .stage { position:relative; flex:0 0 auto; }
+  canvas { position:absolute; inset:0; pointer-events:none; }
+  .btn { position:absolute; border-radius:50%; border:2px solid var(--ring); background:var(--btn);
+         cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0;
+         box-shadow:0 6px 22px rgba(11,158,164,.22); transition:transform .15s, box-shadow .3s, border-color .3s; outline:none; }
+  .btn:focus-visible { box-shadow:0 0 0 4px rgba(11,158,164,.45); }
+  .btn:active { transform:scale(.96); }
+  .logo { width:62%; height:62%; background:var(--teal); transition:background .3s;
+          -webkit-mask:url("data:image/png;base64,__LOGO_B64__") center/contain no-repeat;
+                  mask:url("data:image/png;base64,__LOGO_B64__") center/contain no-repeat; }
+  /* 대기: 숨쉬기 */
+  .idle .btn, .blocked .btn { animation:breathe 3.2s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { transform:scale(1); box-shadow:0 6px 22px rgba(11,158,164,.18);} 50% { transform:scale(1.045); box-shadow:0 8px 30px rgba(11,158,164,.38);} }
+  /* 녹음 중 */
+  .recording .btn { border-color:rgba(239,79,90,.55); box-shadow:0 0 0 6px rgba(239,79,90,.12), 0 8px 26px rgba(239,79,90,.25); }
+  /* 생각 중: 도는 링 */
+  .spin { position:absolute; border-radius:50%; opacity:0; transition:opacity .3s; pointer-events:none;
+          background:conic-gradient(from 0deg, transparent 0 55%, var(--teal) 85%, transparent 100%);
+          -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+                  mask:radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+          animation:spin 1s linear infinite; }
+  .thinking .spin { opacity:1; }
+  .thinking .btn { cursor:progress; }
+  .thinking .logo { animation:think 1.6s ease-in-out infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @keyframes think { 0%,100% { opacity:1; } 50% { opacity:.45; } }
+  .info { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .big .info { align-items:center; text-align:center; }
+  .label { font-size:15px; font-weight:600; }
+  .sub { font-size:13px; color:var(--sub); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--rec); margin-right:6px;
+         vertical-align:1px; animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.2; } }
+  .err { color:var(--rec); }
+</style></head>
+<body>
+<div class="wrap idle" id="wrap">
+  <div class="stage" id="stage">
+    <canvas id="cv"></canvas>
+    <div class="spin" id="spin"></div>
+    <button class="btn" id="btn" aria-label="에이블에게 말하기"><div class="logo" id="logo"></div></button>
+  </div>
+  <div class="info"><div class="label" id="label"></div><div class="sub" id="sub"></div></div>
+</div>
+<script>
+// ── Streamlit 컴포넌트 통신 (라이브러리 없이 postMessage로 직접) ──
+function toST(type, data) { window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, data || {}), "*"); }
+function setHeight() { toST("streamlit:setFrameHeight", {height: document.getElementById("wrap").offsetHeight + 8}); }
+function setValue(v) { toST("streamlit:setComponentValue", {value: v, dataType: "json"}); }
+
+const $ = (id) => document.getElementById(id);
+let state = "idle", size = "", sentId = "", lastPlayId = "", thinkTimer = null;
+let recorder = null, chunks = [], stream = null, recStart = 0, timerInt = null;
+let actx = null, analyser = null, player = null, levelBuf = null, fakeLevel = false;
+const bars = new Array(72).fill(0);
+
+const TEXT = {
+  idle:      ["에이블을 눌러 말하기", "누르면 녹음이 시작되고, 다시 누르면 에이블에게 전달돼요"],
+  recording: ["", "다 말했으면 로고를 한 번 더 눌러 주세요"],
+  thinking:  ["에이블이 생각 중이에요…", "잠시만 기다려 주세요"],
+  speaking:  ["에이블이 말하는 중", "로고를 누르면 멈춰요"],
+  blocked:   ["🔊 답변이 준비됐어요", "로고를 누르면 들려 드려요"],
+};
+
+function setState(s, subText) {
+  state = s;
+  $("wrap").className = "wrap " + size + " " + s;
+  const t = TEXT[s] || ["", ""];
+  $("label").innerHTML = s === "recording" ? '<span class="dot"></span>듣고 있어요 · <span id="tm">0:00</span>' : t[0];
+  $("sub").textContent = subText || t[1];
+  $("sub").className = "sub" + (subText && s === "idle" ? " err" : "");
+  if (s !== "thinking" && thinkTimer) { clearTimeout(thinkTimer); thinkTimer = null; }
+  setHeight();
+}
+
+function layout(sz) {
+  size = sz === "big" ? "big" : "compact";
+  const B = size === "big" ? 120 : 76, S = size === "big" ? 210 : 132;
+  const stage = $("stage"), cv = $("cv"), btn = $("btn"), sp = $("spin");
+  stage.style.width = stage.style.height = S + "px";
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = cv.height = S * dpr; cv.style.width = cv.style.height = S + "px";
+  const off = (S - B) / 2;
+  Object.assign(btn.style, {width: B + "px", height: B + "px", left: off + "px", top: off + "px"});
+  const so = off - 7;
+  Object.assign(sp.style, {width: (B + 14) + "px", height: (B + 14) + "px", left: so + "px", top: so + "px"});
+  setState(state);
+}
+
+// ── 파동 그리기: 녹음(마이크 소리) · 말하기(답변 소리)에 맞춰 로고 주변 막대가 출렁임 ──
+function level() {
+  if (fakeLevel) { const t = performance.now() / 1000; return 0.35 + 0.25 * Math.sin(t * 9) * Math.sin(t * 2.3); }
+  if (!analyser) return 0;
+  analyser.getByteFrequencyData(levelBuf);
+  let s = 0; for (let i = 2; i < levelBuf.length * 0.5; i++) s += levelBuf[i];
+  return Math.min(1, s / (levelBuf.length * 0.5) / 110);
+}
+function draw() {
+  const cv = $("cv"), g = cv.getContext("2d"), dpr = window.devicePixelRatio || 1;
+  const S = cv.width / dpr, B = size === "big" ? 120 : 76, r0 = B / 2 + 8, maxL = (S / 2 - r0) - 4;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, S, S);
+  const active = state === "recording" || state === "speaking";
+  const lv = active ? level() : 0;
+  const color = state === "recording" ? "239,79,90" : "11,158,164";
+  const t = performance.now() / 1000;
+  for (let i = 0; i < bars.length; i++) {
+    const wobble = 0.55 + 0.45 * Math.sin(i * 0.9 + t * 6) * Math.cos(i * 0.37 - t * 3);
+    const target = active ? lv * (0.35 + 0.65 * Math.abs(wobble)) : 0;
+    bars[i] += (target - bars[i]) * 0.25;
+    const L = 2 + bars[i] * maxL;
+    if (bars[i] < 0.01 && !active) continue;
+    const a = (i / bars.length) * Math.PI * 2 - Math.PI / 2;
+    g.strokeStyle = "rgba(" + color + "," + (0.35 + bars[i] * 0.65) + ")";
+    g.lineWidth = size === "big" ? 3 : 2.2; g.lineCap = "round";
+    g.beginPath();
+    g.moveTo(S / 2 + Math.cos(a) * r0, S / 2 + Math.sin(a) * r0);
+    g.lineTo(S / 2 + Math.cos(a) * (r0 + L), S / 2 + Math.sin(a) * (r0 + L));
+    g.stroke();
+  }
+  $("logo").style.transform = active ? "scale(" + (1 + lv * 0.14) + ")" : "";
+  requestAnimationFrame(draw);
+}
+
+function ensureCtx() {
+  if (!actx) { const C = window.AudioContext || window.webkitAudioContext; if (C) actx = new C(); }
+  if (actx && actx.state === "suspended") actx.resume().catch(() => {});
+  return actx;
+}
+function useAnalyser(node) {
+  analyser = actx.createAnalyser(); analyser.fftSize = 256; analyser.smoothingTimeConstant = 0.7;
+  levelBuf = new Uint8Array(analyser.frequencyBinCount); node.connect(analyser); return analyser;
+}
+
+// ── 녹음 ──
+async function startRec() {
+  stopPlayer();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true}});
+  } catch (e) {
+    setState("idle", "마이크를 쓸 수 없어요. 브라우저 주소창의 마이크 권한을 허용해 주세요."); return;
+  }
+  const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+  const mime = types.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+  try { recorder = new MediaRecorder(stream, mime ? {mimeType: mime} : undefined); }
+  catch (e) { setState("idle", "이 브라우저는 녹음을 지원하지 않아요. 크롬에서 열어 주세요."); stopStream(); return; }
+  chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = onRecStop;
+  if (ensureCtx()) { fakeLevel = false; useAnalyser(actx.createMediaStreamSource(stream)); } else { fakeLevel = true; }
+  recorder.start(250);
+  recStart = performance.now();
+  setState("recording");
+  timerInt = setInterval(() => {
+    const s = Math.floor((performance.now() - recStart) / 1000), el = $("tm");
+    if (el) el.textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+    if (s >= 120) stopRec();                    // 너무 길면 2분에서 자동 종료
+  }, 250);
+}
+function stopStream() { if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null; }
+function stopRec() {
+  clearInterval(timerInt);
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+}
+function onRecStop() {
+  stopStream(); analyser = null;
+  const dur = performance.now() - recStart;
+  const type = (recorder && recorder.mimeType) || "audio/webm";
+  const blob = new Blob(chunks, {type: type});
+  if (dur < 700 || blob.size < 1500) { setState("idle", "너무 짧아요. 로고를 누르고 말한 뒤 다시 눌러 주세요."); return; }
+  const ext = type.includes("mp4") ? "mp4" : type.includes("ogg") ? "ogg" : "webm";
+  const fr = new FileReader();
+  fr.onload = () => {
+    sentId = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    setValue({id: sentId, b64: String(fr.result).split(",")[1], ext: ext});
+    setState("thinking");
+    thinkTimer = setTimeout(() => { if (state === "thinking") setState("idle"); }, 120000);
+  };
+  fr.readAsDataURL(blob);
+}
+
+// ── 답변 음성 재생 (말하는 중 애니메이션) ──
+function stopPlayer() { if (player) { player.pause(); player = null; } analyser = null; fakeLevel = false; }
+async function speak(b64) {
+  stopPlayer();
+  const a = new Audio("data:audio/mpeg;base64," + b64);
+  player = a;
+  const ctx = ensureCtx();
+  if (ctx) { try { await Promise.race([ctx.resume(), new Promise((r) => setTimeout(r, 300))]); } catch (e) {} }
+  if (ctx && ctx.state === "running") {
+    try { const src = ctx.createMediaElementSource(a); useAnalyser(src); analyser.connect(ctx.destination); fakeLevel = false; }
+    catch (e) { fakeLevel = true; }
+  } else { fakeLevel = true; }               // 소리 분석이 안 되면 부드러운 가짜 파동
+  a.onended = () => { if (player === a) { stopPlayer(); setState("idle"); } };
+  try { await a.play(); setState("speaking"); }
+  catch (e) { player = null; pendingB64 = b64; setState("blocked"); }   // 자동 재생이 막히면 눌러서 듣기
+}
+let pendingB64 = "";
+
+function played(id) { try { return sessionStorage.getItem("able_played_" + id) === "1"; } catch (e) { return false; } }
+function markPlayed(id) { try { sessionStorage.setItem("able_played_" + id, "1"); } catch (e) {} }
+
+$("btn").addEventListener("click", () => {
+  if (state === "idle") startRec();
+  else if (state === "recording") stopRec();
+  else if (state === "speaking") { stopPlayer(); setState("idle"); }
+  else if (state === "blocked") { const b = pendingB64; pendingB64 = ""; speak(b); }
+});
+
+// ── 파이썬에서 받은 값으로 상태 바꾸기 ──
+window.addEventListener("message", (ev) => {
+  const d = ev.data || {};
+  if (d.type !== "streamlit:render") return;
+  const args = d.args || {};
+  const th = d.theme || {};
+  if (th.textColor) document.documentElement.style.setProperty("--text", th.textColor);
+  if (th.base === "dark") {
+    document.documentElement.style.setProperty("--btn", "#1d2531");
+    document.documentElement.style.setProperty("--sub", "rgba(250,250,250,.6)");
+  }
+  if (args.size && (args.size === "big" ? "big" : "compact") !== size) layout(args.size);
+  // 내가 보낸 녹음 처리가 끝났는데 들려줄 답변이 없으면 대기로
+  if (state === "thinking" && sentId && args.done_id === sentId && !(args.play_id && !played(args.play_id))) setState("idle");
+  // 새 답변 음성이 오면 말하기
+  if (args.play_id && args.play_b64 && args.play_id !== lastPlayId && !played(args.play_id) && state !== "recording") {
+    lastPlayId = args.play_id; markPlayed(args.play_id); speak(args.play_b64);
+  }
+});
+
+layout("compact");
+requestAnimationFrame(draw);
+toST("streamlit:componentReady", {apiVersion: 1});
+window.addEventListener("resize", setHeight);
+</script>
+</body></html>
+'''
+
+
+def _declare_able_mic():
+    page = ABLE_MIC_HTML.replace("__LOGO_B64__", ABLE_LOGO_B64)
+    ver = hashlib.md5(page.encode("utf-8")).hexdigest()[:8]           # 내용이 바뀌면 새 폴더 → 브라우저 캐시 문제 없음
+    folder = Path(tempfile.gettempdir()) / f"able_mic_{ver}"
+    folder.mkdir(parents=True, exist_ok=True)
+    f = folder / "index.html"
+    if not f.exists():
+        f.write_text(page, encoding="utf-8")
+    return components.declare_component("able_mic", path=str(folder))
+
+
+_able_mic = _declare_able_mic()
+
+
+def able_mic(size, key):
+    # size: "big"(새 채팅 첫 화면) / "compact"(말로 이어서 요청하기). 녹음하면 {"id","b64","ext"}를 돌려줌
+    play = st.session_state.get("mic_play")
+    if play and time.time() - play["ts"] > 90:     # 오래된 답변 음성은 다시 보내지 않음
+        st.session_state.pop("mic_play", None)
+        play = None
+    return _able_mic(size=size, play_id=play["id"] if play else "", play_b64=play["b64"] if play else "",
+                     done_id=st.session_state.get("voice_done", ""), key=key, default=None)
 
 
 # ─────────────────────────────────────────────
@@ -1013,8 +1321,6 @@ APP_CSS = [
     "[class*='st-key-act_'] button p {font-size:.76rem; white-space:nowrap;}",
     "[class*='st-key-chatdel_'] button {padding:0 !important; min-width:0 !important; min-height:38px;}",
     "[class*='st-key-chatdel_'] button p {font-size:1rem; line-height:1; margin:0;}",
-    ".st-key-rag_box {gap:.45rem;}",
-    ".st-key-rag_box [data-testid='stExpander'] summary p {font-size:.8rem;}",
 ]
 st.markdown("<style>" + " ".join(APP_CSS) + "</style>", unsafe_allow_html=True)
 
@@ -1419,7 +1725,8 @@ def count_overlaps():
 # 자연어로 일정 삭제: 대상을 보여 주고 김 대리가 승인한 뒤에만 삭제
 # ─────────────────────────────────────────────
 DELETE_MAX = 5
-DELETE_STOP = {"일정", "스케줄", "거", "것", "그거", "약속잡은거"}
+DELETE_STOP = {"일정", "스케줄", "거", "것", "그거", "약속잡은거", "할일", "투두", "todo", "업무", "목록"}
+KIND_NAME = {"events": "일정", "todos": "할 일"}
 
 
 def _nospace(s):
@@ -1447,6 +1754,53 @@ def find_delete_candidates(date_iso, keyword):
     return [x[3] for x in scored[:DELETE_MAX]]
 
 
+def todo_due_text(t):
+    d = parse_date(t["due"])
+    return (f"마감 {fmt_date(d)}" if d else "기한 없음") + (" · 완료" if t["done"] else "")
+
+
+def find_todo_delete_candidates(keyword, status):
+    # status: 미완료 / 완료 / 전체. 키워드가 제목·세부 내용·분류에 가장 많이 들어간 할 일만 후보로 (최대 5개)
+    words = [_nospace(w) for w in re.split(r"[\s,]+", keyword or "") if w and _nospace(w) not in DELETE_STOP]
+    pool = [t for t in data["todos"]
+            if status == "전체" or (status == "완료") == bool(t["done"])]
+    if not words and status != "완료":          # 키워드 없이 '전부'는 완료한 할 일 정리일 때만 허용
+        return [], len(pool)
+    scored = []
+    for t in pool:
+        text = _nospace(t["title"] + " " + t.get("detail", ""))      # 분류 이름(예: 조사·분석)은 비교하지 않음
+        score = sum(w in text for w in words)
+        if score or not words:
+            scored.append((-score, PRIORITY_ORDER.get(t["priority"], 1), t["due"] or "9999", t))
+    scored.sort(key=lambda x: x[:3])
+    if scored and words:
+        scored = [x for x in scored if x[0] == scored[0][0]]
+    return [x[3] for x in scored[:DELETE_MAX]], len(scored)
+
+
+def request_delete_todo(keyword, status):
+    # 바로 지우지 않고 삭제할 할 일 후보를 승인 대기(pending_delete)로 저장
+    status = status if status in ("미완료", "완료", "전체") else "미완료"
+    cands, total = find_todo_delete_candidates(keyword, status)
+    if not cands:
+        pool = [t for t in data["todos"] if status == "전체" or (status == "완료") == bool(t["done"])]
+        return {"status": "failed",
+                "error": (f"'{keyword}'에 해당하는 할 일을 찾지 못했습니다." if keyword else
+                          "어떤 할 일을 지울지 알 수 없습니다. 할 일 이름을 알려 달라고 하세요.")
+                         + " 아무것도 삭제하지 않았습니다.",
+                "todos": [f"{t['title']} ({todo_due_text(t)})" for t in pool[:15]]}
+    st.session_state.pending_delete = {"kind": "todos", "ids": [t["id"] for t in cands],
+                                       "query": keyword or f"{status} 할 일"}
+    st.session_state.pending_toast = "⚠️ 삭제할 할 일을 화면 위 카드에서 확인해 주세요. 승인하기 전에는 지우지 않아요."
+    out = {"status": "needs_approval", "kind": "delete_todo",
+           "candidates": [{"no": i + 1, "title": t["title"], "category": t["category"], "when": todo_due_text(t)}
+                          for i, t in enumerate(cands)],
+           "message": "아직 삭제하지 않았습니다. 삭제 대상을 보여 주고 김 대리의 승인(번호/전부/취소)을 기다립니다."}
+    if total > len(cands):
+        out["note"] = f"조건에 맞는 할 일이 {total}건이라 앞의 {len(cands)}건만 보여 줍니다."
+    return out
+
+
 def request_delete(date_iso, keyword):
     # 바로 지우지 않고 삭제 후보를 승인 대기(pending_delete)로 저장
     if date_iso and not parse_date(date_iso):
@@ -1457,7 +1811,7 @@ def request_delete(date_iso, keyword):
         return {"status": "failed",
                 "error": f"'{keyword or date_iso}'에 해당하는 일정을 찾지 못했습니다. 아무것도 삭제하지 않았습니다.",
                 "events_on_date": [f"{e['title']} ({event_time_text(e)})" for e in same_day]}
-    st.session_state.pending_delete = {"ids": [e["id"] for e in cands], "query": keyword or date_iso}
+    st.session_state.pending_delete = {"kind": "events", "ids": [e["id"] for e in cands], "query": keyword or date_iso}
     st.session_state.pending_toast = "⚠️ 삭제할 일정을 화면 위 카드에서 확인해 주세요. 승인하기 전에는 지우지 않아요."
     return {"status": "needs_approval", "kind": "delete",
             "candidates": [{"no": i + 1, "title": e["title"], "category": e["category"],
@@ -1466,33 +1820,46 @@ def request_delete(date_iso, keyword):
             "message": "아직 삭제하지 않았습니다. 삭제 대상을 보여 주고 김 대리의 승인(번호/전부/취소)을 기다립니다."}
 
 
+def pending_delete_kind():
+    p = st.session_state.get("pending_delete")
+    return p.get("kind", "events") if p else "events"
+
+
 def pending_delete_events():
+    # 삭제 승인 대기 중인 항목 (일정 또는 할 일)
     p = st.session_state.get("pending_delete")
     if not p:
         return []
-    by_id = {e["id"]: e for e in data["events"]}
+    by_id = {x["id"]: x for x in data[pending_delete_kind()]}
     return [by_id[i] for i in p["ids"] if i in by_id]
+
+
+def delete_item_text(kind, x):
+    if kind == "todos":
+        return f"{x['title']} ({todo_due_text(x)})"
+    return f"{x['title']} ({fmt_date(parse_date(x['date']))} {event_time_text(x)})"
 
 
 def decide_pending_delete(choice):
     # 김 대리 승인: 번호(1~5) / all(후보 전부) / cancel(삭제하지 않음)
     evs = pending_delete_events()
+    kind = pending_delete_kind()
     if not st.session_state.get("pending_delete"):
-        return {"status": "failed", "error": "삭제 승인을 기다리는 일정이 없습니다."}
+        return {"status": "failed", "error": "삭제 승인을 기다리는 일정·할 일이 없습니다."}
     if choice == "cancel" or not evs:
         st.session_state.pop("pending_delete", None)
-        return {"status": "success", "decision": "취소", "deleted": []}
+        return {"status": "success", "decision": "취소", "deleted": [], "kind": KIND_NAME[kind]}
     if choice == "all":
         targets = evs
     elif choice.isdigit() and 1 <= int(choice) <= len(evs):
         targets = [evs[int(choice) - 1]]
     else:
-        return {"status": "failed", "error": f"{choice}번 일정이 없습니다. 1~{len(evs)}, all, cancel 중에서 골라 주세요."}
+        return {"status": "failed", "error": f"{choice}번 {KIND_NAME[kind]}이 없습니다. 1~{len(evs)}, all, cancel 중에서 골라 주세요."}
     for e in targets:
-        delete_item("events", e["id"])
+        delete_item(kind, e["id"])
     st.session_state.pop("pending_delete", None)
-    return {"status": "success", "decision": "삭제",
-            "deleted": [f"{e['title']} ({fmt_date(parse_date(e['date']))} {event_time_text(e)})" for e in targets]}
+    return {"status": "success", "decision": "삭제", "kind": KIND_NAME[kind],
+            "deleted": [delete_item_text(kind, e) for e in targets]}
 
 
 def _delete_cb(choice):
@@ -1500,9 +1867,9 @@ def _delete_cb(choice):
     if r["status"] != "success":
         st.session_state.pending_toast = f"⚠️ {r['error']}"
     elif r["decision"] == "취소":
-        st.session_state.pending_toast = "일정 삭제를 취소했어요. 일정은 그대로 있어요."
+        st.session_state.pending_toast = f"{r['kind']} 삭제를 취소했어요. 그대로 있어요."
     else:
-        st.session_state.pending_toast = "일정을 삭제했어요: " + ", ".join(r["deleted"])
+        st.session_state.pending_toast = f"{r['kind']}을 삭제했어요: " + ", ".join(r["deleted"])
 
 
 def render_pending_delete():
@@ -1512,12 +1879,14 @@ def render_pending_delete():
     if not evs:                                  # 그 사이 다른 곳에서 지워졌으면 카드 닫기
         st.session_state.pop("pending_delete", None)
         return
+    kind = pending_delete_kind()
+    what = KIND_NAME[kind]
     with st.container(border=True):
-        st.error(f"🗑️ 일정 삭제 확인 — '{st.session_state.pending_delete['query']}'에 해당하는 일정 {len(evs)}건")
-        st.caption("승인하기 전에는 삭제하지 않아요. 지울 일정을 골라 주세요. 에이블 비서에게 '1번 지워줘', '취소'라고 말해도 돼요.")
+        st.error(f"🗑️ {what} 삭제 확인 — '{st.session_state.pending_delete['query']}'에 해당하는 {what} {len(evs)}건")
+        st.caption(f"승인하기 전에는 삭제하지 않아요. 지울 {what}을 골라 주세요. 에이블 비서에게 '1번 지워줘', '취소'라고 말해도 돼요.")
         for i, e in enumerate(evs):
             a, b = st.columns([5, 1.3])
-            a.markdown(f"**{i + 1}.** " + event_html(e), unsafe_allow_html=True)
+            a.markdown(f"**{i + 1}.** " + (todo_html(e) if kind == "todos" else event_html(e)), unsafe_allow_html=True)
             b.button("🗑️ 삭제", key=f"pd_del_{e['id']}", on_click=_delete_cb, args=(str(i + 1),), type="primary",
                      use_container_width=True)
         c1, c2, _ = st.columns([1.4, 1, 3])
@@ -1858,9 +2227,26 @@ TOOLS = [
         "strict": True,
     },
     {
+        "type": "function", "name": "delete_todo",
+        "description": "할 일을 삭제해 달라고 할 때 사용합니다(완료 처리와 다름). 바로 지우지 않고 삭제 대상을 찾아 화면에 보여 준 뒤 "
+                       "status=needs_approval과 candidates를 돌려줍니다. 김 대리가 승인해야 decide_pending_delete로 삭제됩니다.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string",
+                            "description": "할 일을 가리키는 말 그대로(예: '경쟁사 분석', '보고서'). "
+                                           "'완료한 할 일 다 지워줘'처럼 이름 없이 정리할 때만 빈 문자열"},
+                "status": {"type": "string", "enum": ["미완료", "완료", "전체"],
+                           "description": "어떤 할 일에서 찾을지. 보통 미완료, '완료한 할 일 지워줘'면 완료, 모르면 전체"},
+            },
+            "required": ["keyword", "status"], "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
         "type": "function", "name": "decide_pending_delete",
-        "description": "삭제 승인 대기 중인 일정을 김 대리의 대답대로 처리합니다. 김 대리가 승인한 뒤에만 사용합니다. "
-                       "번호(1~5): 그 일정 삭제, all: 후보 전부 삭제, cancel: 삭제하지 않음.",
+        "description": "삭제 승인 대기 중인 일정·할 일을 김 대리의 대답대로 처리합니다. 김 대리가 승인한 뒤에만 사용합니다. "
+                       "번호(1~5): 그 항목 삭제, all: 후보 전부 삭제, cancel: 삭제하지 않음.",
         "parameters": {
             "type": "object",
             "properties": {"choice": {"type": "string", "enum": ["1", "2", "3", "4", "5", "all", "cancel"]}},
@@ -1883,312 +2269,7 @@ TOOLS = [
 TOOL_LABEL = {"send_email": "메일", "add_todo": "할 일 추가", "add_event": "일정 추가",
               "move_event": "일정 변경", "complete_todo": "완료 처리", "decide_pending_event": "일정 승인",
               "confirm_pending_email": "메일 발송", "get_recent_mails": "받은 메일",
-              "delete_event": "일정 삭제", "decide_pending_delete": "삭제 승인"}
-
-
-# ─────────────────────────────────────────────
-# 업무 기록 전체 검색 (RAG)
-#   회의록·분석한 메일·대화 기록·할 일·일정을 조각(chunk)으로 나눠 임베딩해 두고,
-#   질문과 의미가 가까운 조각을 찾아 그 내용만 근거로 답합니다 (답변마다 출처 번호 표시).
-#   · 색인 파일: able_index.json(조각 정보) + able_index.npy(벡터)  → 앱을 다시 켜도 유지
-#   · 내용이 바뀐 조각만 다시 임베딩 (변하지 않은 조각은 저장된 벡터 재사용 → 비용 절약)
-# ─────────────────────────────────────────────
-EMBED_MODEL = "text-embedding-3-small"
-INDEX_META = BASE / "able_index.json"
-INDEX_VEC = BASE / "able_index.npy"
-CHUNK_SIZE = 700         # 조각 하나의 글자 수
-CHUNK_OVERLAP = 120      # 조각끼리 겹치는 글자 수 (문장이 잘려도 앞뒤 맥락 유지)
-RAG_TOP_K = 6            # 답변 근거로 쓸 조각 수
-RAG_MIN_SCORE = 0.25     # 이보다 낮으면 '관련 기록 없음'
-RAG_KINDS = {"meeting": "📝 회의", "mail": "📥 메일", "chat": "💬 대화", "todo": "✅ 할 일", "event": "📅 일정"}
-RAG_SCOPES = {"전체": None, "회의": ["meeting"], "메일": ["mail"], "대화": ["chat"], "할 일·일정": ["todo", "event"]}
-
-
-def split_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    # 문단·문장 경계를 최대한 살려서 size 글자 안팎으로 자름
-    text = re.sub(r"[ \t]+", " ", (text or "")).strip()
-    if len(text) <= size:
-        return [text] if text else []
-    out, start = [], 0
-    while start < len(text):
-        end = min(start + size, len(text))
-        if end < len(text):
-            cut = max(text.rfind("\n", start + size // 2, end), text.rfind(". ", start + size // 2, end),
-                      text.rfind("다.", start + size // 2, end), text.rfind("요.", start + size // 2, end))
-            if cut > start:
-                end = cut + 1
-        out.append(text[start:end].strip())
-        if end >= len(text):
-            break
-        start = max(end - overlap, start + 1)
-    return [c for c in out if c]
-
-
-def collect_records():
-    # 검색 대상이 되는 업무 기록 → 조각 목록 [{key, kind, src_id, title, when, text}]
-    recs = []
-
-    def add(kind, src_id, title, when, body, head=""):
-        for i, part in enumerate(split_text(body)):
-            text = (head + "\n" + part).strip() if head else part
-            recs.append({"kind": kind, "src_id": src_id, "title": title, "when": when, "part": i, "text": text})
-
-    for n in data["meeting_notes"]:
-        head = f"[회의] {n['title']} ({n['when']})" + (f" 참석: {n['attendees']}" if n["attendees"] else "")
-        brief = "\n".join(
-            ["요약:"] + [f"- {s}" for s in n["summary"]]
-            + (["결정 사항:"] + [f"- {s}" for s in n["decisions"]] if n["decisions"] else [])
-            + (["김 대리 업무:"] + [f"- {t['title']} (기한: {t['due_text'] or '언급 없음'})" for t in n["kim_tasks"]]
-               if n["kim_tasks"] else []))
-        if n["summary"] or n["decisions"] or n["kim_tasks"]:
-            add("meeting", n["id"], n["title"], n["when"], brief, head)
-        elif n.get("minutes"):
-            add("meeting", n["id"], n["title"], n["when"], n["minutes"], head)
-        add("meeting", n["id"], n["title"], n["when"], n.get("text", ""), head + " · 원문")
-
-    for m in data["mail_analysis"]["mails"]:
-        head = f"[메일] {m.get('subject', '')} · 보낸 사람: {m.get('from', '')} ({m.get('date', '')})"
-        body = (f"요약: {m['summary']}\n" if m.get("summary") else "") + (m.get("body") or "")[:4000]
-        add("mail", m.get("msg_id", ""), m.get("subject", "(제목 없음)"), m.get("date", ""), body, head)
-
-    for c in data["chats"]:
-        for i, t in enumerate(c.get("turns", [])):
-            add("chat", f"{c['id']}#{i}", c.get("title", "대화"), t.get("time", c.get("updated", "")),
-                f"김 대리: {t.get('q', '')}\n에이블: {t.get('a', '')}", f"[대화] {c.get('title', '')}")
-
-    for t in data["todos"]:
-        body = (f"할 일: {t['title']} / 마감: {t['due'] or '없음'} / 우선순위: {t['priority']} / "
-                f"분류: {t.get('category', '')} / {'완료' if t['done'] else '미완료'} / 출처: {t.get('source', '')}"
-                + (f"\n세부: {t['detail']}" if t.get("detail") else ""))
-        add("todo", t["id"], t["title"], t["due"] or t.get("created", ""), body)
-
-    for e in data["events"]:
-        body = (f"일정: {e['title']} / {e['date']} {event_time_text(e)} / 종류: {e['category']}"
-                + (f"\n메모: {e['note']}" if e.get("note") else ""))
-        add("event", e["id"], e["title"], e["date"], body)
-
-    for r in recs:
-        r["key"] = hashlib.sha1(f"{r['kind']}|{r['src_id']}|{r['text']}".encode("utf-8")).hexdigest()
-    return recs
-
-
-def load_index():
-    if "rag_index" in st.session_state:
-        return st.session_state.rag_index
-    idx = {"meta": [], "vecs": np.zeros((0, 0), dtype=np.float32), "when": ""}
-    try:
-        if INDEX_META.exists() and INDEX_VEC.exists():
-            saved = json.loads(INDEX_META.read_text(encoding="utf-8"))
-            vecs = np.load(INDEX_VEC)
-            if len(saved.get("meta", [])) == len(vecs) and saved.get("model") == EMBED_MODEL:
-                idx = {"meta": saved["meta"], "vecs": vecs.astype(np.float32), "when": saved.get("when", "")}
-    except Exception:
-        pass                               # 색인 파일이 깨졌으면 새로 만듦
-    st.session_state.rag_index = idx
-    return idx
-
-
-def save_index(idx):
-    INDEX_META.write_text(json.dumps({"model": EMBED_MODEL, "when": idx["when"], "meta": idx["meta"]},
-                                     ensure_ascii=False), encoding="utf-8")
-    np.save(INDEX_VEC, idx["vecs"])
-    st.session_state.rag_index = idx
-
-
-def embed_texts(texts):
-    client = get_client()
-    out = []
-    for i in range(0, len(texts), 96):     # 한 번에 너무 많이 보내지 않게 나눠서
-        resp = client.embeddings.create(model=EMBED_MODEL, input=[t[:6000] for t in texts[i:i + 96]])
-        out += [d.embedding for d in resp.data]
-    v = np.array(out, dtype=np.float32)
-    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-8)   # 코사인 유사도용 정규화
-
-
-def refresh_index(force=False):
-    # 업무 기록이 바뀐 부분만 다시 임베딩 → {"total", "added", "removed"}
-    idx = load_index()
-    recs = collect_records()
-    if force:
-        idx = {"meta": [], "vecs": np.zeros((0, 0), dtype=np.float32), "when": ""}
-    old = {m["key"]: i for i, m in enumerate(idx["meta"])}
-    new_keys = [r["key"] for r in recs]
-    if not force and set(new_keys) == set(old) and len(recs) == len(idx["meta"]):
-        return {"total": len(recs), "added": 0, "removed": 0}
-    todo = [r for r in recs if r["key"] not in old]
-    new_vecs = embed_texts([r["text"] for r in todo]) if todo else None
-    new_pos = {r["key"]: i for i, r in enumerate(todo)}
-    dim = new_vecs.shape[1] if new_vecs is not None else idx["vecs"].shape[1] if len(idx["vecs"]) else 1536
-    vecs = np.zeros((len(recs), dim), dtype=np.float32)
-    for i, r in enumerate(recs):
-        vecs[i] = new_vecs[new_pos[r["key"]]] if r["key"] in new_pos else idx["vecs"][old[r["key"]]]
-    removed = len(set(old) - set(new_keys))
-    save_index({"meta": recs, "vecs": vecs, "when": now_kst()})
-    return {"total": len(recs), "added": len(todo), "removed": removed}
-
-
-def keyword_bonus(query, text):
-    # 이름·숫자·고유명사처럼 임베딩이 놓치기 쉬운 단어가 그대로 들어 있으면 점수를 조금 더 줌
-    words = [w for w in re.findall(r"[0-9A-Za-z가-힣]+", query) if len(w) >= 2]
-    if not words:
-        return 0.0
-    t = _squash(text)
-    hit = sum(1 for w in words if _squash(w) in t or (len(w) > 2 and _squash(w[:-1]) in t))
-    return 0.12 * hit / len(words)
-
-
-def search_records(query, scope="전체", k=RAG_TOP_K):
-    # 질문과 가까운 업무 기록 조각을 찾아 점수순으로 돌려줌 (같은 기록은 최대 2조각)
-    query = (query or "").strip()
-    if not query:
-        return {"status": "failed", "error": "검색어가 비어 있습니다."}
-    try:
-        info = refresh_index()
-        idx = load_index()
-        if not idx["meta"]:
-            return {"status": "success", "query": query, "hits": [], "indexed": 0}
-        qv = embed_texts([query])[0]
-    except Exception as e:
-        return {"status": "failed", "error": f"검색하지 못했습니다 ({e})"}
-    kinds = RAG_SCOPES.get(scope) if scope in RAG_SCOPES else None
-    scores = idx["vecs"] @ qv
-    ranked = []
-    for i, m in enumerate(idx["meta"]):
-        if kinds and m["kind"] not in kinds:
-            continue
-        ranked.append((float(scores[i]) + keyword_bonus(query, m["text"]), i))
-    ranked.sort(reverse=True)
-    hits, per_src = [], {}
-    for s, i in ranked:
-        m = idx["meta"][i]
-        src = f"{m['kind']}|{m['src_id']}"
-        if s < RAG_MIN_SCORE or per_src.get(src, 0) >= 2:
-            continue
-        per_src[src] = per_src.get(src, 0) + 1
-        hits.append({"no": len(hits) + 1, "kind": m["kind"], "kind_label": RAG_KINDS[m["kind"]],
-                     "title": m["title"], "when": m["when"], "src_id": m["src_id"],
-                     "score": round(s, 3), "text": m["text"]})
-        if len(hits) >= k:
-            break
-    return {"status": "success", "query": query, "hits": hits, "indexed": info["total"]}
-
-
-RAG_ANSWER_RULES = "\n".join([
-    "당신은 김 대리의 개인 비서 '에이블'입니다. 아래 [검색된 업무 기록]만 근거로 질문에 답합니다.",
-    f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일)",
-    "규칙",
-    "- 기록에 있는 내용만 씁니다. 기록에 없으면 '기록에서 확인되지 않습니다'라고 말하고 지어내지 않습니다.",
-    "- 문장 끝에 근거 기록 번호를 [1], [2]처럼 붙입니다.",
-    "- 날짜·금액·담당자·기한은 기록에 적힌 그대로 옮깁니다.",
-    "- 기록끼리 내용이 다르면 더 최근 기록을 앞세우고, 다르다는 점을 함께 알려 줍니다.",
-    "- 공손한 존댓말로 3~6문장 안에서 간결하게 답합니다.",
-])
-
-
-def rag_answer(question, scope="전체"):
-    # 업무 기록 검색 → 찾은 기록만 근거로 답변 생성 (사이드바 검색창에서 사용)
-    found = search_records(question, scope)
-    if found["status"] != "success":
-        return {"ok": False, "answer": found["error"], "hits": []}
-    hits = found["hits"]
-    if not hits:
-        msg = ("아직 검색할 업무 기록이 없습니다. 회의 분석·메일 분석·비서 대화를 하면 자동으로 쌓여요."
-               if not found["indexed"] else "관련된 업무 기록을 찾지 못했습니다. 다른 단어로 검색해 보세요.")
-        return {"ok": True, "answer": msg, "hits": []}
-    ctx = "\n\n".join(f"[{h['no']}] {h['kind_label']} · {h['title']} · {h['when']}\n{h['text']}" for h in hits)
-    try:
-        resp = get_client().responses.create(
-            model=MODEL, instructions=RAG_ANSWER_RULES,
-            input=f"[검색된 업무 기록]\n{ctx}\n\n[질문]\n{question}")
-        answer = resp.output_text.strip()
-    except Exception as e:
-        return {"ok": False, "answer": f"답변을 만들지 못했습니다 ({e})", "hits": hits}
-    used = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
-    return {"ok": True, "answer": answer, "hits": [h for h in hits if h["no"] in used] or hits[:3]}
-
-
-def records_for_chat(query, scope):
-    # 에이블 비서 도구용: 조각 원문을 적당히 잘라서 넘김
-    found = search_records(query, scope)
-    if found["status"] != "success":
-        return found
-    return {"status": "success", "query": query, "count": len(found["hits"]),
-            "records": [{"no": h["no"], "type": h["kind_label"], "title": h["title"], "when": h["when"],
-                         "content": h["text"][:900]} for h in found["hits"]]}
-
-
-TOOLS.append({
-    "type": "function", "name": "search_records",
-    "description": "김 대리의 지난 업무 기록(모든 회의록, 분석한 메일, 지난 대화, 할 일·일정)을 의미로 검색합니다. "
-                   "'지난달 회의에서 예산 얼마로 정했지?', '박과장님이 보낸 견적 메일 뭐였지?', "
-                   "'예전에 물어봤던 출장 건'처럼 [최근 회의]나 [현재 업무 데이터]만으로 답할 수 없는 과거 기록을 물을 때 사용합니다.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "찾을 내용을 핵심 단어 위주로 (예: '마케팅 예산 결정', '박과장 견적')"},
-            "scope": {"type": "string", "enum": list(RAG_SCOPES), "description": "검색 범위, 모르면 '전체'"},
-        },
-        "required": ["query", "scope"], "additionalProperties": False,
-    },
-    "strict": True,
-})
-TOOL_LABEL["search_records"] = "기록 검색"
-
-
-def _rag_search_cb():
-    q = (st.session_state.get("rag_q") or "").strip()
-    if not q:
-        st.session_state.rag_result = None
-        return
-    with st.spinner("업무 기록을 찾는 중…"):
-        r = rag_answer(q, st.session_state.get("rag_scope", "전체"))
-    st.session_state.rag_result = {"q": q, **r}
-
-
-def _rag_clear_cb():
-    st.session_state.rag_result = None
-    st.session_state.rag_q = ""
-
-
-def _rag_to_chat_cb(q):
-    new_chat_cb(notify=False)
-    set_quick(q)
-    st.session_state.pending_toast = "🤖 에이블 비서 탭에서 이어서 답해 드릴게요."
-
-
-def _rag_reindex_cb():
-    try:
-        r = refresh_index(force=True)
-        st.session_state.pending_toast = f"업무 기록 {r['total']}조각을 다시 색인했어요."
-    except Exception as e:
-        st.session_state.pending_toast = f"⚠️ 색인하지 못했어요 ({e})"
-
-
-def render_record_search():
-    # 사이드바 '새 채팅' 위: 업무 기록 전체 검색
-    with st.container(border=True, key="rag_box"):
-        st.markdown("**🔎 업무 기록 검색**")
-        st.text_input("검색", key="rag_q", placeholder="예: 지난달 회의에서 정한 예산", on_change=_rag_search_cb,
-                      label_visibility="collapsed")
-        a, b = st.columns([3, 2], gap="small")
-        a.selectbox("범위", list(RAG_SCOPES), key="rag_scope", label_visibility="collapsed")
-        b.button("검색", key="rag_go", on_click=_rag_search_cb, use_container_width=True)
-        r = st.session_state.get("rag_result")
-        if r:
-            (st.markdown if r["ok"] else st.error)(r["answer"])
-            for h in r["hits"]:
-                with st.expander(f"[{h['no']}] {h['kind_label']} · {h['title'][:18]}"):
-                    st.caption(f"{h['when']} · 관련도 {h['score']:.2f}")
-                    st.markdown(f"<div class='able-meta' style='white-space:pre-wrap'>"
-                                f"{html.escape(h['text'][:600])}</div>", unsafe_allow_html=True)
-            c, d = st.columns(2, gap="small")
-            c.button("💬 채팅으로", key="rag_chat", on_click=_rag_to_chat_cb, args=(r["q"],),
-                     help="이 질문을 에이블 비서와 이어서 대화해요", use_container_width=True)
-            d.button("✖ 닫기", key="rag_clear", on_click=_rag_clear_cb, use_container_width=True)
-        idx = load_index()
-        st.caption(f"색인 {len(idx['meta'])}조각 · 새 기록은 검색할 때 자동 반영"
-                   + (f" · 마지막 {idx['when'][5:16]}" if idx["when"] else ""))
-        st.button("🔄 전체 다시 색인", key="rag_reindex", on_click=_rag_reindex_cb, use_container_width=True)
+              "delete_event": "일정 삭제", "delete_todo": "할 일 삭제", "decide_pending_delete": "삭제 승인"}
 
 
 def recent_mails_for_chat(count=5):
@@ -2225,14 +2306,14 @@ def run_tool(name, args):
         return decide_pending(args["choice"])
     if name == "delete_event":
         return request_delete(args["date"], args["keyword"].strip())
+    if name == "delete_todo":
+        return request_delete_todo(args["keyword"].strip(), args["status"])
     if name == "decide_pending_delete":
         return decide_pending_delete(args["choice"])
     if name == "get_recent_mails":
         return recent_mails_for_chat(args["count"])
     if name == "complete_todo":
         return set_todo_done(args["id"], True)
-    if name == "search_records":
-        return records_for_chat(args["query"], args["scope"])
     return {"status": "failed", "error": f"알 수 없는 도구: {name}"}
 
 
@@ -2240,13 +2321,13 @@ def action_of(name, args, result):
     label = TOOL_LABEL.get(name, name)
     if not isinstance(result, dict) or result.get("status") == "failed":
         return {"ok": False, "text": f"{label} 실패 ({(result or {}).get('error', '')})"}
-    if name == "delete_event":
-        return {"ok": True, "warn": True, "text": "🗑️ 삭제 승인 대기 → "
+    if name in ("delete_event", "delete_todo"):
+        return {"ok": True, "warn": True, "text": f"🗑️ {label} 승인 대기 → "
                 + ", ".join(f"{c['no']}. {c['title']} ({c['when']})" for c in result["candidates"])}
     if name == "decide_pending_delete":
         if result["decision"] == "취소":
-            return {"ok": True, "text": "🗑️ 일정 삭제를 취소했어요 (일정은 그대로 있어요)"}
-        return {"ok": True, "text": "🗑️ 일정 삭제 완료 → " + ", ".join(result["deleted"])}
+            return {"ok": True, "text": f"🗑️ {result['kind']} 삭제를 취소했어요 (그대로 있어요)"}
+        return {"ok": True, "text": f"🗑️ {result['kind']} 삭제 완료 → " + ", ".join(result["deleted"])}
     if result.get("status") == "needs_approval":
         return {"ok": True, "warn": True,
                 "text": f"일정 충돌 감지 → 승인 대기: {result['title']} ({result['requested']}) · "
@@ -2262,8 +2343,6 @@ def action_of(name, args, result):
         return {"ok": True, "text": f"{label} 완료 → {result['title']} ({result['category']})"}
     if name == "get_recent_mails":
         return {"ok": True, "text": f"{label} → 최근 메일 {result['count']}통 확인"}
-    if name == "search_records":
-        return {"ok": True, "text": f"🔎 {label} → '{args['query']}' 관련 기록 {result['count']}건"}
     return {"ok": True, "text": f"{label} 완료 → {result.get('todo', '')}"}
 
 
@@ -2305,6 +2384,10 @@ def system_prompt():
         "  김 대리가 '응/지워줘/1번'이라고 하면 decide_pending_delete(번호, 후보가 하나면 1), '전부' → all,",
         "  '아니/하지 마/취소'라고 하면 cancel입니다. (삭제 승인 대기 중의 '취소'는 삭제를 그만두라는 뜻)",
         "  찾지 못했으면(failed) events_on_date를 알려 주고 어떤 일정인지 묻습니다. 삭제했다고 지어내지 않습니다.",
+        "- 할 일을 지워 달라고 하면(예: '경쟁사 분석 할 일 지워줘', '완료한 할 일 다 지워줘') delete_todo를 사용합니다.",
+        "  '다 했어/끝냈어'는 삭제가 아니라 complete_todo(완료 처리)입니다. 지워 달라고 할 때만 delete_todo를 씁니다.",
+        "  승인 방법은 일정 삭제와 같습니다: 후보를 보여 주고 묻고, 다음 대답에서 decide_pending_delete를 사용합니다.",
+        "  찾지 못했으면(failed) todos 목록을 알려 주고 어떤 할 일인지 묻습니다.",
         "- 이메일로 보내 달라는 명시적 요청이 있을 때만 send_email을 사용합니다.",
         "  받는 사람을 말하지 않으면 to에 '나'를 넣습니다. 연락처에 있는 사람은 이름으로 넣을 수 있고,",
         "  연락처에 없는 사람의 이메일 주소는 절대 지어내지 않습니다.",
@@ -2317,10 +2400,6 @@ def system_prompt():
         "  '그래도 보낼까요?'라고 묻습니다. 김 대리가 '보내줘/그래도 보내'라고 하면 confirm_pending_email(send),",
         "  '보내지 마/취소'라고 하면 confirm_pending_email(cancel)을 사용합니다.",
         "- failed면 이유를 알리고 필요한 정보를 묻습니다.",
-        "- 지난 회의·메일·대화·할 일 등 과거 기록을 물으면 search_records로 먼저 찾아봅니다.",
-        "  (가장 최근 회의 1건만 아래에 들어 있으므로, 그 밖의 회의 내용은 반드시 검색합니다.)",
-        "  찾은 기록에 있는 내용만 답하고, 끝에 '(출처: 📝 회의명, 날짜)'처럼 근거를 밝힙니다.",
-        "  결과가 0건이면 '기록에서 확인되지 않습니다'라고 말하고 지어내지 않습니다.",
         "- 도구를 사용한 뒤에는 무엇을 했는지 짧게 보고합니다.",
         "- 공손한 한국어 존댓말로 간결하게 답합니다.",
         "",
@@ -2336,8 +2415,9 @@ def system_prompt():
                   + ", ".join(f"{i + 1}) {slot_text(x)}" for i, x in enumerate(p["suggestions"])), ""]
     pd_evs = pending_delete_events()
     if pd_evs:
-        lines += ["[삭제 승인 대기 중인 일정] (아직 삭제하지 않음)"]
-        lines += [f"{i + 1}) {e['title']} ({e['date']} {event_time_text(e)})" for i, e in enumerate(pd_evs)] + [""]
+        kind = pending_delete_kind()
+        lines += [f"[삭제 승인 대기 중인 {KIND_NAME[kind]}] (아직 삭제하지 않음)"]
+        lines += [f"{i + 1}) {delete_item_text(kind, e)}" for i, e in enumerate(pd_evs)] + [""]
     note = latest_note()
     if note:
         lines += [f"[최근 회의] {note['title']} ({note['when']})", "요약:"]
@@ -2504,7 +2584,7 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
             else:
                 result = run_tool(c.name, args)
                 act = action_of(c.name, args, result)
-                if c.name == "delete_event" and result.get("status") == "needs_approval":
+                if c.name in ("delete_event", "delete_todo") and result.get("status") == "needs_approval":
                     asked_delete = True
             if not (isinstance(result, dict) and result.get("retry")):
                 actions.append(act)
@@ -2557,7 +2637,6 @@ with tab_chat:
     n = st.session_state.chat_n
     chat = current_chat()
     turns = chat["turns"] if chat else []
-    autoplay_id = st.session_state.pop("chat_autoplay", None)
 
     h1, h2, h3 = st.columns([5, 1.3, 1.3])
     h1.markdown(f"#### 💬 {chat['title'] if chat else '새 채팅'}")
@@ -2566,19 +2645,15 @@ with tab_chat:
     h3.download_button("⬇️ 대화 저장", history_text(chat) if chat else "", file_name="에이블_대화기록.txt",
                        mime="text/plain", use_container_width=True, disabled=not turns)
 
-    voice_in = None
-    has_mic = hasattr(st, "audio_input")
+    voice_val = None
     if not turns:
-        # 새 채팅: 바로 말로 요청할 수 있게 녹음기를 맨 위에 크게
+        # 새 채팅: 에이블 로고를 크게 → 누르면 녹음, 다시 누르면 전달
         with st.container(border=True):
-            st.markdown("### 🎙️ 말로 요청해 보세요")
-            st.caption("마이크 버튼을 눌러 말하고 다시 누르면 바로 에이블에게 전달돼요. "
-                       "예) 내일 오후 2시에 고객사 미팅 잡아줘 · 최근 회의 요약해서 박과장님께 메일 보내줘")
-            if has_mic:
-                voice_in = st.audio_input("음성으로 요청하기", key=f"chat_mic_{n}", label_visibility="collapsed")
-                st.caption("녹음기에 'An error has occurred'가 뜨면 페이지를 새로고침한 뒤 다시 녹음하거나, 아래에 글로 입력해 주세요.")
-            else:
-                st.warning("실시간 녹음을 쓰려면 `!pip install -q -U streamlit`으로 업데이트하세요.")
+            st.markdown("<h3 style='text-align:center; margin-bottom:0'>🎙️ 에이블에게 말로 요청해 보세요</h3>",
+                        unsafe_allow_html=True)
+            voice_val = able_mic("big", "able_mic_big")
+            st.caption("예) 내일 오후 2시에 고객사 미팅 잡아줘 · 최근 회의 요약해서 박과장님께 메일 보내줘 · "
+                       "마이크 권한을 물으면 '허용'을 눌러 주세요.")
 
     for t in turns:
         with st.chat_message("user", avatar="🧑‍💼"):
@@ -2592,7 +2667,7 @@ with tab_chat:
                 show_action(a)
             audio = st.session_state.audio_cache.get(t["id"])
             if audio:
-                st.audio(audio, format="audio/mp3", autoplay=(t["id"] == autoplay_id))
+                st.audio(audio, format="audio/mp3")          # 처음 재생은 로고 녹음기가 '말하는 중'으로 해 줌
 
     for t in turns:
         if t.get("mail") and t["mail"]["status"] == "pending":
@@ -2600,8 +2675,12 @@ with tab_chat:
 
     # --- 입력 카드 ---
     with st.container(border=True):
-        if turns and has_mic:
-            voice_in = st.audio_input("🎙️ 말로 이어서 요청하기", key=f"chat_mic_{n}")
+        err = st.session_state.pop("chat_error", None)
+        if err:
+            st.error(f"답변을 만들지 못했습니다: {err}")
+        if turns:
+            st.markdown("**🎙️ 말로 이어서 요청하기**")
+            voice_val = able_mic("compact", "able_mic_compact")
         typed = st.text_input("⌨️ 글로 입력", key=f"chat_text_{n}",
                               placeholder="예) 박과장님께 회의 요약 메일 보내줘 / 금요일 오후 3시 온라인 회의 잡아줘")
         up_txt = st.file_uploader("📎 텍스트 파일 첨부 (회의록, 메모 등)", type=["txt", "md", "csv"], key="chat_file")
@@ -2615,18 +2694,24 @@ with tab_chat:
         for col, qa in zip(qc, QUICK_ASKS):
             col.button(qa, key=f"quick_{qa}", on_click=set_quick, args=(qa,), use_container_width=True)
 
-        b1, b2, b3, b4 = st.columns([1.1, 1.5, 1.6, 1.4])
+        b1, b3, b4 = st.columns([1.1, 1.6, 1.4])
         run_clicked = b1.button("▶ 실행", type="primary", use_container_width=True)
-        auto_voice = b2.toggle("녹음 끝나면 바로 요청", value=True, key="chat_auto")
         tts_on = b3.toggle("🔊 답변 음성 재생", value=True, key="chat_tts")
         voice = b4.selectbox("목소리", list(VOICES), format_func=lambda v: f"{VOICES[v]} ({v})",
                              key="chat_voice", label_visibility="collapsed")
 
     quick = st.session_state.pop("chat_quick", None)
-    voice_bytes = voice_in.getvalue() if voice_in is not None else None
-    voice_hash = hashlib.md5(voice_bytes).hexdigest() if voice_bytes else None
-    new_voice = bool(voice_hash) and voice_hash != st.session_state.get("voice_done")
-    if run_clicked or quick or (auto_voice and new_voice):
+    # 로고 녹음기에서 온 새 녹음 (같은 녹음을 두 번 보내지 않게 id로 확인)
+    voice_bytes, voice_name, voice_hash = None, "voice.webm", None
+    if isinstance(voice_val, dict) and voice_val.get("b64") and voice_val.get("id") != st.session_state.get("voice_done"):
+        try:
+            voice_bytes = base64.b64decode(voice_val["b64"])
+            voice_name = "voice." + str(voice_val.get("ext") or "webm")
+            voice_hash = voice_val["id"]
+        except Exception:
+            voice_bytes = None
+    new_voice = voice_bytes is not None
+    if run_clicked or quick or new_voice:
         question = quick.split(" ", 1)[1] if quick else typed.strip()
         if not quick and not voice_bytes and not question:
             st.warning("음성을 녹음하거나 질문을 입력한 뒤 실행을 눌러 주세요.")
@@ -2638,7 +2723,7 @@ with tab_chat:
                 with st.spinner("답변을 준비하고 있습니다.."):
                     stt = None
                     if voice_bytes and not quick:
-                        stt = speech_to_text(voice_bytes)                            # 음성 → 텍스트 (STT)
+                        stt = speech_to_text(voice_bytes, voice_name, stt_hint(), STT_CHAT_MODELS)  # 음성 → 텍스트 (STT)
                         question = (stt + " " + question).strip()
                     answer, actions, mail = ask_assistant(chat, question, file_name, file_text,
                                                           "voice" if stt else "text")   # LLM 호출
@@ -2651,11 +2736,14 @@ with tab_chat:
                     cache[turn["id"]] = reply_audio
                     for k in list(cache)[:-30]:
                         del cache[k]
-                st.session_state.chat_autoplay = turn["id"]                       # 답변 음성 즉시 재생
+                if reply_audio:                                                   # 로고 녹음기가 '말하는 중'으로 재생
+                    st.session_state.mic_play = {"id": turn["id"], "ts": time.time(),
+                                                 "b64": base64.b64encode(reply_audio).decode()}
                 st.session_state.chat_n += 1                                      # 녹음기·입력칸 비우기
                 done = True
             except Exception as e:
-                st.error(f"답변을 만들지 못했습니다: {e}")
+                st.session_state.chat_error = str(e)        # 새로고침 후에도 보이게 저장 (로고도 '생각 중'에서 풀림)
+                done = True
             if done:
                 st.rerun()   # try 밖에서 호출해야 화면 새로고침 신호가 막히지 않음
 
@@ -2732,425 +2820,10 @@ def note_markdown(n):
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────
-# ⚡ 실시간 회의 코파일럿 (회의 중 귓속말)
-#   회의를 30초~1분씩 끊어 녹음 → 멈추는 즉시 받아쓰기 → 방금 나온 말에서
-#     · 김 대리에게 맡겨진 업무      → "그날 이미 고객사 미팅이 있어요" (캘린더·할 일 대조)
-#     · 새로 잡는 회의·일정          → 시간 충돌 확인 + 대체 시간 제안
-#     · "지난번에 정한 예산" 같은 언급 → 업무 기록 검색(RAG)으로 바로 찾아 출처와 함께
-#     · 김 대리에게 던진 질문        → 지난 기록에서 답변 힌트
-#   를 찾아 오른쪽 '귓속말' 카드로 알림 (원하면 이어폰용 음성). 회의가 끝나면 그대로 회의록 생성.
-# ─────────────────────────────────────────────
-def ask_json(instructions, user_input, name, schema):
-    # 구조화된 JSON 답변 공통 함수 (회의 코파일럿에서 사용)
-    resp = get_client().responses.create(
-        model=MODEL, instructions=instructions, input=user_input,
-        text={"format": {"type": "json_schema", "name": name, "schema": schema, "strict": True}})
-    return json.loads(resp.output_text)
-
-
-CP_MAX_LOOKUPS = 2        # 구간마다 기록 검색은 최대 2번 (속도·비용)
-CP_COLORS = {"task": "#2563eb", "conflict": "#dc2626", "free": "#16a34a", "lookup": "#7c3aed",
-             "question": "#d97706", "info": "#64748b"}
-
-CP_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "kim_tasks": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "업무 이름 (짧게)"},
-                "requester": {"type": "string", "description": "맡긴 사람, 없으면 빈 문자열"},
-                "due_text": {"type": "string", "description": "기한 표현 원문 그대로, 없으면 빈 문자열"},
-                "due_date": {"type": "string", "description": "날짜가 구체적일 때만 YYYY-MM-DD, 아니면 빈 문자열"},
-                "priority": {"type": "string", "enum": PRIORITIES},
-                "evidence": {"type": "string", "description": "[새로 들린 말]에서 글자 그대로 복사한 근거 문장"},
-            },
-            "required": ["title", "requester", "due_text", "due_date", "priority", "evidence"],
-            "additionalProperties": False}},
-        "schedules": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "date": {"type": "string", "description": "YYYY-MM-DD, 모르면 빈 문자열"},
-                "start": {"type": "string", "description": "HH:MM, 모르면 빈 문자열. 오전/오후 없는 1~7시는 오후"},
-                "end": {"type": "string", "description": "HH:MM, 말하지 않았으면 빈 문자열"},
-                "kim_attends": {"type": "boolean", "description": "김 대리가 참석·관련되는 일정인지"},
-                "evidence": {"type": "string", "description": "[새로 들린 말]에서 글자 그대로 복사한 근거 문장"},
-            },
-            "required": ["title", "date", "start", "end", "kim_attends", "evidence"],
-            "additionalProperties": False}},
-        "lookups": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "지난 기록에서 찾을 검색어 (핵심 단어 위주)"},
-                "reason": {"type": "string", "description": "왜 찾아야 하는지 짧게"},
-                "evidence": {"type": "string", "description": "[새로 들린 말]에서 글자 그대로 복사한 근거 문장"},
-            },
-            "required": ["query", "reason", "evidence"], "additionalProperties": False}},
-        "questions_to_kim": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "question": {"type": "string", "description": "김 대리에게 물은 내용 요약"},
-                "query": {"type": "string", "description": "답을 찾을 검색어"},
-                "evidence": {"type": "string", "description": "[새로 들린 말]에서 글자 그대로 복사한 근거 문장"},
-            },
-            "required": ["question", "query", "evidence"], "additionalProperties": False}},
-    },
-    "required": ["kim_tasks", "schedules", "lookups", "questions_to_kim"],
-    "additionalProperties": False,
-}
-
-
-def cp_state():
-    cp = data.get("copilot") or {}
-    return cp if cp.get("active") else None
-
-
-def cp_start(title, attendees):
-    data["copilot"] = {"active": True, "title": title.strip(), "attendees": attendees.strip(), "started": now_kst(),
-                       "segments": [], "whispers": [], "seen": []}
-    save_data()
-    st.session_state.cp_n = st.session_state.get("cp_n", 0) + 1
-
-
-def cp_transcript(cp):
-    return "\n".join(s["text"] for s in cp["segments"])
-
-
-def cp_detect(cp, new_text):
-    # 방금 들린 구간에서 귓속말 거리 찾기 (앞 내용은 맥락으로만 사용)
-    before = cp_transcript(cp)[-1500:]
-    instructions = "\n".join([
-        "당신은 회의에 함께 앉아 있는 김 대리의 비서 '에이블'입니다. 회의를 실시간으로 듣고 있습니다.",
-        f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일)",
-        date_table(),
-        f"회의: {cp['title'] or '(제목 없음)'} / 참석자: {cp['attendees'] or '(입력 없음)'}",
-        "",
-        "[찾을 것] — 반드시 [새로 들린 말]에 나온 것만. [앞 내용]은 맥락을 이해하는 데만 씁니다.",
-        "- kim_tasks: '김대리/김 대리'에게 맡겨진 업무. 다른 사람 업무는 넣지 않습니다.",
-        "- schedules: 회의에서 새로 잡거나 언급한 회의·일정·마감 행사.",
-        "- lookups: '지난번에 정한 ~', '그때 그 견적', '저번 회의에서 ~'처럼 지난 기록을 확인해야 하는 언급,",
-        "  또는 숫자·결정 사항을 두고 참석자들이 기억이 엇갈리는 부분.",
-        "- questions_to_kim: 김 대리에게 직접 묻거나 확인을 요청한 질문.",
-        "- evidence는 [새로 들린 말]에서 글자 그대로 복사합니다. 음성 인식 결과라 오탈자가 있어도 고치지 않고 그대로 옮깁니다.",
-        "- 해당하는 것이 없으면 빈 배열로 둡니다. 억지로 만들지 않습니다.",
-        "- [이미 알린 것]에 있는 내용은 다시 넣지 않습니다.",
-    ])
-    return ask_json(instructions,
-                    f"[이미 알린 것]\n{', '.join(cp['seen'][-30:]) or '(없음)'}\n\n[앞 내용]\n{before or '(회의 시작)'}"
-                    f"\n\n[새로 들린 말]\n{new_text}", "copilot_detect", CP_SCHEMA)
-
-
-def cp_whisper(cp, kind, title, body, payload=None, sources=None):
-    key = _squash(f"{kind}{title}")[:40]
-    if key in cp["seen"]:
-        return None
-    cp["seen"].append(key)
-    w = {"id": uuid.uuid4().hex[:6], "time": now_kst()[11:16], "kind": kind, "title": title, "body": body,
-         "payload": payload or {}, "sources": sources or [], "done": ""}
-    cp["whispers"].insert(0, w)
-    return w
-
-
-def day_brief(d_iso):
-    evs = sorted([e for e in data["events"] if e["date"] == d_iso], key=lambda e: e["start"] or "00:00")
-    tds = [t for t in data["todos"] if not t["done"] and t["due"] == d_iso]
-    return evs, tds
-
-
-def cp_process(cp, new_text):
-    # 구간 하나 처리 → 새 귓속말 목록
-    new_text = new_text.strip()
-    if not new_text:
-        return []
-    found = cp_detect(cp, new_text)
-    cp["segments"].append({"time": now_kst()[11:16], "text": new_text})
-    out = []
-
-    for t in found["kim_tasks"]:
-        if not found_in(t["evidence"], new_text):
-            continue                                     # 들린 말에 근거가 없으면 귓속말하지 않음
-        d = parse_date(t["due_date"])
-        lines = [f"“{t['evidence']}”"]
-        if d:
-            evs, tds = day_brief(d.isoformat())
-            due = f"{fmt_date(d)} ({d_day(d)})"
-            if evs:
-                lines.append(f"그날 이미 일정 {len(evs)}건: " + ", ".join(f"{e['title']} {event_time_text(e)}" for e in evs[:3]))
-            if tds:
-                lines.append(f"그날 마감인 할 일도 {len(tds)}건 있어요: " + ", ".join(x["title"] for x in tds[:3]))
-            if not evs and not tds:
-                lines.append("그날은 다른 일정·마감이 없어요.")
-            if d.weekday() >= 5:
-                lines.append("⚠️ 주말이에요. 날짜를 한 번 확인해 보세요.")
-        else:
-            due = t["due_text"] or "기한 언급 없음"
-            lines.append("기한이 정확하지 않아요. 회의 중에 날짜를 확인해 두면 좋아요." if t["due_text"] else
-                         "기한을 정하지 않았어요. '언제까지 드리면 될까요?'라고 물어보세요.")
-        w = cp_whisper(cp, "task", f"📌 김 대리님 업무: {t['title']} · {due}", "\n".join(lines),
-                       {"title": t["title"], "due": d.isoformat() if d else "", "priority": t["priority"],
-                        "detail": (f"요청: {t['requester']} / " if t["requester"] else "") + f"기한: {t['due_text'] or '없음'}"})
-        if w:
-            out.append(w)
-
-    for s in found["schedules"]:
-        if not found_in(s["evidence"], new_text) or not parse_date(s["date"]):
-            continue
-        f = build_event(s["title"], s["date"], s["start"], s["end"], "", f"회의 중 언급: {s['evidence']}")
-        when = f"{fmt_date(parse_date(f['date']))} {event_time_text(f)}"
-        payload = {"title": f["title"], "date": f["date"], "start": f["start"], "end": f["end"],
-                   "category": f["category"], "note": f["note"]}
-        if not f["start"]:
-            evs, _ = day_brief(f["date"])
-            body = ("그날 일정: " + ", ".join(f"{e['title']} {event_time_text(e)}" for e in evs)) if evs else "그날은 비어 있어요."
-            w = cp_whisper(cp, "info", f"📅 일정 언급: {f['title']} · {when}", body + " 시간을 정하면 충돌도 바로 확인해 드릴게요.", payload)
-        else:
-            conflicts = find_conflicts(f["date"], f["start"], f["end"])
-            if conflicts:
-                alts = suggest_slots(f["date"], f["start"], f["end"])
-                body = ("겹치는 일정: " + ", ".join(conflict_text(c) for c in conflicts)
-                        + ("\n이 시간은 비어 있어요: " + " / ".join(slot_text(a) for a in alts) if alts else ""))
-                if not s["kim_attends"]:
-                    body += "\n(김 대리님 참석 일정이 아니라면 무시해도 돼요.)"
-                w = cp_whisper(cp, "conflict", f"⚠️ 시간 충돌: {f['title']} · {when}", body, payload)
-            else:
-                w = cp_whisper(cp, "free", f"✅ 가능해요: {f['title']} · {when}",
-                               "김 대리님 캘린더에서 그 시간은 비어 있어요.", payload)
-        if w:
-            out.append(w)
-
-    asks = [("lookup", f"🔎 지난 기록: {x['reason']}", x["query"], x["evidence"]) for x in found["lookups"]]
-    asks += [("question", f"💬 답변 힌트: {x['question']}", x["query"], x["evidence"]) for x in found["questions_to_kim"]]
-    for kind, title, query, ev in asks[:CP_MAX_LOOKUPS]:
-        if not found_in(ev, new_text) or _squash(f"{kind}{title}")[:40] in cp["seen"]:
-            continue
-        r = rag_answer(query)
-        if not r["ok"] or not r["hits"]:
-            continue                                     # 찾지 못한 건 귓속말하지 않음 (회의 방해 X)
-        w = cp_whisper(cp, kind, title, r["answer"], {"query": query},
-                       [f"[{h['no']}] {h['kind_label']} · {h['title']} · {h['when']}" for h in r["hits"]])
-        if w:
-            out.append(w)
-
-    save_data()
-    return out
-
-
-def cp_finish(cp):
-    # 회의 종료 → 전체 받아쓰기로 회의록 생성 (회의 분석과 같은 방식, 귓속말도 함께 보관)
-    text = cp_transcript(cp)
-    res = analyze_meeting(text, cp["title"], cp["attendees"])
-    tasks = apply_kim_tasks(res["kim_tasks"], text, "회의 코파일럿")
-    note = {
-        "id": uuid.uuid4().hex[:8],
-        "title": cp["title"] or res["title_guess"].strip() or f"{today.isoformat()} 회의",
-        "when": now_kst(), "attendees": cp["attendees"], "source": "실시간 코파일럿",
-        "text": text, "summary": res["summary"], "decisions": res["decisions"], "kim_tasks": tasks,
-        "schedules": [dict(s, verified=found_in(s["evidence"], text)) for s in res["schedules"]],
-        "whispers": [{k: w[k] for k in ("time", "title", "body")} for w in reversed(cp["whispers"])],
-    }
-    data["meeting_notes"].insert(0, note)
-    del data["meeting_notes"][20:]
-    data["copilot"] = {}
-    save_data()
-    return note, tasks
-
-
-def _cp_todo_cb(wid):
-    cp = cp_state()
-    w = next((x for x in cp["whispers"] if x["id"] == wid), None) if cp else None
-    if not w:
-        return
-    p = w["payload"]
-    if p["title"].strip() in {t["title"].strip() for t in data["todos"] if not t["done"]}:
-        w["done"] = "이미 할 일에 있어요"
-    else:
-        add_todo(p["title"], p["due"], p["priority"], p["detail"], "회의 코파일럿")
-        w["done"] = "할 일에 추가했어요"
-    save_data()
-
-
-def _cp_event_cb(wid):
-    cp = cp_state()
-    w = next((x for x in cp["whispers"] if x["id"] == wid), None) if cp else None
-    if not w:
-        return
-    p = w["payload"]
-    r = add_event(p["title"], p["date"], p["note"], "회의 코파일럿", p["start"], p["end"], p["category"])
-    w["done"] = ("캘린더에 등록했어요" if r["status"] == "success" else
-                 "겹치는 일정이 있어 화면 위 카드에서 시간을 골라 주세요" if r["status"] == "needs_approval" else
-                 f"등록 실패: {r.get('error', '')}")
-    save_data()
-
-
-def _cp_hide_cb(wid):
-    cp = cp_state()
-    if cp:
-        cp["whispers"] = [x for x in cp["whispers"] if x["id"] != wid]
-        save_data()
-
-
-def _cp_cancel_cb():
-    data["copilot"] = {}
-    save_data()
-    st.session_state.pop("cp_demo", None)
-    st.session_state.pending_toast = "코파일럿을 끝냈어요. 받아쓴 내용은 저장하지 않았어요."
-
-
-def cp_demo_segments(text, size=260):
-    # 데모용: 대본을 문장 단위로 묶어 '실시간으로 들리는 것처럼' 한 구간씩 넣음
-    sents = [x.strip() for x in re.split(r"(?<=[.?!다요])\s+|\n+", text) if x.strip()]
-    out, cur = [], ""
-    for s in sents:
-        if cur and len(cur) + len(s) > size:
-            out.append(cur)
-            cur = ""
-        cur = (cur + " " + s).strip()
-    return out + ([cur] if cur else [])
-
-
-def render_whisper(w, live=True):
-    color = CP_COLORS.get(w["kind"], "#64748b")
-    st.markdown(f"<div style='border-left:4px solid {color}; padding:6px 10px; margin:2px 0 4px;"
-                f" background:rgba(128,128,128,.07); border-radius:6px'>"
-                f"<div style='font-weight:600'>{html.escape(w['title'])}</div>"
-                f"<div class='able-meta' style='white-space:pre-wrap'>{html.escape(w['body'])}</div>"
-                f"<div class='able-meta' style='font-size:.72rem'>{w['time']}</div></div>", unsafe_allow_html=True)
-    for s in w.get("sources", []):
-        st.caption(s)
-    if not live:
-        return
-    if w["done"]:
-        st.caption(f"✔ {w['done']}")
-        return
-    cols = st.columns([1.3, 1.3, 1], gap="small")
-    if w["kind"] == "task":
-        cols[0].button("➕ 할 일에 추가", key=f"cpt_{w['id']}", on_click=_cp_todo_cb, args=(w["id"],), use_container_width=True)
-    if w["kind"] in ("free", "conflict", "info") and w["payload"].get("start"):
-        cols[0].button("📅 일정 등록", key=f"cpe_{w['id']}", on_click=_cp_event_cb, args=(w["id"],), use_container_width=True)
-    cols[2].button("✖", key=f"cph_{w['id']}", on_click=_cp_hide_cb, args=(w["id"],), help="이 귓속말 지우기",
-                   use_container_width=True)
-
-
-def render_copilot():
-    st.session_state.setdefault("cp_n", 0)
-    for msg in st.session_state.pop("cp_toasts", []):       # 새 귓속말은 화면 구석에 살짝 알림
-        st.toast(msg, icon="🤫")
-    cp = cp_state()
-    with st.container(border=True, key="cp_box"):
-        st.markdown("#### ⚡ 실시간 회의 코파일럿")
-        st.caption("회의 중에 30초~1분씩 녹음하면, 멈출 때마다 바로 받아쓰고 **김 대리 업무·일정 충돌·지난 기록**을 귓속말로 알려 드려요. "
-                   "회의를 마치면 그대로 회의록이 만들어집니다.")
-        if cp is None:
-            c1, c2 = st.columns(2)
-            title = c1.text_input("회의 제목", key="cp_title", placeholder="예: 신제품 출시 주간 회의")
-            people = c2.text_input("참석자", key="cp_people", placeholder="예: 팀장, 박과장, 이과장")
-            if st.button("▶ 회의 시작 (코파일럿 켜기)", type="primary", key="cp_go", use_container_width=True):
-                cp_start(title, people)
-                st.rerun()
-            return
-
-        n_seg, n_w = len(cp["segments"]), len(cp["whispers"])
-        st.markdown(f"🔴 **진행 중** · {cp['title'] or '제목 없는 회의'} · 시작 {cp['started'][11:16]} · "
-                    f"받아쓴 구간 {n_seg}개 · 귓속말 {n_w}개")
-        left, right = st.columns([1.05, 1], gap="medium")
-
-        with left:
-            n = st.session_state.cp_n
-            new_text, src = "", ""
-            if hasattr(st, "audio_input"):
-                rec = st.audio_input("🎙️ 녹음 → 멈추면 바로 분석 (30초~1분 권장)", key=f"cp_mic_{n}")
-                if rec is not None:
-                    src = "voice"
-            else:
-                rec = None
-                st.warning("녹음을 쓰려면 `!pip install -q -U streamlit`으로 업데이트하세요. 아래에 글로 넣어도 돼요.")
-            with st.form(f"cp_typed_{n}", clear_on_submit=True, border=False):
-                typed = st.text_input("✍️ 들은 말 직접 넣기", placeholder="예) 김 대리가 금요일까지 견적 비교표 정리해 줘요")
-                if st.form_submit_button("넣기", use_container_width=True) and typed.strip():
-                    new_text, src = typed, "typed"
-            with st.expander("🎬 발표·시연용: 회의 대본으로 실시간 흉내 내기"):
-                demo = st.session_state.get("cp_demo")
-                if not demo:
-                    script = st.text_area("회의 대본", key="cp_script", height=120,
-                                          placeholder="팀장: 김 대리, 이번 주 금요일까지 경쟁사 가격 조사 부탁해요. …")
-                    if st.button("대본 준비", key="cp_demo_ready", disabled=not script.strip()):
-                        st.session_state.cp_demo = {"parts": cp_demo_segments(script), "pos": 0}
-                        st.rerun()
-                else:
-                    st.caption(f"{demo['pos']} / {len(demo['parts'])} 구간 진행")
-                    if demo["pos"] < len(demo["parts"]):
-                        st.markdown(f":gray[다음 구간: {demo['parts'][demo['pos']][:80]}…]")
-                        if st.button("▶ 다음 구간 듣기", key="cp_demo_next", type="primary", use_container_width=True):
-                            new_text, src = demo["parts"][demo["pos"]], "demo"
-                            demo["pos"] += 1
-                    else:
-                        st.caption("대본을 모두 넣었어요.")
-                    if st.button("대본 지우기", key="cp_demo_clear"):
-                        st.session_state.pop("cp_demo", None)
-                        st.rerun()
-
-            if src:
-                try:
-                    with st.spinner("듣고 확인하는 중…"):
-                        if src == "voice":
-                            a_bytes, a_name = shrink_audio(rec.getvalue(), "segment.wav")
-                            hint = f"회사 회의 녹음입니다. 참석자: {cp['attendees']}. " + cp_transcript(cp)[-150:]
-                            new_text = speech_to_text(a_bytes, a_name, hint)
-                        fresh = cp_process(cp, new_text)
-                    st.session_state.cp_n = n + 1                          # 녹음기 비우고 다음 구간 대기
-                    st.session_state.cp_toasts = [w["title"] for w in fresh][:3]
-                    if fresh and st.session_state.get("cp_voice"):
-                        st.session_state.cp_speak = " ".join(re.sub(r"^\W+", "", w["title"]) for w in fresh[:2])
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"이 구간을 처리하지 못했어요: {e}")
-
-            st.markdown("**📝 받아쓴 내용**")
-            with st.container(height=260, border=True):
-                if not cp["segments"]:
-                    st.caption("아직 받아쓴 내용이 없어요. 녹음을 시작해 보세요.")
-                for s in reversed(cp["segments"]):
-                    st.markdown(f":gray[{s['time']}] {s['text']}")
-
-        with right:
-            h1, h2 = st.columns([1.4, 1])
-            h1.markdown("**🤫 귓속말**")
-            h2.toggle("🎧 음성", key="cp_voice", help="이어폰을 끼고 있을 때 새 귓속말을 소리로 들려줘요")
-            speak = st.session_state.pop("cp_speak", None)
-            if speak:
-                try:
-                    st.audio(text_to_speech(speak, "shimmer"), format="audio/mp3", autoplay=True)
-                except Exception:
-                    pass
-            with st.container(height=470, border=False):
-                if not cp["whispers"]:
-                    st.caption("회의 내용에서 김 대리님이 챙길 것이 들리면 여기에 알려 드릴게요.")
-                for w in cp["whispers"]:
-                    render_whisper(w)
-
-        b1, b2 = st.columns([2, 1])
-        if b1.button("⏹ 회의 종료 · 회의록 만들기", type="primary", key="cp_end", use_container_width=True,
-                     disabled=not cp["segments"]):
-            try:
-                with st.spinner("전체 회의 내용을 정리하는 중…"):
-                    note, tasks = cp_finish(cp)
-                st.session_state.pop("cp_demo", None)
-                st.session_state.meet_view = note["id"]
-                n_add = sum(t["status"] in ("calendar", "approximate", "nodue") for t in tasks)
-                st.session_state.pending_toast = f"회의록을 만들었어요. 새로 추가된 김 대리 업무 {n_add}건."
-                st.rerun()
-            except Exception as e:
-                st.error(f"회의록을 만들지 못했어요: {e}")
-        b2.button("취소 (저장 안 함)", key="cp_cancel", on_click=_cp_cancel_cb, use_container_width=True)
-
-
 with tab_meet:
     st.markdown("회의를 녹음하거나 녹음·텍스트 파일을 올리면 에이블이 요약하고 **김 대리 업무만** 할 일에 올립니다.")
     st.caption("📅 정확한 날짜가 있는 김 대리 업무만 캘린더에 들어갑니다. 대략적인 기한이나 다른 일정은 이 화면에서만 보여 드려요. "
                "원문에서 근거를 찾지 못한 내용은 추가하지 않습니다.")
-    render_copilot()
 
     with st.container(border=True):
         mode = st.radio("분석 방법", ["🎙️ 실시간 녹음", "📁 음성 파일 분석", "📄 텍스트 파일 분석"],
@@ -3319,19 +2992,44 @@ with tab_meet:
         b3.download_button("⬇️ 원문 (.txt)", n["text"], file_name=f"회의원문_{n['when'][:10]}.txt",
                            mime="text/plain", use_container_width=True)
         if b4.button("🗑️ 이 회의록 삭제", use_container_width=True):
-            added = {t.get("todo_id") for t in n["kim_tasks"] if t["status"] in ("calendar", "approximate", "nodue")}
-            data["todos"] = [x for x in data["todos"] if x["id"] not in added]
-            data["meeting_notes"] = [x for x in notes if x["id"] != n["id"]]
-            save_data()
-            st.session_state.pending_toast = "회의록과 이 회의에서 추가한 할 일을 지웠어요."
-            st.rerun()
+            st.session_state.meeting_delete_pending = n["id"]
+
+        if st.session_state.get("meeting_delete_pending") == n["id"]:
+            linked_ids = {t.get("todo_id") for t in n["kim_tasks"] if t.get("todo_id")}
+            linked_count = sum(t["id"] in linked_ids for t in data["todos"])
+            with st.container(border=True):
+                st.markdown("#### 🗑️ 삭제할 범위를 선택해 주세요")
+                scope = st.radio(
+                    "삭제 범위",
+                    ["회의록만 삭제", "회의록과 연결된 할 일도 삭제"],
+                    index=0,
+                    key=f"meeting_delete_scope_{n['id']}",
+                )
+                if scope == "회의록만 삭제":
+                    st.info("회의 원문과 요약을 삭제합니다. 연결된 할 일과 캘린더 마감 표시는 유지됩니다.")
+                else:
+                    st.warning(f"회의록과 연결된 할 일 {linked_count}건을 함께 삭제합니다. "
+                               "해당 할 일의 캘린더 마감 표시도 사라집니다. 별도로 등록한 일정은 유지됩니다.")
+                cancel_col, confirm_col = st.columns(2)
+                if cancel_col.button("취소", key=f"meeting_delete_cancel_{n['id']}", use_container_width=True):
+                    st.session_state.pop("meeting_delete_pending", None)
+                    st.rerun()
+                if confirm_col.button("선택한 항목 삭제", key=f"meeting_delete_confirm_{n['id']}",
+                                      type="primary", use_container_width=True):
+                    delete_tasks = scope == "회의록과 연결된 할 일도 삭제"
+                    if delete_tasks:
+                        data["todos"] = [t for t in data["todos"] if t["id"] not in linked_ids]
+                    data["meeting_notes"] = [item for item in data["meeting_notes"] if item["id"] != n["id"]]
+                    save_data()
+                    st.session_state.pop("meeting_delete_pending", None)
+                    st.session_state.pop("meet_view", None)
+                    st.session_state.pending_toast = (
+                        f"회의록과 연결된 할 일 {linked_count}건을 삭제했어요."
+                        if delete_tasks else "회의록만 삭제했어요. 할 일과 캘린더 마감 표시는 유지했어요."
+                    )
+                    st.rerun()
         with st.expander("🗣️ 회의 원문 / 녹취록 보기"):
             st.text(n["text"])
-        if n.get("whispers"):
-            with st.expander(f"🤫 회의 중 귓속말 기록 ({len(n['whispers'])}개)"):
-                for w in n["whispers"]:
-                    st.markdown(f"**{w['time']} · {w['title']}**")
-                    st.caption(w["body"])
 
 
 # ─────────────────────────────────────────────
@@ -3889,10 +3587,7 @@ with st.sidebar:
     st.markdown("## 🤖 에이블")
     st.caption("김 대리님의 AI 개인비서")
 
-    # 0-1) 업무 기록 전체 검색 (RAG) — 새 채팅 위
-    render_record_search()
-
-    # 0-2) GPT처럼 새 채팅 + 대화 기록
+    # 0) GPT처럼 새 채팅 + 대화 기록
     st.button("➕ 새 채팅", key="new_chat_side", on_click=new_chat_cb, type="primary", use_container_width=True)
     chats = sorted(data["chats"], key=lambda c: c["updated"], reverse=True)
     with st.expander(f"💬 대화 기록 ({len(chats)}/{MAX_CHATS})", expanded=True):
