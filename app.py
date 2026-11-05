@@ -7,7 +7,7 @@ from types import NoneType
 #   - meeting.txt : (선택) 회의 분석 탭에서 기본으로 불러올 회의록
 #
 # 화면 구성
-#   메인 탭  : 🤖 에이블 비서 (에이블 로고를 눌러 녹음·생각 중·말하는 중 애니메이션, 음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
+#   메인 탭  : 🤖 에이블 비서 (입력창 맨 위·최근 대화가 위로, 에이블 로고를 눌러 녹음·생각 중·말하는 중 애니메이션, 음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
 #              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
 #   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
@@ -143,7 +143,8 @@ def normalize_note(n):
             t.setdefault(k, v)
     for sc in n["schedules"]:
         for k, v in {"title": "", "when_text": "", "date_type": "none", "date": "", "evidence": "",
-                     "verified": True}.items():
+                     "verified": True, "kind": "기타", "end_date": "", "start": "", "end": "", "place": "",
+                     "kim_attends": False, "cal_status": "reference", "event_ids": [], "conflicts": []}.items():
             sc.setdefault(k, v)
     return n
 
@@ -1066,12 +1067,86 @@ def apply_kim_tasks(tasks, source_text, source_label):
                 detail += f" / 요청: {t['requester']}"
             if t["due_text"] and not exact:
                 detail += f" / 기한(대략): {t['due_text']}"
+            elif t["due_text"] and re.search(r"\d+\s*시|오전|오후", t["due_text"]):
+                detail += f" / 마감: {t['due_text']}"
             item = add_todo(title, t["due_date"] if exact else "", t["priority"], detail.strip(" /"), source_label)
             undone_titles[title] = item["id"]
             t.update(status="calendar" if exact else ("approximate" if t["due_type"] == "approximate" else "nodue"),
                      todo_id=item["id"])
         out.append(t)
     return out
+
+
+MEETING_WORDS = re.compile(r"회의|미팅|상담|면담|방문|워크숍|세미나|간담회|참석")
+WORK_WORDS = re.compile(r"자료|보고서|문서|작성|준비|정리|초안|조사|분석|제출|검토|확인|공유|전달")
+
+
+def split_meeting_tasks(tasks):
+    # AI가 '회의 참석'을 김 대리 업무로 넣은 경우 → 할 일이 아니라 일정으로 옮김
+    work, meetings = [], []
+    for t in tasks:
+        if MEETING_WORDS.search(t["title"]) and not WORK_WORDS.search(t["title"]):
+            meetings.append({"title": re.sub(r"\s*참석$", "", t["title"]).strip(), "kind": "회의·미팅",
+                             "when_text": t["due_text"], "date_type": t["due_type"], "date": t["due_date"],
+                             "end_date": "", "start": "", "end": "", "place": "", "kim_attends": True,
+                             "evidence": t["evidence"]})
+        else:
+            work.append(t)
+    return work, meetings
+
+
+def same_event(e, title, date, start):
+    # 이미 캘린더에 있는 같은 일정인지 (제목이 비슷하고 날짜가 같으면, 시간이 있으면 시간도 같으면)
+    if e["date"] != date or (start and e["start"] and e["start"] != start):
+        return False
+    a, b = _squash(e["title"]), _squash(title)
+    return a == b or (min(len(a), len(b)) >= 3 and (a in b or b in a))
+
+
+def apply_meeting_schedules(schedules, source_text, note_title):
+    # 회의에서 언급된 일정을 캘린더에 반영
+    #   · 회의·미팅(김 대리 참석)과 회사 행사 → 캘린더 일정으로 자동 등록 (기간 행사는 시작일·종료일)
+    #   · 다른 사람 마감, 날짜가 정확하지 않은 일정, 근거가 원문에 없는 일정 → 회의록에서 참고로만 보여 줌
+    #   · 기존 일정과 겹쳐도 회의 내용 그대로 등록하고, 겹친다는 표시만 남김 (임의로 옮기거나 지우지 않음)
+    out = []
+    for s in schedules:
+        s = dict(s, verified=found_in(s["evidence"], source_text), event_ids=[], conflicts=[])
+        d = parse_date(s["date"]) if s["date_type"] == "exact" else None
+        wanted = (s["kind"] == "회의·미팅" and s["kim_attends"]) or s["kind"] == "회사 행사"
+        if not s["verified"]:
+            s["cal_status"] = "unverified"
+        elif not d or not wanted:
+            s["cal_status"] = "reference"
+        else:
+            days = [(d.isoformat(), s["title"], s["start"], s["end"])]
+            end_d = parse_date(s["end_date"])
+            if s["kind"] == "회사 행사" and end_d and end_d > d:
+                days = [(d.isoformat(), f"{s['title']} 시작 (~{fmt_date(end_d)})", "", ""),
+                        (end_d.isoformat(), f"{s['title']} 종료", "", "")]
+            status = "calendar"
+            for date_iso, title, start, end in days:
+                dup = next((e for e in data["events"] if same_event(e, title, date_iso, start)), None)
+                if dup:
+                    s["event_ids"].append(dup["id"])
+                    status = "duplicate" if status == "calendar" and len(days) == 1 else status
+                    continue
+                note = f"[회의: {note_title}]" + (f" 장소: {s['place']}" if s["place"] else "")
+                f = build_event(title, date_iso, start, end, "", note)
+                s["conflicts"] += [conflict_text(c) for c in find_conflicts(f["date"], f["start"], f["end"])]
+                s["event_ids"].append(commit_event(f, "add", None, "회의 분석")["id"])
+            s["cal_status"] = "conflict" if s["conflicts"] else status
+        out.append(s)
+    return out
+
+
+def schedule_status_line(s):
+    return {
+        "calendar": "📅 캘린더에 일정으로 추가했어요",
+        "conflict": "⚠️ 캘린더에 추가했어요 · 겹치는 일정: " + ", ".join(s.get("conflicts", [])),
+        "duplicate": "↔️ 이미 캘린더에 있는 일정이에요",
+        "reference": "참고용 · 캘린더에는 넣지 않았어요",
+        "unverified": "⚠️ 원문에서 근거 문장을 찾지 못해 캘린더에 넣지 않았어요",
+    }.get(s.get("cal_status"), "")
 
 
 def task_status_line(t):
@@ -1224,15 +1299,22 @@ def review_email(rcpt, subject, body, context=""):
         resp = get_client().responses.create(
             model=MODEL,
             instructions="\n".join([
-                "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 메일을 보내기 전에 마지막으로 점검합니다.",
+                "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 메일을 보내기 전에 마지막으로 한 번 점검합니다.",
+                f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일)",
+                date_table(),
                 "아래 다섯 항목을 모두 점검해 항목마다 ok(true/false)와 짧은 comment를 씁니다.",
+                "실제로 잘못 보낼 위험이 있을 때만 false로 하고, 사소하거나 애매하면 ok=true로 둡니다.",
                 "- 받는 사람: [요청/상황]에서 의도한 사람과 [받는 사람] 정보가 맞는지. 요청에 받는 사람 언급이 없으면 ok.",
-                "- 내용 정확성: 본문에 [요청/상황]·[참고 자료]에 없는 날짜·숫자·약속·사실이 들어갔는지. 지어낸 내용이 있으면 false.",
+                "- 내용 정확성: 본문의 날짜·숫자·약속이 [요청/상황]·[이전 대화]·[참고 자료]와 '어긋날' 때만 false.",
+                "  '내일', '금요일', '다음 주 화요일'처럼 요청한 표현을 [날짜표]에 맞는 실제 날짜(예: 11월 7일)로 바꿔 쓴 것은 정상(ok)입니다.",
+                "  요일과 날짜가 날짜표와 맞지 않거나, 요청과 다른 날짜·금액이 들어간 경우만 문제입니다.",
+                "  메일에 흔히 들어가는 인사·마무리 문장, 요청 내용을 정리한 표현은 지어낸 내용이 아닙니다.",
                 "- 빠진 내용: 요청한 내용이 빠졌는지, '첨부'를 언급했는데 실제 첨부가 없는지(이 메일은 첨부를 보낼 수 없음).",
                 "- 말투·맞춤법: 받는 사람에게 맞는 정중한 말투인지, 오탈자가 있는지.",
                 "- 민감 정보: 비밀번호·주민번호·계좌번호 같은 민감 정보가 들어 있는지.",
                 "비교할 자료가 없어 판단할 수 없으면 추측하지 말고 ok=true, comment에 '비교할 자료 없음'이라고 씁니다.",
-                "summary: 김 대리에게 하는 한 문장 결론 (예: '보내도 괜찮아 보여요.' / '요청에 없는 날짜가 있어 확인이 필요해요.').",
+                "summary: 김 대리에게 하는 한 문장 결론. 문제가 없으면 '보내도 괜찮아 보여요.',",
+                "  문제가 있으면 무엇이 왜 문제인지 구체적으로 (예: '요청은 금요일인데 본문에 목요일(11/6)로 적혀 있어요.').",
             ]),
             input=(f"[받는 사람] {who} <{rcpt['email']}>\n\n[요청/상황]\n{context or '(없음)'}\n\n"
                    f"[제목] {subject}\n\n[본문]\n{body}"),
@@ -1293,28 +1375,81 @@ def confirm_and_send(key, to_raw, subject, body, context="", reply_to_id=""):
 # ─────────────────────────────────────────────
 # 캘린더 · 화면 스타일
 # ─────────────────────────────────────────────
+ABLE_TEAL, ABLE_TEAL_DARK = "#0b9ea4", "#087e83"
+_LOGO_MASK = f"url('data:image/png;base64,{ABLE_LOGO_B64}') center/contain no-repeat"
 APP_CSS = [
-    ".able-hero {padding:18px 22px; border-radius:16px; margin-bottom:10px;"
-    " background:linear-gradient(135deg, rgba(62,123,250,.16), rgba(139,92,246,.12));"
-    " border:1px solid rgba(128,128,128,.2);}",
-    ".able-title {font-size:1.65rem; font-weight:700; line-height:1.3;}",
-    ".able-sub {opacity:.75; font-size:.9rem; margin:2px 0 10px;}",
-    ".able-chip {display:inline-block; font-size:.78rem; padding:3px 10px; margin:2px 6px 2px 0;"
-    " border-radius:999px; background:rgba(128,128,128,.16);}",
-    ".able-chip.warn {background:rgba(229,72,77,.2);}",
+    # 브랜드 색 (Streamlit 기본 빨강 → 에이블 청록)
+    f":root {{--able:{ABLE_TEAL}; --able-dark:{ABLE_TEAL_DARK}; --able-soft:rgba(11,158,164,.10);}}",
+    "button[kind='primary'], [data-testid='stBaseButton-primary'] {background:var(--able) !important;"
+    " border-color:var(--able) !important; color:#fff !important;}",
+    "button[kind='primary']:hover, [data-testid='stBaseButton-primary']:hover {background:var(--able-dark) !important;"
+    " border-color:var(--able-dark) !important;}",
+    "button[kind='secondary']:hover, [data-testid='stBaseButton-secondary']:hover {border-color:var(--able) !important;"
+    " color:var(--able-dark) !important;}",
+    "button:focus-visible {box-shadow:0 0 0 3px rgba(11,158,164,.35) !important;}",
+    "[data-baseweb='tab-highlight'] {background-color:var(--able) !important;}",
+    "[data-baseweb='tab'][aria-selected='true'] p {color:var(--able-dark) !important; font-weight:600;}",
+    "[data-baseweb='tab']:hover p {color:var(--able-dark) !important;}",
+    "label[data-baseweb='radio']:has(input:checked) > div:first-child {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "label[data-baseweb='checkbox']:has(input:checked) > span {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "label[data-baseweb='checkbox']:has(input[role='switch']:checked) > div {background-color:var(--able) !important;}",
+    # (새 버전 Streamlit 구조) 라디오·체크박스·토글
+    "[data-testid='stRadioOption'][data-selected='true'] > div > div:first-child {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "label[data-selected='true']:not([data-testid='stRadioOption']) > span + div {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "input:focus, textarea:focus, [data-baseweb='select'] > div:focus-within {border-color:var(--able) !important;}",
+    "a {color:var(--able-dark);}",
+    # 로고 마크 (로고 색을 그대로 씀)
+    f".able-mark {{display:inline-block; width:28px; height:28px; flex:0 0 auto; background:var(--able);"
+    f" -webkit-mask:{_LOGO_MASK}; mask:{_LOGO_MASK};}}",
+    ".able-mark.big {width:40px; height:40px;}",
+    ".able-side-brand {display:flex; align-items:center; gap:10px; margin:0 0 12px;}",
+    ".able-side-brand b {font-size:1.25rem;}",
+    # 헤더: 한 줄 (로고 · 제목/날짜 · 오늘 요약 칩)
+    ".able-hero {display:flex; align-items:center; gap:14px; flex-wrap:wrap; padding:12px 18px; border-radius:14px;"
+    " margin-bottom:6px; background:var(--able-soft); border:1px solid rgba(11,158,164,.22);}",
+    ".able-hero-text {flex:1 1 220px; min-width:0;}",
+    ".able-chips {display:flex; flex-wrap:wrap; gap:6px;}",
+    ".able-title {font-size:1.3rem; font-weight:700; line-height:1.25;}",
+    ".able-sub {opacity:.72; font-size:.85rem; margin-top:1px;}",
+    ".able-chip {display:inline-block; font-size:.78rem; padding:3px 10px; border-radius:999px;"
+    " background:rgba(128,128,128,.10); border:1px solid rgba(11,158,164,.25); white-space:nowrap;}",
+    ".able-chip.warn {background:rgba(229,72,77,.14); border-color:rgba(229,72,77,.35);}",
+    # 대시보드 오늘 요약 카드
+    ".able-cards {display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:10px; margin:4px 0 12px;}",
+    "@media (max-width:900px) {.able-cards {grid-template-columns:repeat(2, minmax(0,1fr));}}",
+    ".able-card {border:1px solid rgba(128,128,128,.22); border-left:4px solid var(--c, var(--able)); border-radius:10px;"
+    " padding:10px 12px; min-width:0; background:rgba(128,128,128,.04);}",
+    ".able-card .k {font-size:.76rem; opacity:.7; letter-spacing:.02em;}",
+    ".able-card .v {font-size:1.05rem; font-weight:700; margin-top:2px; overflow:hidden; text-overflow:ellipsis;"
+    " white-space:nowrap;}",
+    ".able-card .m {font-size:.8rem; opacity:.8; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}",
+    ".able-card .big {font-size:1.6rem; font-weight:700; line-height:1.15; font-variant-numeric:tabular-nums;}",
     ".able-badge {display:inline-block; padding:1px 8px; border-radius:999px; font-size:.72rem;"
     " font-weight:600; margin-right:4px; vertical-align:1px;}",
     ".able-meta {opacity:.75; font-size:.83rem;}",
     ".able-warn {color:#e5484d; font-size:.8rem;}",
-    ".able-cal .pill {display:block; font-size:.7rem; line-height:1.35; margin-top:2px; padding:1px 4px;"
-    " border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}",
+    ".able-cal .pill {display:block; font-size:.7rem; line-height:1.3; margin-top:3px; padding:2px 4px;"
+    " border-radius:4px;}",
+    ".able-cal .pill .tm {display:block; font-size:.64rem; opacity:.75; font-variant-numeric:tabular-nums;}",
+    ".able-cal .pill .t {display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;"
+    " word-break:keep-all; overflow-wrap:anywhere;}",
     ".able-cal .pill.done {text-decoration:line-through; opacity:.45;}",
     ".able-cal .more {font-size:.68rem; opacity:.6; margin-top:2px;}",
     ".legend {margin-top:4px;} .legend span {font-size:.74rem; margin-right:10px; white-space:nowrap;}",
     ".cal-head {text-align:center; font-size:.8rem; font-weight:600; opacity:.8; padding-bottom:2px;}",
-    ".cal-cell {height:58px; overflow:hidden; margin-top:-10px;}",
+    ".cal-cell {min-height:70px; overflow:hidden; margin-top:-12px; padding-bottom:4px;"
+    " border-bottom:1px solid rgba(128,128,128,.14);}",
     ".cal-cell.other {opacity:.35;}",
-    ".st-key-able_cal button {padding:0 4px; min-height:32px;}",
+    ".st-key-able_cal button {padding:0 4px; min-height:30px; justify-content:flex-start;}",
+    ".st-key-able_cal button[kind='secondary'], .st-key-able_cal [data-testid='stBaseButton-secondary'] {"
+    " background:transparent !important; border-color:transparent !important; box-shadow:none !important;}",
+    ".st-key-able_cal button[kind='secondary']:hover, .st-key-able_cal [data-testid='stBaseButton-secondary']:hover {"
+    " background:var(--able-soft) !important;}",
+    ".st-key-able_cal button p {font-weight:600; font-variant-numeric:tabular-nums;}",
     ".st-key-able_cal [data-testid='stHorizontalBlock'] {gap:.35rem;}",
     "[class*='st-key-act_'] {gap:.3rem;}",
     "[class*='st-key-act_'] button {min-height:28px; padding:2px 6px;}",
@@ -1354,10 +1489,16 @@ def items_by_date():
 
 
 def pill_html(kind, label, color):
-    t = html.escape(label)
+    # 시간(있으면)은 작은 글씨 한 줄, 제목은 두 줄까지 보여 줌 · 마우스를 올리면 전체 제목
+    tm, rest = "", label
+    m = re.match(r"^(\d{1,2}:\d{2})\s+(.*)$", label)
+    if m:
+        tm, rest = m.group(1), m.group(2)
+    full = html.escape(label)
     line = "solid" if kind == "event" else "dashed"            # 할 일 마감은 점선
-    return (f'<span class="pill {kind}" title="{t}" '
-            f'style="border-left:3px {line} {color}; background:{color}24">{t}</span>')
+    return (f'<span class="pill {kind}" title="{full}" '
+            f'style="border-left:3px {line} {color}; background:{color}24">'
+            + (f'<span class="tm">{tm}</span>' if tm else "") + f'<span class="t">{html.escape(rest)}</span></span>')
 
 
 def legend_html():
@@ -1712,6 +1853,43 @@ def render_calendar(year, month):
     st.caption("날짜를 누르면 그 날 일정을 보고 추가·수정·삭제할 수 있어요.")
 
 
+def dashboard_cards_html(undone, overdue, due_this_week, today_events):
+    # 대시보드 맨 위 '오늘 한눈에' 카드: 다음 일정 · 가장 급한 마감 · 남은 할 일 · 오늘 일정/충돌
+    now_hm = dt.datetime.now(KST).strftime("%H:%M")
+    upcoming = sorted([e for e in data["events"] if (d := parse_date(e["date"]))
+                       and (d > today or (d == today and (e["end"] or e["start"] or "23:59") >= now_hm))],
+                      key=lambda e: (e["date"], e["start"] or "00:00"))
+    dues = sorted([t for t in undone if parse_date(t["due"])], key=lambda t: (t["due"], PRIORITY_ORDER[t["priority"]]))
+    esc = html.escape
+
+    def card(key, value, meta, color, big=False):
+        v = f'<div class="big">{value}</div>' if big else f'<div class="v" title="{esc(value)}">{esc(value)}</div>'
+        return (f'<div class="able-card" style="--c:{color}"><div class="k">{key}</div>{v}'
+                f'<div class="m" title="{esc(meta)}">{esc(meta)}</div></div>')
+
+    if upcoming:
+        e = upcoming[0]
+        d = parse_date(e["date"])
+        when = ("오늘" if d == today else "내일" if (d - today).days == 1 else fmt_date(d)) + " " + event_time_text(e)
+        c1 = card("다음 일정", e["title"], when, ev_color(e))
+    else:
+        c1 = card("다음 일정", "예정된 일정 없음", "캘린더에서 날짜를 눌러 추가해요", "#94a3b8")
+    if dues:
+        t = dues[0]
+        d = parse_date(t["due"])
+        color = "#e5484d" if d <= today + dt.timedelta(days=1) else "#d97706" if (d - today).days <= 3 else "#2563eb"
+        c2 = card("가장 급한 마감", t["title"], f"{d_day(d)} · {fmt_date(d)} · {t['priority']}", color)
+    else:
+        c2 = card("가장 급한 마감", "마감 있는 할 일 없음", f"기한 없는 할 일 {len(undone)}건", "#94a3b8")
+    c3 = card("남은 할 일", f"{len(undone)}건",
+              (f"기한 지남 {len(overdue)}건 · " if overdue else "") + f"이번 주 마감 {len(due_this_week)}건",
+              "#e5484d" if overdue else ABLE_TEAL, big=True)
+    ov = count_overlaps()
+    c4 = card("오늘 일정", f"{len(today_events)}건", f"⚠️ 겹치는 일정 {ov}건" if ov else "겹치는 일정 없음",
+              "#e5484d" if ov else ABLE_TEAL, big=True)
+    return f'<div class="able-cards">{c1}{c2}{c3}{c4}</div>'
+
+
 def count_overlaps():
     n = 0
     for e in data["events"]:
@@ -1906,37 +2084,557 @@ def _decide_cb(choice):
 
 
 def render_pending_event():
-    # 일정 충돌 → 사용자 승인: 대체 시간 선택 / 원래 시간으로 등록 / 취소
+    from datetime import datetime, date, time
+
+    # 날짜·시간 비교용 변환 함수
+    def to_date(value):
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+
+        return date.fromisoformat(str(value).strip()[:10])
+
+    def to_time(value):
+        if isinstance(value, datetime):
+            return value.time()
+        if isinstance(value, time):
+            return value
+
+        # "16:10", "16:10:00" 형식 지원
+        return time.fromisoformat(str(value).strip())
+
     p = st.session_state.get("pending_event")
     if not p:
         return
-    f = p["fields"]
-    conflicts = find_conflicts(f["date"], f["start"], f["end"], p["event_id"])
-    with st.container(border=True):
-        what = "수정" if p["mode"] == "edit" else "추가"
-        st.warning(f"⚠️ 일정 충돌 감지 — {what}하려는 '{f['title']}' "
-                   f"({fmt_date(parse_date(f['date']))} {event_time_text(f)}, {f['category']})")
-        if conflicts:
-            st.markdown("<br>".join(f"{badge(c['category'], ev_color(c))}{html.escape(c['title'])} · "
-                                    f"{event_time_text(c)} — <b>{c['reason']}</b>" for c in conflicts),
-                        unsafe_allow_html=True)
-            st.caption("기존 일정과 겹치거나 앞뒤 간격이 10분 미만이에요. 어떻게 할까요?")
-        else:
-            st.caption("지금은 겹치는 일정이 없어졌어요. 원래 시간으로 등록할 수 있어요.")
-        sugg = p["suggestions"]
-        if sugg:
-            st.markdown("**대체 시간 추천** · 업무 시간 9~18시, 점심 12~13시 제외, 앞뒤 10분 여유")
-            cols = st.columns(len(sugg))
-            for i, s in enumerate(sugg):
-                ok = is_free(s["date"], parse_time(s["start"]), parse_time(s["end"]), p["event_id"])
-                cols[i].button(f"{i + 1}. {slot_text(s)}", key=f"pe_s{i}", on_click=_decide_cb, args=(str(i + 1),),
-                               use_container_width=True, disabled=not ok, type="primary" if i == 0 else "secondary")
-        else:
-            st.caption("2주 안에서 충돌하지 않는 업무 시간을 찾지 못했어요.")
-        a, b, _ = st.columns([1.4, 1, 3])
-        a.button("원래 시간으로 등록", key="pe_orig", on_click=_decide_cb, args=("original",), use_container_width=True)
-        b.button("취소", key="pe_cancel", on_click=_decide_cb, args=("cancel",), use_container_width=True)
 
+    f = p["fields"]
+    event_id = p.get("event_id")
+    what = "수정" if p.get("mode") == "edit" else "추가"
+
+    conflicts = find_conflicts(
+        f["date"],
+        f["start"],
+        f["end"],
+        event_id,
+    )
+
+    original_date = to_date(f["date"])
+    original_start = datetime.combine(
+        original_date,
+        to_time(f["start"]),
+    )
+
+    suggestions = []
+
+    for original_index, slot in enumerate(p.get("suggestions") or []):
+        slot_date = to_date(slot["date"])
+        slot_start = datetime.combine(
+            slot_date,
+            to_time(slot["start"]),
+        )
+
+        # 기존 충돌 검사 함수의 입력 방식 유지
+        available = is_free(
+            slot["date"],
+            parse_time(slot["start"]),
+            parse_time(slot["end"]),
+            event_id,
+        )
+
+        suggestions.append({
+            "slot": slot,
+            # 화면 정렬 후에도 원래 추천 번호를 콜백에 전달
+            "original_index": original_index,
+            "available": available,
+            "same_day": slot_date == original_date,
+            "difference_minutes": int(
+                (slot_start - original_start).total_seconds() / 60
+            ),
+        })
+
+    # 선택 가능 → 같은 날 → 원래 시작 시간과 가까운 순
+    suggestions.sort(
+        key=lambda item: (
+            not item["available"],
+            not item["same_day"],
+            abs(item["difference_minutes"]),
+            item["original_index"],
+        )
+    )
+
+    with st.container(border=True):
+        event_description = (
+            f"{what}하려는 '{f['title']}' "
+            f"({fmt_date(original_date)} "
+            f"{event_time_text(f)}, {f['category']})"
+        )
+
+        if conflicts:
+            st.warning(
+                f"⚠️ 일정 충돌 감지 — {event_description}"
+            )
+
+            st.markdown("**충돌하는 기존 일정**")
+
+            conflict_lines = []
+
+            for conflict in conflicts:
+                conflict_lines.append(
+                    f"{badge(conflict['category'], ev_color(conflict))}"
+                    f"{html.escape(str(conflict['title']))} · "
+                    f"{html.escape(str(event_time_text(conflict)))}"
+                    f" — <b>"
+                    f"{html.escape(str(conflict.get('reason', '일정 충돌')))}"
+                    f"</b>"
+                )
+
+            st.markdown(
+                "<br>".join(conflict_lines),
+                unsafe_allow_html=True,
+            )
+
+            st.caption(
+                "기존 일정과 겹치거나 앞뒤 간격이 10분 미만이에요. "
+                "대체 시간을 선택하거나 원래 시간으로 등록할 수 있어요."
+            )
+
+            st.markdown("**대체 시간 추천**")
+
+            with st.expander("추천 기준 보기", expanded=False):
+                st.write(
+                    "업무 시간 09:00–18:00 · "
+                    "점심시간 12:00–13:00 제외 · "
+                    "일정 앞뒤 10분 여유"
+                )
+
+                st.caption(
+                    "선택 가능한 시간을 우선하고, 같은 날의 시간부터 "
+                    "원래 시작 시간과 가까운 순서로 표시해요."
+                )
+
+            if suggestions:
+                available_count = sum(
+                    bool(item["available"])
+                    for item in suggestions
+                )
+
+                if available_count == 0:
+                    st.info(
+                        "기존 추천 시간에도 충돌이 생겼어요. "
+                        "취소 후 날짜나 시간을 바꿔 다시 시도해 주세요."
+                    )
+
+                # 한 줄에 최대 3개의 추천 표시
+                for row_start in range(0, len(suggestions), 3):
+                    row = suggestions[row_start:row_start + 3]
+                    cols = st.columns(len(row))
+
+                    for offset, item in enumerate(row):
+                        display_index = row_start + offset
+                        slot = item["slot"]
+                        available = item["available"]
+
+                        with cols[offset]:
+                            with st.container(border=True):
+                                if available and display_index == 0:
+                                    st.markdown("**⭐ 우선 추천**")
+                                else:
+                                    st.markdown(
+                                        f"**대체 시간 {display_index + 1}**"
+                                    )
+
+                                st.text(slot_text(slot))
+
+                                if available:
+                                    if item["same_day"]:
+                                        delta = item["difference_minutes"]
+
+                                        if delta == 0:
+                                            reason = (
+                                                "원래 시작 시간과 같아요."
+                                            )
+                                        else:
+                                            direction = (
+                                                "늦춘"
+                                                if delta > 0
+                                                else "앞당긴"
+                                            )
+
+                                            hours, minutes = divmod(
+                                                abs(delta), 60
+                                            )
+
+                                            duration_parts = []
+
+                                            if hours:
+                                                duration_parts.append(
+                                                    f"{hours}시간"
+                                                )
+
+                                            if minutes:
+                                                duration_parts.append(
+                                                    f"{minutes}분"
+                                                )
+
+                                            duration_text = " ".join(
+                                                duration_parts
+                                            )
+
+                                            reason = (
+                                                "원래 일정과 같은 날이에요. "
+                                                f"시작을 {duration_text} "
+                                                f"{direction} 시간이에요."
+                                            )
+                                    else:
+                                        reason = (
+                                            "다른 날짜에 확보할 수 있는 "
+                                            "대체 시간이에요."
+                                        )
+
+                                    st.caption(reason)
+                                    st.caption("✅ 현재 충돌 없음")
+
+                                else:
+                                    st.caption(
+                                        "⛔ 다른 일정과 충돌해 "
+                                        "선택할 수 없어요."
+                                    )
+
+                                st.button(
+                                    "이 시간으로 등록",
+                                    key=(
+                                        f"pe_s{item['original_index']}"
+                                    ),
+                                    on_click=_decide_cb,
+                                    args=(
+                                        str(
+                                            item["original_index"] + 1
+                                        ),
+                                    ),
+                                    use_container_width=True,
+                                    disabled=not available,
+                                    type=(
+                                        "primary"
+                                        if available and display_index == 0
+                                        else "secondary"
+                                    ),
+                                )
+
+            else:
+                st.info(
+                    "2주 안에서 조건에 맞는 업무 시간을 "
+                    "찾지 못했어요. "
+                    "취소 후 날짜나 시간을 바꿔 다시 시도해 주세요."
+                )
+
+        else:
+            st.success("✅ 일정 충돌이 해소됐어요.")
+            st.write(event_description)
+            st.caption("원래 시간으로 등록할 수 있어요.")
+
+        st.divider()
+
+        a, b = st.columns([2, 1])
+
+        a.button(
+            (
+                "충돌을 감수하고 원래 시간으로 등록"
+                if conflicts
+                else "원래 시간으로 등록"
+            ),
+            key="pe_orig",
+            on_click=_decide_cb,
+            args=("original",),
+            use_container_width=True,
+            type="secondary" if conflicts else "primary",
+        )
+
+        b.button(
+            "취소",
+            key="pe_cancel",
+            on_click=_decide_cb,
+            args=("cancel",),
+            use_container_width=True,
+        )
+
+
+# ─────────────────────────────────────────────
+# 퇴근 10분 전 내일 브리핑
+# 기존 "# 화면" 바로 위에 이 블록 전체 추가
+# ─────────────────────────────────────────────
+
+def render_leave_briefing_settings():
+    # 사이드바 ⚙️ 설정: 퇴근 브리핑 켜기·시간·미리보기·초기화 + 테스트 상태 (본문 첫 화면을 가리지 않게)
+    import datetime as briefing_dt
+    from zoneinfo import ZoneInfo
+
+    settings = st.session_state.data.setdefault("settings", {})
+    seoul = ZoneInfo("Asia/Seoul")
+    now = briefing_dt.datetime.now(seoul)
+    current_iso = now.date().isoformat()
+    settings.setdefault("leave_briefing_enabled", True)
+    settings.setdefault("leave_briefing_time", "18:00")
+    settings.setdefault("leave_briefing_ack_date", "")
+    try:
+        saved_time = briefing_dt.time.fromisoformat(settings["leave_briefing_time"])
+    except (TypeError, ValueError):
+        saved_time = briefing_dt.time(18, 0)
+    st.session_state.setdefault("lb_enabled_widget", settings["leave_briefing_enabled"])
+    st.session_state.setdefault("lb_time_widget", saved_time)
+
+    with st.expander("⚙️ 설정 · 퇴근 브리핑", expanded=False):
+        enabled = st.checkbox("퇴근 10분 전 내일 브리핑 받기", key="lb_enabled_widget")
+        leave_time = st.time_input("퇴근 시간 · 24시간 기준", key="lb_time_widget", step=60)
+        st.caption("오후 6시는 18:00이에요. 앱이 열려 있는 동안 30초마다 확인해요.")
+        left, right = st.columns(2)
+        preview_clicked = left.button("미리보기", key="lb_preview_button", use_container_width=True)
+        reset_clicked = right.button("초기화", key="lb_reset_button", use_container_width=True,
+                                     help="오늘 알림을 다시 받을 수 있게 해요")
+        show_test = st.toggle("🛠️ 테스트 상태 보기", key="lb_test_toggle")
+
+        leave_text = leave_time.strftime("%H:%M")
+        if (settings["leave_briefing_enabled"] != enabled or settings["leave_briefing_time"] != leave_text
+                or reset_clicked):
+            settings["leave_briefing_enabled"] = enabled
+            settings["leave_briefing_time"] = leave_text
+            settings["leave_briefing_ack_date"] = ""
+            st.session_state.pop("lb_toast_date", None)
+            save_data()
+        if preview_clicked:
+            st.session_state["lb_preview_date"] = current_iso
+
+        if show_test:
+            leave_at = briefing_dt.datetime.combine(now.date(), leave_time, tzinfo=seoul)
+            notification_at = leave_at - briefing_dt.timedelta(minutes=10)
+            acknowledged = settings["leave_briefing_ack_date"] == current_iso
+            auto_show = enabled and now >= notification_at and not acknowledged
+            st.text(f"현재 한국 시간: {now:%Y-%m-%d %H:%M:%S}")
+            st.text(f"설정한 퇴근 시간: {leave_at:%Y-%m-%d %H:%M}")
+            st.text(f"알림 시작 시간: {notification_at:%Y-%m-%d %H:%M}")
+            st.text(f"알림 켜짐: {'예' if enabled else '아니요'}")
+            st.text(f"오늘 확인 완료: {'예' if acknowledged else '아니요'}")
+            st.text(f"자동 표시 조건 충족: {'예' if auto_show else '아니요'}")
+            if not enabled:
+                st.info("브리핑 받기를 켜주세요.")
+            elif acknowledged:
+                st.info("오늘 브리핑을 확인했어요. 다시 테스트하려면 '초기화'를 누르세요.")
+            elif now < notification_at:
+                minutes, seconds = divmod(int((notification_at - now).total_seconds()), 60)
+                st.info(f"알림 시작까지 {minutes}분 {seconds}초 남았어요.")
+            else:
+                st.success("자동 브리핑 표시 조건이 충족됐어요.")
+
+
+@st.fragment(run_every="30s")
+def render_leave_briefing():
+    import datetime as briefing_dt
+    from zoneinfo import ZoneInfo
+
+    app_data = st.session_state.data
+    settings = app_data.setdefault("settings", {})
+    seoul = ZoneInfo("Asia/Seoul")
+
+    now = briefing_dt.datetime.now(seoul)
+    current_date = now.date()
+    next_date = current_date + briefing_dt.timedelta(days=1)
+
+    current_iso = current_date.isoformat()
+    next_iso = next_date.isoformat()
+    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
+
+    settings.setdefault("leave_briefing_enabled", True)
+    settings.setdefault("leave_briefing_time", "18:00")
+    settings.setdefault("leave_briefing_ack_date", "")
+
+    try:
+        saved_time = briefing_dt.time.fromisoformat(
+            settings["leave_briefing_time"]
+        )
+    except (TypeError, ValueError):
+        saved_time = briefing_dt.time(18, 0)
+
+    st.session_state.setdefault(
+        "lb_enabled_widget",
+        settings["leave_briefing_enabled"],
+    )
+    st.session_state.setdefault("lb_time_widget", saved_time)
+
+    # 설정 값은 사이드바 ⚙️ 설정(render_leave_briefing_settings)에서 바꾸고, 여기서는 읽기만 함
+    enabled = bool(settings["leave_briefing_enabled"])
+    leave_time = saved_time
+    leave_text = leave_time.strftime("%H:%M")
+    leave_at = briefing_dt.datetime.combine(current_date, leave_time, tzinfo=seoul)
+    notification_at = leave_at - briefing_dt.timedelta(minutes=10)
+    acknowledged = settings["leave_briefing_ack_date"] == current_iso
+    auto_show = enabled and now >= notification_at and not acknowledged
+    preview_show = st.session_state.get("lb_preview_date") == current_iso
+
+    if not (auto_show or preview_show):
+        return
+
+    if (
+        auto_show
+        and st.session_state.get("lb_toast_date") != current_iso
+    ):
+        st.toast(
+            "김 대리님, 퇴근 전 내일 일정을 확인하세요.",
+            icon="🌙",
+        )
+        st.session_state["lb_toast_date"] = current_iso
+
+    # 기존 일정 데이터 사용
+    next_events = sorted(
+        [
+            event
+            for event in app_data.get("events", [])
+            if event.get("date") == next_iso
+        ],
+        key=lambda event: event.get("start") or "00:00",
+    )
+
+    # 기존 할 일 데이터 사용: 마감일 due, 완료 여부 done
+    next_todos = sorted(
+        [
+            todo
+            for todo in app_data.get("todos", [])
+            if todo.get("due") == next_iso
+            and not todo.get("done", False)
+        ],
+        key=lambda todo: (
+            PRIORITY_ORDER.get(todo.get("priority", "보통"), 1),
+            todo.get("title", ""),
+        ),
+    )
+
+    # 기존 앱의 시간 겹침·간격 부족 판단 로직 사용
+    conflict_pairs = []
+
+    for index, first in enumerate(next_events):
+        first_span = event_span(first)
+        if first_span is None:
+            continue
+
+        for second in next_events[index + 1:]:
+            second_span = event_span(second)
+            if second_span is None:
+                continue
+
+            reason = conflict_reason(first_span, second_span)
+            if reason:
+                conflict_pairs.append((first, second, reason))
+
+    next_label = (
+        f"{next_date.month}/{next_date.day}"
+        f"({weekdays[next_date.weekday()]})"
+    )
+
+    with st.container(border=True):
+        st.subheader("🌙 김 대리님의 내일 브리핑")
+        st.caption(
+            f"내일 {next_label} · "
+            f"퇴근 시간 {leave_text} · 한국 시간 기준"
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("내일 일정", f"{len(next_events)}건")
+        c2.metric("내일 마감", f"{len(next_todos)}건")
+        c3.metric("일정 충돌·간격 부족", f"{len(conflict_pairs)}건")
+
+        st.markdown("**📅 내일 일정**")
+
+        if next_events:
+            for event in next_events:
+                st.text(
+                    f"• {event_time_text(event)} | "
+                    f"{event.get('title', '제목 없음')}"
+                )
+
+                category = event.get("category", "")
+                if category:
+                    st.caption(f"분류: {category}")
+
+                note = event.get("note", "")
+                if note:
+                    with st.expander(
+                        f"📝 {event.get('title', '일정')} 메모"
+                    ):
+                        st.text(note)
+        else:
+            st.caption("내일 등록된 일정이 없어요.")
+
+        st.markdown("**⏰ 내일 마감인 미완료 업무**")
+
+        if next_todos:
+            for todo in next_todos:
+                priority = todo.get("priority", "보통")
+
+                st.text(
+                    f"• [{priority}] "
+                    f"{todo.get('title', '제목 없음')}"
+                )
+
+                detail = todo.get("detail", "")
+                if detail:
+                    with st.expander(
+                        f"📋 {todo.get('title', '업무')} 상세"
+                    ):
+                        st.text(detail)
+
+            st.caption(
+                "할 일에는 마감 날짜만 저장되어 있어요. "
+                "구체적인 마감 시간은 업무 상세 내용을 확인해 주세요."
+            )
+        else:
+            st.caption("내일 마감인 미완료 업무가 없어요.")
+
+        if conflict_pairs:
+            st.warning(
+                "내일 일정이 겹치거나 일정 사이 여유가 부족해요."
+            )
+
+            for first, second, reason in conflict_pairs:
+                st.text(
+                    f"• {first.get('title', '제목 없음')} "
+                    f"({event_time_text(first)})"
+                    f" ↔ {second.get('title', '제목 없음')} "
+                    f"({event_time_text(second)})"
+                    f" — {reason}"
+                )
+
+        if not next_events and not next_todos:
+            st.success(
+                "내일 등록된 일정과 마감 업무가 없어요. "
+                "편안하게 하루를 마무리하세요."
+            )
+
+        st.divider()
+
+        def acknowledge_briefing():
+            ack_date = (
+                briefing_dt.datetime.now(seoul).date().isoformat()
+            )
+
+            st.session_state.data["settings"][
+                "leave_briefing_ack_date"
+            ] = ack_date
+
+            st.session_state.pop("lb_preview_date", None)
+            save_data()
+
+        st.button(
+            "✅ 확인 완료 · 오늘 브리핑 닫기",
+            key="lb_ack_button",
+            on_click=acknowledge_briefing,
+            use_container_width=True,
+            type="primary",
+        )
+
+
+SIDE_MAIN = st.sidebar.container()          # 사이드바 위쪽: 새 채팅·대화 기록·요약
+SIDE_SETTINGS = st.sidebar.container()      # 사이드바 맨 아래: ⚙️ 설정
+with SIDE_SETTINGS:
+    render_leave_briefing_settings()
 
 # ─────────────────────────────────────────────
 # 화면
@@ -1955,10 +2653,13 @@ _ov = count_overlaps()
 if _ov:
     _chip_html += f'<span class="able-chip warn">충돌 일정 {_ov}건</span>'
 st.markdown(
-    f'<div class="able-hero"><div class="able-title">🤖 AI 개인비서 에이블</div>'
-    f'<div class="able-sub">김 대리님의 업무를 돕는 음성 AI 비서 · {today.year}년 {today.month}월 {today.day}일 '
-    f'{WEEKDAYS[today.weekday()]}요일</div>{_chip_html}</div>',
+    f'<div class="able-hero"><span class="able-mark big"></span>'
+    f'<div class="able-hero-text"><div class="able-title">AI 개인비서 에이블</div>'
+    f'<div class="able-sub">{today.month}월 {today.day}일 {WEEKDAYS[today.weekday()]}요일 · 김 대리님의 업무 비서</div></div>'
+    f'<div class="able-chips">{_chip_html}</div></div>',
     unsafe_allow_html=True)
+
+render_leave_briefing()      # 퇴근 10분 전(또는 미리보기)에만 헤더 아래에 내일 브리핑 카드가 나타남
 
 render_pending_event()
 render_pending_delete()
@@ -1973,11 +2674,7 @@ with tab_dash:
     overdue = [t for t in undone if (d := parse_date(t["due"])) and d < today]
     today_events = [e for e in data["events"] if parse_date(e["date"]) == today]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("오늘 일정", f"{len(today_events)}건")
-    c2.metric("남은 할 일", f"{len(undone)}건",
-              delta=f"기한 지남 {len(overdue)}건" if overdue else None, delta_color="inverse")
-    c3.metric("이번 주 마감", f"{len(due_this_week)}건")
+    st.markdown(dashboard_cards_html(undone, overdue, due_this_week, today_events), unsafe_allow_html=True)
 
     with st.expander("⚙️ 일정 종류 · 할 일 분류 직접 정하기"):
         render_type_settings()
@@ -2397,7 +3094,9 @@ def system_prompt():
         "- 메일을 보내 달라고 하면 메일을 쓰고 send_email까지 반드시 호출합니다. 보낼지 다시 묻지 않습니다.",
         "- send_email 결과가 success면 '메일을 보냈습니다'라고 받는 사람과 제목을 알려 줍니다.",
         "- needs_confirmation이면 아직 보내지 않은 것입니다. AI 확인에서 나온 확인할 점(issues)을 짧게 말하고",
-        "  '그래도 보낼까요?'라고 묻습니다. 김 대리가 '보내줘/그래도 보내'라고 하면 confirm_pending_email(send),",
+        "  '그래도 보낼까요?'라고 한 번만 묻습니다. 같은 답변 안에서 send_email을 다시 부르지 않습니다.",
+        "  김 대리가 '보내줘/그래도 보내'라고 하면 confirm_pending_email(send)로 바로 보냅니다(다시 확인하지 않음).",
+        "  내용을 고쳐 달라고 하면 고친 내용으로 send_email을 부르면 확인 없이 바로 발송됩니다.",
         "  '보내지 마/취소'라고 하면 confirm_pending_email(cancel)을 사용합니다.",
         "- failed면 이유를 알리고 필요한 정보를 묻습니다.",
         "- 도구를 사용한 뒤에는 무엇을 했는지 짧게 보고합니다.",
@@ -2490,15 +3189,47 @@ def save_turn(chat, turn):
     return chat
 
 
-def prepare_email(args, question, via="text"):
-    # send_email 도구: 받는 사람 확인 → AI 점검 → 문제가 없으면 발송
-    #   음성 요청은 AI 확인에서 문제가 없으면 바로 발송, 글 요청은 설정에 따라 김 대리 확인 후 발송
+def pending_mail_of(chat):
+    # 이 대화에서 '보내기 전 확인'을 이미 마치고 김 대리 대답을 기다리는 메일
+    for t in reversed(chat["turns"] if chat else []):
+        if t.get("mail") and t["mail"]["status"] == "pending":
+            return t["mail"], t
+    return None, None
+
+
+def prepare_email(args, question, via="text", chat=None, reviewed=None):
+    # send_email 도구: 받는 사람 확인 → AI 점검(메일 한 통에 딱 한 번) → 발송
+    #   · 음성 요청은 AI 확인에서 문제가 없으면 바로 발송, 글 요청은 설정에 따라 김 대리 확인 후 발송
+    #   · 이미 한 번 확인한 메일(이번 답변 안에서 다시 호출 / 확인 대기 중에 '보내줘')은 다시 확인하지 않음
     rcpt, err = resolve_recipient(args["to"])
     if err:
         return {"status": "failed", "error": err}, None, {"ok": False, "text": f"📧 메일 준비 실패 ({err})"}
-    ctx = f"[김 대리 요청]\n{question}\n\n[참고 자료]\n{brief_context()}"
-    rv = review_email(rcpt, args["subject"], args["body"], ctx)
     who = f"{rcpt['name']} <{rcpt['email']}>" if rcpt["name"] else rcpt["email"]
+
+    if reviewed is not None:
+        # 같은 답변 안에서 send_email을 또 부른 경우: 다시 확인하지 않고, 김 대리 대답을 기다리게 함
+        reviewed.update(to=rcpt["email"], name=rcpt["name"], subject=args["subject"], body=args["body"])
+        return ({"status": "needs_confirmation", "already_reviewed": True, "to": rcpt["email"],
+                 "message": "이 메일은 방금 확인을 마쳤습니다. 다시 확인하거나 send_email을 또 부르지 말고, "
+                            "확인할 점을 한 번만 말한 뒤 '그래도 보낼까요?'라고 물어보세요."}, None, None)
+
+    prior, prior_turn = pending_mail_of(chat)
+    if prior is not None and prior["to"].lower() == rcpt["email"].lower():
+        # 앞 답변에서 이미 확인을 마친 메일(같은 받는 사람): 김 대리가 보내라고 했으므로 다시 확인하지 않고 바로 발송
+        sr = send_email(rcpt["email"], args["subject"], args["body"])
+        if sr["status"] != "success":
+            return sr, None, {"ok": False, "text": f"📧 메일 발송 실패 ({sr['error']})"}
+        prior.update(status="sent", to=rcpt["email"], name=rcpt["name"], subject=args["subject"], body=args["body"])
+        save_data()
+        return ({"status": "success", "to": rcpt["email"], "subject": args["subject"],
+                 "note": "발송 전 확인은 앞에서 한 번 마쳤습니다."}, None,
+                {"ok": True, "text": f"📧 메일 발송 완료 → {who} · '{args['subject']}'"})
+
+    history = ""
+    if chat:
+        history = "\n".join(f"김 대리: {t['q']}\n에이블: {t['a'][:300]}" for t in chat["turns"][-4:])
+    ctx = (f"[김 대리 요청]\n{question}\n\n[이전 대화]\n{history or '(없음)'}\n\n[참고 자료]\n{brief_context()}")
+    rv = review_email(rcpt, args["subject"], args["body"], ctx)
     if rv["ok"] and (via == "voice" or not data["settings"].get("confirm_before_send", True)):
         sr = send_email(rcpt["email"], args["subject"], args["body"])
         if sr["status"] == "success":
@@ -2562,6 +3293,7 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
 
     client = get_client()
     actions, mail = [], None
+    sent_mail = None                     # 이번 답변에서 이미 보낸 메일 (같은 메일을 두 번 보내지 않게)
     asked_delete = False                 # 이번 답변에서 삭제 대상을 보여 줬으면 같은 답변에서는 삭제 금지
     for _ in range(5):  # 도구 호출은 최대 5회 반복
         resp = client.responses.create(model=MODEL, instructions=instructions, input=inputs, tools=TOOLS)
@@ -2571,9 +3303,20 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
         inputs += resp.output
         for c in calls:
             args = json.loads(c.arguments)
+            if c.name == "send_email" and sent_mail:
+                inputs.append({"type": "function_call_output", "call_id": c.call_id,
+                               "output": json.dumps({"status": "success", "already_sent": True, **sent_mail},
+                                                    ensure_ascii=False)})
+                continue
             if c.name == "send_email":
-                result, new_mail, act = prepare_email(args, question, via)
+                result, new_mail, act = prepare_email(args, question, via, chat, mail)
                 mail = new_mail or mail
+                if result.get("status") == "success":
+                    sent_mail = {"to": result["to"], "subject": args["subject"]}
+                if act is None:                  # 이미 확인한 메일을 다시 부른 경우: 화면에 확인 알림을 또 띄우지 않음
+                    inputs.append({"type": "function_call_output", "call_id": c.call_id,
+                                   "output": json.dumps(result, ensure_ascii=False)})
+                    continue
             elif c.name == "confirm_pending_email":
                 result, act = confirm_pending_mail(chat, args["action"], mail)
             elif c.name == "decide_pending_delete" and asked_delete and args["choice"] != "cancel":
@@ -2638,10 +3381,9 @@ with tab_chat:
     chat = current_chat()
     turns = chat["turns"] if chat else []
 
-    h1, h2, h3 = st.columns([5, 1.3, 1.3])
+    h1, h3 = st.columns([6, 1.3])
     h1.markdown(f"#### 💬 {chat['title'] if chat else '새 채팅'}")
-    h1.caption(f"🧠 이 대화에서 기억 중인 질문·답변 {len(turns)}/{MAX_TURNS} · 대화 기록은 왼쪽 사이드바에 있어요")
-    h2.button("➕ 새 채팅", key="new_chat_main", on_click=new_chat_cb, use_container_width=True)
+    h1.caption(f"🧠 이 대화에서 기억 중인 질문·답변 {len(turns)}/{MAX_TURNS} · 새 채팅과 대화 기록은 왼쪽 사이드바에 있어요")
     h3.download_button("⬇️ 대화 저장", history_text(chat) if chat else "", file_name="에이블_대화기록.txt",
                        mime="text/plain", use_container_width=True, disabled=not turns)
 
@@ -2655,25 +3397,7 @@ with tab_chat:
             st.caption("예) 내일 오후 2시에 고객사 미팅 잡아줘 · 최근 회의 요약해서 박과장님께 메일 보내줘 · "
                        "마이크 권한을 물으면 '허용'을 눌러 주세요.")
 
-    for t in turns:
-        with st.chat_message("user", avatar="🧑‍💼"):
-            if t["via"] == "voice":
-                st.caption("🎙️ 음성 인식 결과 (STT) — 말씀하신 내용이 맞는지 확인하세요")
-            st.markdown(t["q"])
-            st.caption(t["time"] + (f" · 첨부 {t['file']}" if t["file"] else ""))
-        with st.chat_message("assistant", avatar="🤖"):
-            st.markdown(t["a"])
-            for a in t["actions"]:
-                show_action(a)
-            audio = st.session_state.audio_cache.get(t["id"])
-            if audio:
-                st.audio(audio, format="audio/mp3")          # 처음 재생은 로고 녹음기가 '말하는 중'으로 해 줌
-
-    for t in turns:
-        if t.get("mail") and t["mail"]["status"] == "pending":
-            render_mail_confirm(t)
-
-    # --- 입력 카드 ---
+    # --- 입력 카드 (맨 위: 말로 지시해도 최근 대화를 바로 볼 수 있게) ---
     with st.container(border=True):
         err = st.session_state.pop("chat_error", None)
         if err:
@@ -2747,20 +3471,60 @@ with tab_chat:
             if done:
                 st.rerun()   # try 밖에서 호출해야 화면 새로고침 신호가 막히지 않음
 
+    # --- 보내기 전 확인 메일 (기다리는 메일이 있으면 대화 기록보다 먼저) ---
+    for t in reversed(turns):
+        if t.get("mail") and t["mail"]["status"] == "pending":
+            render_mail_confirm(t)
+
+    # --- 대화 기록: 최근 대화가 맨 위, 아래로 갈수록 이전 대화 ---
+    def render_turn(t):
+        with st.chat_message("user", avatar="🧑‍💼"):
+            if t["via"] == "voice":
+                st.caption("🎙️ 음성 인식 결과 (STT) — 말씀하신 내용이 맞는지 확인하세요")
+            st.markdown(t["q"])
+            st.caption(t["time"] + (f" · 첨부 {t['file']}" if t["file"] else ""))
+        with st.chat_message("assistant", avatar="🤖"):
+            st.markdown(t["a"])
+            for a in t["actions"]:
+                show_action(a)
+            audio = st.session_state.audio_cache.get(t["id"])
+            if audio:
+                st.audio(audio, format="audio/mp3")          # 처음 재생은 로고 녹음기가 '말하는 중'으로 해 줌
+
+    if turns:
+        latest, older = turns[-1], list(reversed(turns[:-1]))
+        with st.container(border=True):
+            st.markdown("**🆕 최근 대화**")
+            render_turn(latest)
+        if older:
+            st.markdown(f"**🕘 이전 대화 ({len(older)}개)** · 최근 순")
+            for t in older:
+                render_turn(t)
+
 
 # ─────────────────────────────────────────────
 # 🎙️ 회의 분석 (실시간 녹음 · 음성 파일 · 텍스트 파일)
 # ─────────────────────────────────────────────
+SCHEDULE_KINDS = ["회의·미팅", "회사 행사", "다른 사람 마감", "기타"]
 SCHEDULE_ITEM = {
     "type": "object",
     "properties": {
-        "title": {"type": "string"},
+        "title": {"type": "string", "description": "일정 이름 (예: B사 제휴 미팅, 중간 점검 회의, 연말 프로모션)"},
+        "kind": {"type": "string", "enum": SCHEDULE_KINDS,
+                 "description": "회의·미팅: 회의·미팅·상담·방문·면담 / 회사 행사: 프로모션·출시·행사 기간 / "
+                                "다른 사람 마감: 김 대리가 아닌 사람의 업무 마감 / 기타"},
         "when_text": {"type": "string", "description": "시점 표현 원문 그대로"},
         "date_type": {"type": "string", "enum": ["exact", "approximate", "none"]},
-        "date": {"type": "string", "description": "exact일 때만 YYYY-MM-DD, 아니면 빈 문자열"},
+        "date": {"type": "string", "description": "exact일 때만 YYYY-MM-DD(기간이면 시작일), 아니면 빈 문자열"},
+        "end_date": {"type": "string", "description": "기간 일정의 마지막 날 YYYY-MM-DD, 하루짜리면 빈 문자열"},
+        "start": {"type": "string", "description": "시작 시간 HH:MM(24시간), 언급 없으면 빈 문자열"},
+        "end": {"type": "string", "description": "끝나는 시간 HH:MM, 언급 없으면 빈 문자열"},
+        "place": {"type": "string", "description": "장소, 언급 없으면 빈 문자열"},
+        "kim_attends": {"type": "boolean", "description": "김 대리가 참석자로 언급되었으면 true"},
         "evidence": {"type": "string", "description": "원문에서 그대로 복사한 근거 문장 1개"},
     },
-    "required": ["title", "when_text", "date_type", "date", "evidence"],
+    "required": ["title", "kind", "when_text", "date_type", "date", "end_date", "start", "end", "place",
+                 "kim_attends", "evidence"],
     "additionalProperties": False,
 }
 
@@ -2772,7 +3536,7 @@ MEETING_SCHEMA = {
         "decisions": {"type": "array", "items": {"type": "string"}, "description": "회의에서 확정된 사항"},
         "kim_tasks": {"type": "array", "items": TASK_ITEM},
         "schedules": {"type": "array", "items": SCHEDULE_ITEM,
-                      "description": "김 대리 업무가 아닌, 회의에서 언급된 일정(출시, 광고 시작, 다음 회의 등)"},
+                      "description": "회의에서 언급된 일정(회의·미팅, 프로모션·출시 기간, 다른 사람 마감 등)"},
     },
     "required": ["title_guess", "summary", "decisions", "kim_tasks", "schedules"],
     "additionalProperties": False,
@@ -2789,7 +3553,13 @@ def analyze_meeting(text, title="", attendees=""):
         "[작성 규칙]",
         *TASK_RULES,
         "- summary: 안건별 핵심을 3~6개 문장으로. decisions: 회의에서 확정된 사항만.",
-        "- schedules: 김 대리 업무가 아닌 일정만. when_text는 원문 표현, date_type/date는 위 기한 규칙과 같게.",
+        "- kim_tasks에는 김 대리가 해야 할 '작업'(문서·보고서 작성, 자료 준비, 조사, 메일 확인 등)만 넣습니다.",
+        "  회의·미팅·상담 '참석'은 kim_tasks가 아니라 schedules에 넣습니다.",
+        "- schedules: 회의에서 언급된 일정. 회의·미팅·상담·방문은 kind='회의·미팅', 프로모션·출시·행사 기간은 '회사 행사',",
+        "  김 대리가 아닌 사람의 업무 마감은 '다른 사람 마감'. 김 대리 업무의 마감은 kim_tasks에 있으므로 넣지 않습니다.",
+        "  when_text는 원문 표현, date_type/date는 위 기한 규칙과 같게. 기간이면 date=시작일, end_date=마지막 날.",
+        "  start/end는 원문에 시간이 있을 때만 HH:MM. kim_attends는 김 대리가 참석자로 언급됐을 때만 true.",
+        "  이미 잡혀 있는 기존 일정이 언급되어도(예: 김 대리 캘린더에 있는 상담) 그대로 schedules에 넣습니다.",
     ])
     resp = get_client().responses.create(
         model=MODEL, instructions=instructions,
@@ -2815,15 +3585,16 @@ def note_markdown(n):
             lines.append(f"  - {t['detail']}")
     if not n["kim_tasks"]:
         lines.append("- (없음)")
-    lines += ["", "## 회의에서 언급된 일정 (참고)"]
+    lines += ["", "## 회의에서 언급된 일정"]
     lines += [f"- {s['title']}: {s['when_text'] or '시점 언급 없음'}" for s in n["schedules"]] or ["- (없음)"]
     return "\n".join(lines)
 
 
 with tab_meet:
-    st.markdown("회의를 녹음하거나 녹음·텍스트 파일을 올리면 에이블이 요약하고 **김 대리 업무만** 할 일에 올립니다.")
-    st.caption("📅 정확한 날짜가 있는 김 대리 업무만 캘린더에 들어갑니다. 대략적인 기한이나 다른 일정은 이 화면에서만 보여 드려요. "
-               "원문에서 근거를 찾지 못한 내용은 추가하지 않습니다.")
+    st.markdown("회의를 녹음하거나 녹음·텍스트 파일을 올리면 에이블이 요약하고, 분석이 끝나면 **자동으로** "
+                "문서 작성·보고서 제출 같은 **김 대리 업무는 할 일**로, **회의·미팅은 캘린더 일정**으로 등록합니다.")
+    st.caption("📅 정확한 날짜가 있는 할 일은 마감일로 캘린더에 표시되고, 김 대리가 참석하는 회의·미팅과 회사 행사(프로모션 기간 등)는 "
+               "일정으로 들어갑니다. 다른 사람의 마감, 날짜가 정확하지 않은 일정, 원문에서 근거를 찾지 못한 내용은 참고로만 보여 드려요.")
 
     with st.container(border=True):
         mode = st.radio("분석 방법", ["🎙️ 실시간 녹음", "📁 음성 파일 분석", "📄 텍스트 파일 분석"],
@@ -2874,12 +3645,14 @@ with tab_meet:
                     text = src_text
                 st.write("② 회의 내용 분석 중")
                 res = analyze_meeting(text, m_title, m_people)
-                st.write("③ 김 대리 업무를 할 일·캘린더에 반영 중")
-                tasks = apply_kim_tasks(res["kim_tasks"], text, "회의 분석")
-                schedules = [dict(s, verified=found_in(s["evidence"], text)) for s in res["schedules"]]
+                st.write("③ 할 일(문서·보고서 등)은 대시보드에, 회의·미팅은 캘린더 일정으로 반영 중")
+                note_title = m_title.strip() or res["title_guess"].strip() or f"{today.isoformat()} 회의"
+                work, meet_like = split_meeting_tasks(res["kim_tasks"])
+                tasks = apply_kim_tasks(work, text, "회의 분석")
+                schedules = apply_meeting_schedules(res["schedules"] + meet_like, text, note_title)
                 note = {
                     "id": uuid.uuid4().hex[:8],
-                    "title": m_title.strip() or res["title_guess"].strip() or f"{today.isoformat()} 회의",
+                    "title": note_title,
                     "when": now_kst(), "attendees": m_people.strip(),
                     "source": ("실시간 녹음" if mode.startswith("🎙") else "음성 파일") if src_audio else "텍스트 파일",
                     "text": text, "summary": res["summary"], "decisions": res["decisions"],
@@ -2890,6 +3663,8 @@ with tab_meet:
                 save_data()
                 n_cal = sum(t["status"] == "calendar" for t in tasks)
                 n_add = sum(t["status"] in ("calendar", "approximate", "nodue") for t in tasks)
+                n_ev = sum(s["cal_status"] in ("calendar", "conflict") for s in schedules)
+                n_cf = sum(s["cal_status"] == "conflict" for s in schedules)
                 status.update(label="분석 완료!", state="complete")
                 done = True
             except Exception as e:
@@ -2897,7 +3672,8 @@ with tab_meet:
                 st.error(f"오류 내용: {e}")
         if done:
             st.session_state.meet_view = note["id"]
-            st.session_state.pending_toast = f"김 대리 업무 {n_add}건을 할 일에 추가했어요 (캘린더 {n_cal}건)."
+            st.session_state.pending_toast = (f"할 일 {n_add}건(마감 표시 {n_cal}건)과 일정 {n_ev}건을 캘린더에 추가했어요."
+                                              + (f" ⚠️ 겹치는 일정 {n_cf}건은 회의록에서 확인하세요." if n_cf else ""))
             st.rerun()
 
     notes = data["meeting_notes"]
@@ -2937,14 +3713,22 @@ with tab_meet:
             st.markdown("\n".join(f"- {s}" for s in n["decisions"]) or "_(확정된 사항이 없습니다)_")
         with r:
             st.markdown("#### 🗓️ 회의에서 언급된 일정")
-            st.caption("참고용입니다. 캘린더에는 넣지 않았어요.")
             if not n["schedules"]:
                 st.caption("언급된 일정이 없습니다.")
-            for s in n["schedules"]:
+            order = {"conflict": 0, "calendar": 1, "duplicate": 2, "reference": 3, "unverified": 4}
+            for s in sorted(n["schedules"], key=lambda x: (order.get(x.get("cal_status"), 3), x["date"] or "9999")):
                 when = s["when_text"] or "시점 언급 없음"
                 if s["date_type"] == "exact" and parse_date(s["date"]):
-                    when += f" ({fmt_date(parse_date(s['date']))})"
-                st.markdown(f"- **{s['title']}** · {when}" + ("" if s.get("verified", True) else " ⚠️근거 확인 필요"))
+                    when = fmt_date(parse_date(s["date"]))
+                    if parse_date(s.get("end_date")):
+                        when += f" ~ {fmt_date(parse_date(s['end_date']))}"
+                    if s.get("start"):
+                        when += f" {s['start']}" + (f"–{s['end']}" if s.get("end") else "")
+                st.markdown(f"**{s['title']}** · {when}" + (f" · {s['place']}" if s.get("place") else "")
+                            + f"  \n:gray[{s.get('kind', '기타')}]")
+                line = schedule_status_line(s)
+                {"calendar": st.success, "conflict": st.warning, "unverified": st.warning}.get(
+                    s.get("cal_status"), st.caption)(line)
 
         st.markdown(f"#### 🙋 김 대리 업무 ({len(n['kim_tasks'])}건)")
         if not n["kim_tasks"]:
@@ -2997,34 +3781,39 @@ with tab_meet:
         if st.session_state.get("meeting_delete_pending") == n["id"]:
             linked_ids = {t.get("todo_id") for t in n["kim_tasks"] if t.get("todo_id")}
             linked_count = sum(t["id"] in linked_ids for t in data["todos"])
+            linked_ev = {i for s in n["schedules"] if s.get("cal_status") in ("calendar", "conflict")
+                         for i in s.get("event_ids", [])}
+            linked_ev_count = sum(e["id"] in linked_ev for e in data["events"])
             with st.container(border=True):
                 st.markdown("#### 🗑️ 삭제할 범위를 선택해 주세요")
                 scope = st.radio(
                     "삭제 범위",
-                    ["회의록만 삭제", "회의록과 연결된 할 일도 삭제"],
+                    ["회의록만 삭제", "회의록과 연결된 할 일·일정도 삭제"],
                     index=0,
                     key=f"meeting_delete_scope_{n['id']}",
                 )
                 if scope == "회의록만 삭제":
                     st.info("회의 원문과 요약을 삭제합니다. 연결된 할 일과 캘린더 마감 표시는 유지됩니다.")
                 else:
-                    st.warning(f"회의록과 연결된 할 일 {linked_count}건을 함께 삭제합니다. "
-                               "해당 할 일의 캘린더 마감 표시도 사라집니다. 별도로 등록한 일정은 유지됩니다.")
+                    st.warning(f"회의록과 연결된 할 일 {linked_count}건, 이 회의 분석으로 추가한 일정 {linked_ev_count}건을 "
+                               "함께 삭제합니다. 원래 캘린더에 있던 일정과 직접 등록한 일정은 유지됩니다.")
                 cancel_col, confirm_col = st.columns(2)
                 if cancel_col.button("취소", key=f"meeting_delete_cancel_{n['id']}", use_container_width=True):
                     st.session_state.pop("meeting_delete_pending", None)
                     st.rerun()
                 if confirm_col.button("선택한 항목 삭제", key=f"meeting_delete_confirm_{n['id']}",
                                       type="primary", use_container_width=True):
-                    delete_tasks = scope == "회의록과 연결된 할 일도 삭제"
+                    delete_tasks = scope == "회의록과 연결된 할 일·일정도 삭제"
                     if delete_tasks:
                         data["todos"] = [t for t in data["todos"] if t["id"] not in linked_ids]
+                        data["events"] = [e for e in data["events"]
+                                          if not (e["id"] in linked_ev and e.get("source") == "회의 분석")]
                     data["meeting_notes"] = [item for item in data["meeting_notes"] if item["id"] != n["id"]]
                     save_data()
                     st.session_state.pop("meeting_delete_pending", None)
                     st.session_state.pop("meet_view", None)
                     st.session_state.pending_toast = (
-                        f"회의록과 연결된 할 일 {linked_count}건을 삭제했어요."
+                        f"회의록과 연결된 할 일 {linked_count}건, 일정 {linked_ev_count}건을 삭제했어요."
                         if delete_tasks else "회의록만 삭제했어요. 할 일과 캘린더 마감 표시는 유지했어요."
                     )
                     st.rerun()
@@ -3583,12 +4372,13 @@ with tab_mail:
 # ─────────────────────────────────────────────
 # 사이드바 (챕터를 누르면 펼쳐짐)
 # ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🤖 에이블")
-    st.caption("김 대리님의 AI 개인비서")
+with SIDE_MAIN:
+    st.markdown(f'<div class="able-side-brand"><span class="able-mark"></span><div><b>에이블</b>'
+                f'<div class="able-meta">김 대리님의 AI 개인비서</div></div></div>', unsafe_allow_html=True)
 
     # 0) GPT처럼 새 채팅 + 대화 기록
-    st.button("➕ 새 채팅", key="new_chat_side", on_click=new_chat_cb, type="primary", use_container_width=True)
+    st.button("새 채팅", key="new_chat_side", icon=":material/add:", on_click=new_chat_cb, type="primary",
+              use_container_width=True)
     chats = sorted(data["chats"], key=lambda c: c["updated"], reverse=True)
     with st.expander(f"💬 대화 기록 ({len(chats)}/{MAX_CHATS})", expanded=True):
         if not chats:
