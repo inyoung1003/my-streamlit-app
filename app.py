@@ -1,4 +1,5 @@
-import os, io, math, base64, tempfile, datetime as dt
+import os, io, re, csv, math, base64, tempfile, datetime as dt
+import requests
 from operator import itemgetter
 from typing import List
 
@@ -154,20 +155,6 @@ def rag_pipeline(filepath):
     return rag_chain
 
 
-def to_standalone(question, history):
-    """이전 대화를 반영해 검색용 독립 질문으로 바꾸기 (예: '그건 언제야?' → '훈련장려금은 언제 지급되나요?')"""
-    if not history:
-        return question
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "이전 대화를 참고해 마지막 질문을 그 자체로 이해되는 하나의 한국어 질문으로 바꾸세요. "
-                   "질문만 출력하고, 이미 독립적인 질문이면 그대로 출력하세요."),
-        MessagesPlaceholder("history"),
-        ("human", "{input}"),
-    ])
-    chain = prompt | ChatOpenAI(model=MODEL, temperature=0) | StrOutputParser()
-    return chain.invoke({"input": question, "history": history}).strip() or question
-
-
 def search_context(queries, k=4, max_chars=9000):
     """여러 질문으로 백서를 검색해 중복 없이 합친 근거 텍스트"""
     vs = get_vectorstore()
@@ -230,12 +217,26 @@ class WeekPlan(BaseModel):
     checkpoint: str = Field(description="주말에 확인할 점검 기준 한 문장")
 
 
+class DayPlan(BaseModel):
+    day: str = Field(description="요일 한 글자(일, 월, 화, 수, 목, 금, 토)")
+    blocks: List[TimeBlock] = Field(description="그 요일의 시간표(시간순). 공부 가능 시간이 없으면 휴식 블록 하나")
+
+
 class StudyPlan(BaseModel):
     summary: str = Field(description="계획 요약 2~3문장")
-    weekday_schedule: List[TimeBlock] = Field(description="평일 하루 시간표(교육 시간 포함, 시간순)")
-    weekend_schedule: List[TimeBlock] = Field(description="주말 하루 시간표(시간순)")
+    day_schedules: List[DayPlan] = Field(description="일~토 7개 요일의 시간표, 일요일부터 순서대로")
     weekly_plan: List[WeekPlan] = Field(description="주차별 계획")
     tips: List[str] = Field(description="실천 팁 3~5개")
+
+
+class QuestionInfo(BaseModel):
+    standalone: str = Field(description="이전 대화를 반영해 그 자체로 이해되는 검색용 질문")
+    keyword: str = Field(description="질문의 핵심을 2~4단어, 15자 이내 키워드로 요약")
+    is_plan_request: bool = Field(description="학습 계획(공부 계획·스케줄)을 세워 달라는 요청이면 true")
+    goal: str = Field(description="계획 요청일 때 학습 목표, 없으면 빈 문자열")
+    start_date: str = Field(description="계획 시작일 YYYY-MM-DD, 언급이 없으면 빈 문자열")
+    end_date: str = Field(description="계획 종료일 YYYY-MM-DD, 언급이 없으면 빈 문자열")
+    track: str = Field(description="'DX 컨설턴트' 또는 'AI 개발자', 언급이 없으면 빈 문자열")
 
 
 class KeyNumber(BaseModel):
@@ -269,6 +270,85 @@ class PortfolioDoc(BaseModel):
     key_numbers: List[KeyNumber] = Field(description="입력에 있는 대표 숫자 0~3개, 없으면 빈 리스트")
     strengths: List[Strength] = Field(description="핵심 강점 정확히 3개")
     projects: List[ProjectSummary]
+
+
+# ─────────────────────────────────────────── 노션 연동
+def plan_markdown(plan, prof):
+    """노션 '가져오기 → Markdown'용 (할 일은 체크박스로 변환됨)"""
+    L = [f"# 개인 학습 계획: {prof['goal']}", "",
+         f"- 트랙: {prof['track']} / 단계: {prof['stage']}",
+         f"- 기간: {prof['period']} ({prof['weeks']}주)", "", "## 계획 요약", plan["summary"], "",
+         "## 요일별 시간표", "", "| 요일 | 시간 | 할 일 | 세부 내용 |", "|---|---|---|---|"]
+    L += [f"| {d['day']} | {b['time']} | {b['activity']} | {b['detail']} |"
+          for d in plan["day_schedules"] for b in d["blocks"]]
+    L += ["", "## 주간 계획"]
+    for w in plan["weekly_plan"]:
+        L += ["", f"### {w['week']}주차 ({week_label(prof, w['week'])}) · {w['theme']}", "**목표**"]
+        L += [f"- {g}" for g in w["goals"]] + ["**할 일**"] + [f"- [ ] {t}" for t in w["tasks"]]
+        L += [f"> 점검 기준: {w['checkpoint']}"]
+    L += ["", "## 실천 팁"] + [f"- {t}" for t in plan["tips"]]
+    return "\n".join(L)
+
+
+def plan_csv(plan, prof):
+    """노션 '가져오기 → CSV'용: 주차별 할 일을 데이터베이스(체크리스트)로"""
+    buf = io.StringIO()
+    w_ = csv.writer(buf)
+    w_.writerow(["할 일", "주차", "시작일", "종료일", "구분", "주제", "완료"])
+    for w in plan["weekly_plan"]:
+        r = prof["ranges"][w["week"] - 1] if 0 < w["week"] <= len(prof["ranges"]) else (None, None)
+        a = r[0].isoformat() if r[0] else ""
+        b = r[1].isoformat() if r[1] else ""
+        for g in w["goals"]:
+            w_.writerow([g, f"{w['week']}주차", a, b, "목표", w["theme"], "No"])
+        for t in w["tasks"]:
+            w_.writerow([t, f"{w['week']}주차", a, b, "할 일", w["theme"], "No"])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def _rt(text):
+    return [{"type": "text", "text": {"content": str(text)[:1900]}}]
+
+
+def plan_notion_blocks(plan, prof):
+    B = lambda t, kind: {"object": "block", "type": kind, kind: {"rich_text": _rt(t)}}
+    blocks = [B(f"{prof['track']} · {prof['stage']} · {prof['period']} ({prof['weeks']}주)", "paragraph"),
+              B("계획 요약", "heading_2"), B(plan["summary"], "paragraph"), B("요일별 시간표", "heading_2")]
+    for d in plan["day_schedules"]:
+        blocks.append(B(f"{d['day']}요일", "heading_3"))
+        blocks += [B(f"{b['time']} · {b['activity']} — {b['detail']}", "bulleted_list_item") for b in d["blocks"]]
+    blocks.append(B("주간 계획", "heading_2"))
+    for w in plan["weekly_plan"]:
+        blocks.append(B(f"{w['week']}주차 ({week_label(prof, w['week'])}) · {w['theme']}", "heading_3"))
+        blocks += [B(f"목표: {g}", "bulleted_list_item") for g in w["goals"]]
+        blocks += [{"object": "block", "type": "to_do", "to_do": {"rich_text": _rt(t), "checked": False}}
+                   for t in w["tasks"]]
+        blocks.append(B(f"점검 기준: {w['checkpoint']}", "quote"))
+    blocks.append(B("실천 팁", "heading_2"))
+    blocks += [B(t, "bulleted_list_item") for t in plan["tips"]]
+    return blocks
+
+
+def notion_push(token, page_url, title, blocks):
+    """노션 페이지 아래에 새 페이지로 학습 계획 만들기 (Notion API)"""
+    ids = re.findall(r"[0-9a-fA-F]{32}", page_url.replace("-", ""))
+    if not ids:
+        raise ValueError("노션 페이지 링크에서 페이지 ID를 찾지 못했습니다.")
+    headers = {"Authorization": f"Bearer {token}", "Notion-Version": "2022-06-28",
+               "Content-Type": "application/json"}
+    res = requests.post("https://api.notion.com/v1/pages", headers=headers, timeout=30, json={
+        "parent": {"page_id": ids[-1]},
+        "properties": {"title": {"title": _rt(title)}},
+        "children": blocks[:100]})
+    if res.status_code >= 300:
+        raise RuntimeError(res.json().get("message", res.text))
+    page = res.json()
+    for i in range(100, len(blocks), 100):     # 노션은 한 번에 100블록까지
+        r = requests.patch(f"https://api.notion.com/v1/blocks/{page['id']}/children", headers=headers,
+                           timeout=30, json={"children": blocks[i:i + 100]})
+        if r.status_code >= 300:
+            raise RuntimeError(r.json().get("message", r.text))
+    return page.get("url", "")
 
 
 # ─────────────────────────────────────────── PDF 만들기 (reportlab 내장 한글 폰트)
@@ -327,10 +407,10 @@ def plan_pdf(plan, prof):
     st_ = [_p("개인 학습 계획", "title"),
            _p(f"{prof['track']} · {prof['stage']} · {prof['period']} ({prof['weeks']}주) · 작성일 {dt.date.today():%Y-%m-%d}", "sub"),
            _p(f"학습 목표: {prof['goal']}", "box"), _p("계획 요약", "h1"), _p(plan["summary"])]
-    for key, title in (("weekday_schedule", "평일 하루 계획"), ("weekend_schedule", "주말 하루 계획")):
-        st_ += [_p(title, "h1"), _table(["시간", "할 일", "세부 내용"],
-                                        [[b["time"], b["activity"], b["detail"]] for b in plan[key]],
-                                        [28 * mm, 45 * mm, CW - 73 * mm])]
+    st_ += [_p("요일별 시간표", "h1"), _table(["요일", "시간", "할 일", "세부 내용"],
+                                          [[d["day"], b["time"], b["activity"], b["detail"]]
+                                           for d in plan["day_schedules"] for b in d["blocks"]],
+                                          [14 * mm, 28 * mm, 42 * mm, CW - 84 * mm])]
     st_.append(_p("주간 계획", "h1"))
     for w in plan["weekly_plan"]:
         st_.append(KeepTogether([_p(f"{w['week']}주차 ({week_label(prof, w['week'])}) · {w['theme']}", "h2"), _p("목표")] + _bullets(w["goals"])
@@ -472,8 +552,24 @@ section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button {
 }}
 .st-key-logo_start button:hover {{transform: scale(1.04);}}
 .st-key-logo_start button p {{color: transparent !important;}}
+/* 학습 도우미 상단 로고 + 안내 문구 */
+.ask-head {{display:flex; align-items:center; gap:18px; margin: 4px 0 10px 0;}}
+.ask-head img {{height: 44px;}}
+.ask-head span {{font-size: 1.25rem; font-weight: 700; color:#1F3864;}}
 /* 추천 질문 버튼 */
 div[class*="st-key-sugg_"] button {{border-radius: 20px; font-size: 0.85rem;}}
+/* 최근 질문 키워드 */
+.kw {{display:inline-block; background:#EEF3FA; color:#1F3864; border-radius:12px;
+      padding:3px 10px; margin:3px 4px 3px 0; font-size:0.82rem;}}
+/* 공부 가능 시간표 */
+div[class*="st-key-s_on_"] button {{background:#E9ECF1 !important; color:#222 !important;
+      border:1px solid #D0D5DD !important; min-height: 2.1rem;}}
+div[class*="st-key-s_off_"] button {{background:#FFF1EF !important; color:#C0392B !important;
+      border:1px solid #F5C6C0 !important; min-height: 2.1rem;}}
+div[class*="st-key-fx_"] button {{background:#EAF1FB !important; color:#2E75B6 !important;
+      border:1px solid #C9DAF0 !important; opacity:1 !important; min-height: 2.1rem;}}
+.slot-head {{text-align:center; font-weight:700; color:#1F3864;}}
+.slot-time {{font-size:0.85rem; color:#595959; padding-top:0.45rem;}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -501,7 +597,115 @@ if get_vectorstore()._collection.count() == 0:
     st.warning("벡터 DB가 비어 있습니다. chroma_db 폴더 또는 백서 PDF 경로(PDF_PATH)를 확인하세요.")
 
 if "history" not in st.session_state:
-    st.session_state.history = []   # [{"q":..., "a":..., "sources":[...]}] 최신이 앞
+    st.session_state.history = []   # [{"q", "kw", "a", "sources"}] 최신이 앞
+
+# ─────────────────────────────────────────── 공부 가능 시간 (요일 × 시간)
+DAYS = ["일", "월", "화", "수", "목", "금", "토"]
+WEEKEND = {"일", "토"}
+BANDS = {"오전 08–12": range(8, 12), "오후 12–18": range(12, 18), "저녁 18–24": range(18, 24)}
+
+
+def is_fixed(d, h):
+    """평일 09:00~18:00은 교육 시간으로 고정"""
+    return d not in WEEKEND and 9 <= h < 18
+
+
+def slot_minutes(d, h):
+    return 50 if (d not in WEEKEND and h == 8) else 60     # 평일 08:00~08:50
+
+
+if "avail" not in st.session_state:
+    st.session_state.avail = {
+        f"{d}-{h}": (h in (19, 20, 21)) if d not in WEEKEND else (h in (10, 11, 14, 15, 16, 17))
+        for d in DAYS for h in range(8, 24) if not is_fixed(d, h)}
+
+
+def day_ranges(d):
+    """선택한 가능 시간을 이어진 구간으로 합치기. 예) ['08:00~08:50', '19:00~22:00']"""
+    hours = [h for h in range(8, 24) if st.session_state.avail.get(f"{d}-{h}")]
+    out, i = [], 0
+    while i < len(hours):
+        j = i
+        while j + 1 < len(hours) and hours[j + 1] == hours[j] + 1 and not is_fixed(d, hours[j + 1]):
+            j += 1
+        a, b = hours[i], hours[j]
+        end = "08:50" if (d not in WEEKEND and b == 8) else f"{b + 1:02d}:00"
+        out.append(f"{a:02d}:00~{end}")
+        i = j + 1
+    return out
+
+
+def day_minutes(d):
+    return sum(slot_minutes(d, h) for h in range(8, 24) if st.session_state.avail.get(f"{d}-{h}"))
+
+
+def availability_text():
+    lines = []
+    for d in DAYS:
+        r = day_ranges(d)
+        edu = " (09:00~18:00 교육 참여)" if d not in WEEKEND else ""
+        lines.append(f"- {d}: " + (", ".join(r) + f" → 총 {fmt_minutes(day_minutes(d))}" if r else "공부 가능 시간 없음") + edu)
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────── 학습 계획 생성 (탭·채팅 공용)
+def generate_plan(track, stage, goal, start, end, level):
+    ranges = week_ranges(start, end)
+    weeks = len(ranges)
+    period_txt = f"{fmt_md(start)}~{fmt_md(end)}"
+    week_txt = "\n".join(f"- {i}주차: {fmt_md(a)}~{fmt_md(b)}" for i, (a, b) in enumerate(ranges, 1))
+    prof = {"track": track, "stage": stage, "goal": goal, "weeks": weeks, "period": period_txt, "ranges": ranges}
+    context = search_context(["개인 학습 전략 하루 루틴", f"{stage} 단계별 전략", "일일 타임테이블",
+                              f"{track} 트랙", goal, "배경별 팁"])
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """당신은 AIVLE School 학습 코치입니다. [백서 근거]와 학습자 정보로 실행 가능한 학습 계획을 만드세요.
+규칙:
+1. 요일별 시간표는 일~토 7개 요일을 일요일부터 순서대로 만드세요.
+2. 개인 학습 블록은 반드시 [공부 가능 시간] 안에만 배치하세요. 가능 시간이 없는 요일은 '휴식' 블록 하나만 넣으세요.
+3. 평일(월~금)에는 '09:00~18:00 교육 참여' 블록을 넣으세요.
+4. 가능 시간이 긴 날은 중간에 휴식을 넣고, 블록은 30분 또는 1시간 단위로 나누세요.
+5. 주간 계획은 [주차 구분]대로 정확히 {weeks}개 주차로 만들고, 할 일에는 분량(문제 수·시간·회차)을 적으세요.
+6. 백서에 없는 사실·날짜·수치는 만들지 마세요. 한국어로 작성하세요.
+
+[공부 가능 시간]
+{avail}
+
+[주차 구분]
+{week_txt}
+
+[백서 근거]
+{context}"""),
+        ("human", "트랙: {track}\n단계: {stage}\n목표: {goal}\n계획 기간: {period} ({weeks}주)\n현재 수준: {level}"),
+    ])
+    plan = (prompt | ChatOpenAI(model=MODEL, temperature=0.3).with_structured_output(StudyPlan)).invoke({
+        "context": context, "track": track, "stage": stage, "goal": goal, "weeks": weeks,
+        "week_txt": week_txt, "period": period_txt, "avail": availability_text(), "level": level or "입력 없음",
+    }).model_dump()
+    st.session_state.plan, st.session_state.plan_prof = plan, prof
+    st.session_state.plan_pdf = plan_pdf(plan, prof)
+    st.session_state.pop("notion_url", None)
+    return plan, prof
+
+
+# ─────────────────────────────────────────── 질문 분석 (검색용 질문 · 키워드 · 계획 요청 여부)
+def analyze_question(question, history):
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "오늘은 {today}입니다. 이전 대화와 마지막 질문을 보고 지정된 항목을 채우세요. "
+                   "standalone은 이전 대화를 반영해 그 자체로 이해되는 한국어 질문으로 쓰고, "
+                   "날짜는 '다음 주부터 한 달'처럼 상대적으로 말해도 오늘 기준으로 계산하세요."),
+        MessagesPlaceholder("history"),
+        ("human", "{input}"),
+    ])
+    chain = prompt | ChatOpenAI(model=MODEL, temperature=0).with_structured_output(QuestionInfo)
+    return chain.invoke({"input": question, "history": history, "today": dt.date.today().isoformat()})
+
+
+def parse_date(s, default):
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        return default
+
 
 # ─────────────────────────────────────────── 사이드바: 문서 업로드 · 대화 삭제
 with st.sidebar:
@@ -537,11 +741,7 @@ with st.sidebar:
     if st.button("🗑️ 대화 삭제"):
         st.session_state.history = []
         st.rerun()
-
-    if st.session_state.history:
-        st.markdown("**🕘 최근 질문**")
-        for i, h in enumerate(st.session_state.history[:8]):
-            st.caption(f"{i + 1}. {h['q']}")
+    recent_box = st.container()     # 최근 질문 (화면 맨 끝에서 채움 → 방금 질문까지 반영)
     st.caption("※ 지원 일정·금액 등은 기수마다 바뀔 수 있으니 공식 공지를 함께 확인하세요.")
 
 chain = st.session_state.get("upload_chain", default_chain)
@@ -556,7 +756,7 @@ SUGGESTED = [
     "훈련장려금은 얼마나, 언제 받을 수 있나요?",
     "선배들이 강조한 빅프로젝트 수상 비결은?",
     "하루 일과는 어떻게 되나요?",
-    "포트폴리오는 어떻게 작성하면 좋을까요?",
+    "AICE 합격을 목표로 4주 학습 계획을 세워 줘",
 ]
 
 
@@ -577,10 +777,14 @@ def show_sources(sources):
 
 
 with tab_chat:
+    # 로고 + 안내 문구
+    st.markdown(f'<div class="ask-head"><img src="data:image/png;base64,{LOGO_B64}"/>'
+                f'<span>궁금한 점을 입력하세요</span></div>', unsafe_allow_html=True)
+
     # ① 질문 입력 (맨 위)
     with st.form("ask_form", clear_on_submit=True):
         c1, c2 = st.columns([8, 1])
-        typed = c1.text_input("질문", placeholder="궁금한 점을 입력하세요. 예) 수료 기준이 어떻게 되나요?",
+        typed = c1.text_input("질문", placeholder="예) 수료 기준이 어떻게 되나요? / 다음 주부터 4주 SQL 공부 계획 세워 줘",
                               label_visibility="collapsed")
         sent = c2.form_submit_button("보내기", type="primary", width="stretch")
 
@@ -595,20 +799,48 @@ with tab_chat:
     question = clicked or (typed.strip() if sent and typed.strip() else None)
 
     # ③ 새 질문 → 답변을 맨 위에 바로 표시
+    shown = 0
     if question:
         with st.chat_message("user", avatar="🙋"):
             st.markdown(question)
         with st.chat_message("assistant", avatar="📘"):
+            thinking = st.empty()
+            thinking.markdown("🤔 생각중입니다...")
             past = history_messages()
-            standalone = to_standalone(question, past)
-            answer = st.write_stream(chain.stream({"input": standalone, "history": past}))
-            sources = [d.page_content[:300] + ("…" if len(d.page_content) > 300 else "")
-                       for d in retriever.invoke(standalone)]
-            show_sources(sources)
-        st.session_state.history.insert(0, {"q": question, "a": answer, "sources": sources})
+            info = analyze_question(question, past)
+            sources = []
+
+            if info.is_plan_request:
+                # 학습 도우미 → 개인 학습 계획 연동
+                today = dt.date.today()
+                start = parse_date(info.start_date, today)
+                end = parse_date(info.end_date, start + dt.timedelta(days=27))
+                if end < start or (end - start).days > 7 * 12:
+                    end = start + dt.timedelta(days=27)
+                track = info.track if info.track in ("DX 컨설턴트", "AI 개발자") else st.session_state.get("plan_track", "DX 컨설턴트")
+                plan, prof = generate_plan(track, st.session_state.get("plan_stage", "STEP1 (분석형·생성형 AI)"),
+                                           info.goal or question, start, end, st.session_state.get("plan_level", ""))
+                thinking.empty()
+                answer = (f"📅 **학습 계획을 만들었어요!** 위쪽 **'📅 개인 학습 계획'** 탭에서 요일별 시간표와 "
+                          f"주차별 할 일을 확인하고, PDF·노션으로 내보낼 수 있어요.\n\n"
+                          f"- 목표: {prof['goal']}\n- 기간: {prof['period']} ({prof['weeks']}주)\n"
+                          f"- 공부 가능 시간: 개인 학습 계획 탭에서 선택한 시간 기준\n\n{plan['summary']}")
+                st.markdown(answer)
+            else:
+                def stream():
+                    first = True
+                    for chunk in chain.stream({"input": info.standalone or question, "history": past}):
+                        if first:
+                            thinking.empty()
+                            first = False
+                        yield chunk
+                answer = st.write_stream(stream())
+                sources = [d.page_content[:300] + ("…" if len(d.page_content) > 300 else "")
+                           for d in retriever.invoke(info.standalone or question)]
+                show_sources(sources)
+        st.session_state.history.insert(0, {"q": question, "kw": info.keyword or question[:15],
+                                            "a": answer, "sources": sources})
         shown = 1
-    else:
-        shown = 0
 
     # ④ 이전 대화 (최신이 위)
     if st.session_state.history[shown:]:
@@ -623,20 +855,60 @@ with tab_chat:
 # ─────────────────────────────────────────── 탭 2. 개인 학습 계획
 with tab_plan:
     st.subheader("📅 개인 학습 계획 만들기")
+
+    # ① 공부 가능 시간 선택 (칸을 누르면 가능 ↔ 불가)
+    st.markdown("#### ① 공부할 수 있는 시간 선택")
+    st.caption("칸을 누르면 가능 ↔ 불가가 바뀝니다. 평일 09:00~18:00은 교육 시간으로 고정되고, "
+               "평일 08:00 칸은 08:00~08:50(체크인 전)입니다. 주말은 모든 시간을 선택할 수 있어요.")
+    band = st.segmented_control("시간대", list(BANDS), default="저녁 18–24", key="band",
+                                label_visibility="collapsed") or "저녁 18–24"
+
+    b1, b2 = st.columns(2)
+    if b1.button("이 시간대 모두 가능", width="stretch"):
+        for d in DAYS:
+            for h in BANDS[band]:
+                if not is_fixed(d, h):
+                    st.session_state.avail[f"{d}-{h}"] = True
+        st.rerun()
+    if b2.button("이 시간대 모두 불가", width="stretch"):
+        for d in DAYS:
+            for h in BANDS[band]:
+                if not is_fixed(d, h):
+                    st.session_state.avail[f"{d}-{h}"] = False
+        st.rerun()
+
+    head = st.columns([0.8] + [1] * 7)
+    for j, d in enumerate(DAYS):
+        head[j + 1].markdown(f"<div class='slot-head'>{d}</div>", unsafe_allow_html=True)
+    for h in BANDS[band]:
+        row = st.columns([0.8] + [1] * 7)
+        row[0].markdown(f"<div class='slot-time'>{h:02d}:00</div>", unsafe_allow_html=True)
+        for j, d in enumerate(DAYS):
+            if is_fixed(d, h):
+                row[j + 1].button("교육", key=f"fx_{j}_{h}", disabled=True, width="stretch")
+            else:
+                on = st.session_state.avail[f"{d}-{h}"]
+                if row[j + 1].button("가능" if on else "불가", key=f"s_{'on' if on else 'off'}_{j}_{h}",
+                                     width="stretch"):
+                    st.session_state.avail[f"{d}-{h}"] = not on
+                    st.rerun()
+
+    total = sum(day_minutes(d) for d in DAYS)
+    st.caption("주간 공부 가능 시간: **" + fmt_minutes(total) + "**  ·  " +
+               "  ".join(f"{d} {fmt_minutes(day_minutes(d))}" for d in DAYS if day_minutes(d)))
+
+    # ② 계획 정보 입력
+    st.markdown("#### ② 계획 정보 입력")
     today = dt.date.today()
     with st.form("plan_form"):
         c1, c2 = st.columns(2)
-        track = c1.radio("트랙", ["DX 컨설턴트", "AI 개발자"], horizontal=True)
+        track = c1.radio("트랙", ["DX 컨설턴트", "AI 개발자"], horizontal=True, key="plan_track")
         stage = c2.selectbox("현재 단계", ["교육 시작 전", "STEP1 (분석형·생성형 AI)", "STEP2 (Cloud·서비스 개발/제안)",
-                                         "STEP3 (빅프로젝트)", "수료 전후 (취업 준비)"])
+                                         "STEP3 (빅프로젝트)", "수료 전후 (취업 준비)"], key="plan_stage")
         period = date_range_input("계획 기간 (시작일 ~ 종료일)", today, today + dt.timedelta(days=27), "plan_period")
         goal = st.text_area("학습 목표 *", placeholder="예) AICE Associate 합격, SQL 기본기 다지기")
-        c4, c5 = st.columns(2)
-        wd_m = c4.number_input("평일 개인 학습 가능 시간 (교육 시간 외, 분/일)", min_value=0, max_value=360,
-                               value=120, step=30, format="%d")
-        we_m = c5.number_input("주말 학습 가능 시간 (분/일)", min_value=0, max_value=720,
-                               value=240, step=30, format="%d")
-        level = st.text_area("현재 수준·강점·보완점", placeholder="예) 비전공자, 파이썬 기초는 됨, SQL이 약함")
+        level = st.text_area("현재 수준·강점·보완점", placeholder="예) 비전공자, 파이썬 기초는 됨, SQL이 약함",
+                             key="plan_level")
         ok = st.form_submit_button("📅 학습 계획 생성", type="primary")
 
     if ok:
@@ -646,53 +918,26 @@ with tab_plan:
             st.warning("계획 기간의 시작일과 종료일을 모두 선택해 주세요.")
         elif (period[1] - period[0]).days > 7 * 12:
             st.warning("계획 기간은 최대 12주까지 설정할 수 있어요.")
+        elif total == 0:
+            st.warning("공부할 수 있는 시간을 한 칸 이상 '가능'으로 선택해 주세요.")
         else:
-            start, end = period
-            ranges = week_ranges(start, end)
-            weeks = len(ranges)
-            period_txt = f"{fmt_md(start)}~{fmt_md(end)}"
-            week_txt = "\n".join(f"- {i}주차: {fmt_md(a)}~{fmt_md(b)}" for i, (a, b) in enumerate(ranges, 1))
-            prof = {"track": track, "stage": stage, "goal": goal, "weeks": weeks,
-                    "period": period_txt, "ranges": ranges}
-            with st.spinner("백서를 참고해 계획을 만드는 중..."):
-                context = search_context(["개인 학습 전략 하루 루틴", f"{stage} 단계별 전략", "일일 타임테이블",
-                                          f"{track} 트랙", goal, "배경별 팁"])
-                prompt = ChatPromptTemplate.from_messages([
-                    ("system", """당신은 AIVLE School 학습 코치입니다. [백서 근거]와 학습자 정보로 실행 가능한 학습 계획을 만드세요.
-규칙:
-1. 평일 09:00~18:00은 교육 시간입니다(체크인 08:50~09:10, 체크아웃 17:50~18:10). 평일 시간표에 '교육 참여' 블록으로 넣고, 개인 학습은 교육 시간 밖에만 배치하세요.
-2. 개인 학습 블록의 합은 평일 하루 {wd}, 주말 하루 {we}을 넘지 마세요. 시간대는 30분 단위로 나누세요.
-3. 휴식·식사 시간을 넣어 무리하지 않게 하세요.
-4. 주간 계획은 아래 주차 구분대로 정확히 {weeks}개 주차로 만들고, 할 일에는 분량(문제 수·시간·회차)을 적으세요.
-5. 백서에 없는 사실·날짜·수치는 만들지 마세요. 한국어로 작성하세요.
+            with st.spinner("생각중입니다... 백서를 참고해 계획을 만들고 있어요."):
+                generate_plan(track, stage, goal, period[0], period[1], level)
 
-[주차 구분]
-{week_txt}
-
-[백서 근거]
-{context}"""),
-                    ("human", "트랙: {track}\n단계: {stage}\n목표: {goal}\n계획 기간: {period} ({weeks}주)\n현재 수준: {level}"),
-                ])
-                plan = (prompt | ChatOpenAI(model=MODEL, temperature=0.3).with_structured_output(StudyPlan)).invoke({
-                    "context": context, "track": track, "stage": stage, "goal": goal, "weeks": weeks,
-                    "week_txt": week_txt, "period": period_txt,
-                    "wd": fmt_minutes(wd_m), "we": fmt_minutes(we_m), "level": level or "입력 없음",
-                }).model_dump()
-            st.session_state.plan, st.session_state.plan_prof = plan, prof
-            st.session_state.plan_pdf = plan_pdf(plan, prof)
-
+    # ③ 결과
     if "plan" in st.session_state:
         plan, prof = st.session_state.plan, st.session_state.plan_prof
-        cols = {"time": "시간", "activity": "할 일", "detail": "세부 내용"}
         st.divider()
         st.markdown(f"### 🎯 {prof['goal']}")
-        st.caption(f"📆 {prof['period']} ({prof['weeks']}주)")
+        st.caption(f"📆 {prof['period']} ({prof['weeks']}주) · {prof['track']} · {prof['stage']}")
         st.info(plan["summary"])
-        c1, c2 = st.columns(2)
-        c1.markdown("#### 평일 하루 계획")
-        c1.dataframe(pd.DataFrame(plan["weekday_schedule"]).rename(columns=cols), hide_index=True, width="stretch")
-        c2.markdown("#### 주말 하루 계획")
-        c2.dataframe(pd.DataFrame(plan["weekend_schedule"]).rename(columns=cols), hide_index=True, width="stretch")
+
+        st.markdown("#### 요일별 시간표")
+        day_tabs = st.tabs([f"{d['day']}요일" for d in plan["day_schedules"]])
+        for t, d in zip(day_tabs, plan["day_schedules"]):
+            t.dataframe(pd.DataFrame(d["blocks"]).rename(columns={"time": "시간", "activity": "할 일", "detail": "세부 내용"}),
+                        hide_index=True, width="stretch")
+
         st.markdown("#### 주간 계획")
         for w in plan["weekly_plan"]:
             with st.expander(f"{w['week']}주차 ({week_label(prof, w['week'])}) · {w['theme']}", expanded=(w["week"] == 1)):
@@ -700,8 +945,42 @@ with tab_plan:
                 st.markdown("**할 일**\n" + "\n".join(f"- [ ] {t}" for t in w["tasks"]))
                 st.caption(f"점검 기준: {w['checkpoint']}")
         st.markdown("#### 실천 팁\n" + "\n".join(f"- {t}" for t in plan["tips"]))
+
+        stamp = f"{dt.date.today():%Y%m%d}"
         st.download_button("⬇️ 학습 계획 PDF 다운로드", st.session_state.plan_pdf,
-                           file_name=f"학습계획_{dt.date.today():%Y%m%d}.pdf", mime="application/pdf")
+                           file_name=f"학습계획_{stamp}.pdf", mime="application/pdf")
+
+        # ④ 노션 연동
+        st.markdown("#### 🗂️ 노션으로 내보내기")
+        n1, n2 = st.columns(2)
+        n1.download_button("⬇️ 노션 페이지용 Markdown", plan_markdown(plan, prof).encode("utf-8"),
+                           file_name=f"학습계획_{stamp}.md", mime="text/markdown", width="stretch")
+        n2.download_button("⬇️ 노션 데이터베이스용 CSV", plan_csv(plan, prof),
+                           file_name=f"학습계획_할일_{stamp}.csv", mime="text/csv", width="stretch")
+        st.caption("노션에서 **설정 → 가져오기 → Markdown/CSV**로 불러오면 됩니다. "
+                   "Markdown은 체크박스가 있는 페이지로, CSV는 주차·시작일·완료 열이 있는 할 일 데이터베이스로 만들어져요.")
+
+        with st.expander("🔗 노션에 바로 보내기 (API 연동)"):
+            st.caption("1) notion.so/my-integrations 에서 통합을 만들고 토큰을 복사합니다.  "
+                       "2) 계획을 넣을 노션 페이지 오른쪽 위 ··· → 연결 → 만든 통합을 추가합니다.  "
+                       "3) 그 페이지 링크를 아래에 붙여 넣습니다.")
+            try:
+                default_token = st.secrets.get("NOTION_TOKEN", "")
+            except Exception:
+                default_token = ""
+            token = st.text_input("노션 통합 토큰", value=default_token, type="password",
+                                  help="Streamlit Secrets에 NOTION_TOKEN으로 저장해 두면 자동으로 입력됩니다.")
+            page_url = st.text_input("노션 페이지 링크", placeholder="https://www.notion.so/...")
+            if st.button("📤 노션에 계획 보내기", type="primary", disabled=not (token and page_url)):
+                try:
+                    with st.spinner("노션에 페이지를 만드는 중..."):
+                        st.session_state.notion_url = notion_push(
+                            token, page_url, f"학습 계획 · {prof['goal'][:30]} ({prof['period']})",
+                            plan_notion_blocks(plan, prof))
+                except Exception as e:
+                    st.error(f"노션 전송 실패: {e}")
+            if st.session_state.get("notion_url"):
+                st.success(f"노션에 학습 계획 페이지를 만들었어요 👉 [열기]({st.session_state.notion_url})")
 
 # ─────────────────────────────────────────── 탭 3. AI 문서 작성
 with tab_doc:
@@ -716,8 +995,9 @@ with tab_doc:
         name = c1.text_input("프로젝트 이름 *")
         ptype = c2.selectbox("유형", ["빅프로젝트", "미니프로젝트", "공모전", "해커톤", "스터디", "개인 프로젝트", "기타"])
         proj_period = date_range_input("기간 (시작일 ~ 종료일)", today - dt.timedelta(days=55), today, "proj_period")
-        c4, c5 = st.columns(2)
-        team = c4.text_input("팀 구성", placeholder="6명 (DX 4, AI 2)")
+        c3, c4, c5 = st.columns([1.2, 0.8, 2])
+        team_track = c3.selectbox("팀 트랙", ["DX 컨설턴트", "AI 개발자"])
+        team_size = c4.number_input("인원", min_value=1, max_value=12, value=5, step=1)
         tech = c5.text_input("사용 기술·도구", placeholder="Python, Pandas, Streamlit")
         role = st.text_area("맡은 역할 *", placeholder="조장, 데이터 수집·분석, 최종 발표")
         task = st.text_area("과제 내용 (어떤 문제를 풀었나) *")
@@ -735,6 +1015,7 @@ with tab_doc:
             a, b = proj_period
             weeks_n = max(1, math.ceil(((b - a).days + 1) / 7))
             period = f"{a:%Y.%m.%d}~{b:%Y.%m.%d} ({weeks_n}주)"
+            team = f"{team_size}명 ({team_track} 트랙)"
             st.session_state.projects.append({"프로젝트 이름": name, "유형": ptype, "기간": period, "팀 구성": team,
                                               "사용 기술": tech, "맡은 역할": role, "과제 내용": task,
                                               "수행 과정": process, "결과·성과": result, "얻은 것": learned})
@@ -742,7 +1023,7 @@ with tab_doc:
 
     for i, p in enumerate(st.session_state.projects):
         c1, c2 = st.columns([10, 1])
-        c1.markdown(f"**{i + 1}. {p['프로젝트 이름']}** · {p['유형']} · {p['기간']}")
+        c1.markdown(f"**{i + 1}. {p['프로젝트 이름']}** · {p['유형']} · {p['기간']} · {p['팀 구성']}")
         if c2.button("삭제", key=f"del_{i}"):
             st.session_state.projects.pop(i)
             st.rerun()
@@ -753,13 +1034,15 @@ with tab_doc:
     job = c2.text_input("지원 직무", value="DX 컨설턴트")
     links = st.text_input("링크 (쉼표로 구분)", placeholder="github.com/..., 블로그 주소")
     formats = st.multiselect("출력 형식", ["PDF", "PPT"], default=["PDF", "PPT"])
+    request = st.text_area("요청 사항", placeholder="예) 데이터 분석 역량이 잘 드러나게, 면접관이 1분 안에 읽을 수 있게 간결하게, "
+                                                 "금융권 지원용 표현으로")
 
     if st.button("🪄 AI로 문서 작성", type="primary", disabled=not st.session_state.projects):
         author = {"name": author_name or "에이블러", "job": job,
                   "links": [x.strip() for x in links.split(",") if x.strip()]}
         projects_text = "\n\n".join(f"[프로젝트 {i + 1}]\n" + "\n".join(f"- {k}: {v or '입력 없음'}" for k, v in p.items())
                                     for i, p in enumerate(st.session_state.projects))
-        with st.spinner("백서의 포트폴리오 원칙을 참고해 작성하는 중..."):
+        with st.spinner("생각중입니다... 백서의 포트폴리오 원칙을 참고해 작성하고 있어요."):
             context = search_context(["포트폴리오 작성 순서", "나를 차별화하는 구성 규칙 7가지",
                                       "자기소개 페이지 다섯 칸 슬로건", "포트폴리오 핵심 4가지 영역"])
             prompt = ChatPromptTemplate.from_messages([
@@ -771,13 +1054,18 @@ with tab_doc:
 3. 강점은 형용사 대신 일하는 방식과 근거(프로젝트 이름·숫자)로 쓰세요.
 4. '{job}' 직무의 언어로, 간결한 개조식(~함, ~임)으로 쓰세요. 한 줄은 60자 안팎.
 5. projects는 입력 순서대로 입력 개수만큼 만들고, period는 입력한 기간을 그대로 쓰세요.
+6. [요청 사항]이 있으면 문체·강조점·분량에 반영하세요. 단, 요청 사항이 1번 규칙(사실만 사용)과 충돌하면 1번을 지키세요.
+
+[요청 사항]
+{request}
 
 [백서의 포트폴리오 원칙]
 {context}"""),
                 ("human", "[사용자 입력]\n지원 직무: {job}\n\n{projects}"),
             ])
             doc = (prompt | ChatOpenAI(model=MODEL, temperature=0.2).with_structured_output(PortfolioDoc)).invoke(
-                {"context": context, "job": job, "projects": projects_text}).model_dump()
+                {"context": context, "job": job, "projects": projects_text,
+                 "request": request.strip() or "없음"}).model_dump()
         st.session_state.portfolio = doc
         stamp = f"{dt.date.today():%Y%m%d}"
         st.session_state.files = {}
@@ -803,3 +1091,10 @@ with tab_doc:
                                                    st.session_state.files.items()):
             col.download_button(f"⬇️ {fmt} 다운로드", data, file_name=fname, mime=mime)
         st.caption("※ AI가 정리한 초안입니다. 제출 전 내용을 꼭 확인하세요.")
+
+# ─────────────────────────────────────────── 사이드바: 최근 질문 3개 (키워드)
+with recent_box:
+    if st.session_state.history:
+        st.markdown("**🕘 최근 질문**")
+        st.markdown("".join(f"<span class='kw'>{escape(h.get('kw') or h['q'][:15])}</span>"
+                            for h in st.session_state.history[:3]), unsafe_allow_html=True)
