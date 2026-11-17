@@ -1,5 +1,4 @@
-
-import os, io, datetime as dt
+import os, io, tempfile, datetime as dt
 from operator import itemgetter
 from typing import List
 
@@ -11,6 +10,8 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_pymupdf4llm import PyMuPDF4LLMLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # PDF (reportlab 내장 한글 폰트 사용 → 글꼴 다운로드·설치 없음)
 from reportlab.lib.pagesizes import A4
@@ -35,17 +36,39 @@ st.set_page_config(page_title="AIVLE School 학습 도우미", page_icon="📘",
 # ─────────────────────────────────────────── 기본 설정
 CHROMA_DIR = "chroma_db"          # Colab에서 만들 때와 같아야 함
 COLLECTION = "aivle_docs"
-FOLDER = "/content/drive/MyDrive/project04/"
+# Colab이면 구글 드라이브, Streamlit Cloud면 저장소 폴더(app.py와 같은 위치)
+FOLDER = "/content/drive/MyDrive/project04/" if os.path.isdir("/content/drive/MyDrive/project04") else ""
 PDF_PATH = FOLDER + "AIVLE School 백서.pdf"   # 벡터 DB가 비어 있을 때만 사용
 MODEL = "gpt-4o-mini"
 
-# API 키: 환경변수에 없으면 api_key.txt에서 읽기
+# API 키: ① 환경변수 ② Streamlit Cloud Secrets ③ api_key.txt 순서로 찾기
+if not os.environ.get("OPENAI_API_KEY"):
+    try:
+        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
 if not os.environ.get("OPENAI_API_KEY") and os.path.exists(FOLDER + "api_key.txt"):
     for line in open(FOLDER + "api_key.txt"):
         if "=" in line:
             k, v = line.strip().split("=", 1)
             os.environ[k.strip()] = v.strip().strip('"').strip("'")
 
+# 학습 도우미 역할 (미션 4: 시스템 메시지)
+SYSTEM_MSG = """당신은 KT AIVLE School 선배 에이블러처럼 친근하고 든든한 학습 도우미 '에이블 메이트'입니다.
+
+아래 [참고 문서]만 근거로 질문에 답하세요.
+
+답변 규칙:
+1. 질문에 먼저 한두 문장으로 핵심을 답하고, 필요하면 항목별로 자세히 설명하세요.
+2. 공식 안내, 선배 후기, 학습 제안을 구분해서 말하세요. (예: "공식 안내에 따르면…", "선배 후기에서는…")
+3. 문서에 근거가 없으면 "백서에서 해당 내용을 확인할 수 없습니다."라고 말하고, 문의처가 문서에 있으면 함께 안내하세요.
+4. 지원 조건, 일정, 금액, 수료 기준처럼 바뀔 수 있는 정보는 해당 기수의 공식 공지를 확인하라고 덧붙이세요.
+5. 문서에 없는 사실이나 수치를 만들지 마세요.
+6. 마지막에 질문자의 상황에 맞는 응원 한 문장이나 다음에 해 볼 행동 하나를 제안해, 에이블스쿨에 적극적으로 도전하고 싶어지게 하세요.
+7. 친절하고 이해하기 쉬운 한국어로 답하세요.
+
+[참고 문서]
+{context}"""
 
 # 문서 포맷팅 함수
 def format_docs(docs):
@@ -79,9 +102,7 @@ def get_retriever():
 @st.cache_resource
 def get_chain():
     retriever = get_retriever()
-    s_msg = "당신은 주어진 문서를 기반으로 답변하는 AIVLE School 학습 도우미입니다.\n\n[문서]\n\n{context}"
-    h_msg = "{input}"
-    messages = [("system", s_msg), ("human", h_msg)]
+    messages = [("system", SYSTEM_MSG), ("human", "{input}")]
     prompt = ChatPromptTemplate.from_messages(messages)
     llm = ChatOpenAI(model=MODEL, streaming=True, temperature=0)
     rag_chain = (
@@ -89,6 +110,41 @@ def get_chain():
             "context": itemgetter("input") | retriever | format_docs,
             "input": itemgetter("input")
         }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    return rag_chain
+
+
+# ─────────────────────────────────────────── 01번 노트북의 rag_pipeline() (문서 업로드용)
+_UPLOAD = {}   # 업로드 문서의 검색기(근거 표시용)
+
+
+def rag_pipeline(filepath):
+    # 1. PDF 파일 읽기
+    docs = [d for d in PyMuPDF4LLMLoader(str(filepath)).load() if d.page_content.strip()]
+    if not docs:
+        raise ValueError("PDF에서 읽을 수 있는 본문이 없습니다.")
+
+    # 2. 텍스트 분할
+    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(docs)
+
+    # 3~4. 임베딩 + 벡터 저장소 (백서 DB와 섞이지 않게 별도 컬렉션)
+    vectorstore = Chroma(collection_name="aivle_upload",
+                         embedding_function=OpenAIEmbeddings(model="text-embedding-3-small"))
+    vectorstore.reset_collection()
+    vectorstore.add_documents(chunks)
+
+    # 5. 검색기
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    _UPLOAD["retriever"] = retriever
+
+    # 6~8. 프롬프트 + LLM + 체인
+    prompt = ChatPromptTemplate.from_messages([("system", SYSTEM_MSG), ("human", "{input}")])
+    llm = ChatOpenAI(model=MODEL, streaming=True, temperature=0)
+    rag_chain = (
+        {"context": itemgetter("input") | retriever | format_docs, "input": itemgetter("input")}
         | prompt
         | llm
         | StrOutputParser()
@@ -347,38 +403,113 @@ def portfolio_pptx(doc, author):
 
 
 # ═══════════════════════════════════════════ 화면
-st.title("📘 AIVLE School 학습 도우미")
+st.markdown("""
+<style>
+.hero {background: linear-gradient(120deg,#1F3864 0%,#2E75B6 100%); color:#fff;
+       padding: 22px 28px; border-radius: 16px; margin-bottom: 14px;}
+.hero h1 {color:#fff; font-size: 1.9rem; margin: 0 0 4px 0;}
+.hero p {color:#DCE6F2; margin: 0; font-size: 1rem;}
+</style>
+<div class="hero">
+  <h1>📘 AIVLE School 학습 도우미 · 에이블 메이트</h1>
+  <p>지원 자격부터 수업, 프로젝트, 취업 준비까지. 선배들이 정리한 백서를 바탕으로 답해 드려요.</p>
+</div>
+""", unsafe_allow_html=True)
 
 if not os.environ.get("OPENAI_API_KEY"):
-    st.error("OpenAI API 키가 없습니다. api_key.txt 위치를 확인하세요.")
+    st.error("OpenAI API 키가 없습니다. Streamlit Cloud의 Settings → Secrets에 OPENAI_API_KEY를 등록하세요.")
     st.stop()
 
-# RAG 체인 준비
-chain = get_chain()
+# 기본 RAG 체인 (백서)
+default_chain = get_chain()
 if get_vectorstore()._collection.count() == 0:
     st.warning("벡터 DB가 비어 있습니다. chroma_db 폴더 또는 백서 PDF 경로(PDF_PATH)를 확인하세요.")
 
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# ─────────────────────────────────────────── 사이드바: 문서 업로드 · 대화 삭제
+with st.sidebar:
+    st.header("📂 문서 업로드")
+    uploaded = st.file_uploader("PDF를 올리면 그 문서를 기반으로 답변합니다.", type=["pdf"])
+    if uploaded is not None:
+        file_id = f"{uploaded.name}_{uploaded.size}"
+        if st.session_state.get("upload_id") != file_id:
+            with st.spinner("문서를 읽고 검색 DB를 만드는 중..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(uploaded.getvalue())
+                    tmp_path = tmp.name
+                try:
+                    st.session_state.upload_chain = rag_pipeline(tmp_path)
+                    st.session_state.upload_retriever = _UPLOAD["retriever"]
+                    st.session_state.upload_id = file_id
+                    st.session_state.upload_name = uploaded.name
+                except Exception as e:
+                    st.error(f"문서 처리 오류: {e}")
+                finally:
+                    os.remove(tmp_path)
+
+    use_upload = "upload_chain" in st.session_state
+    if use_upload:
+        st.success(f"📄 '{st.session_state.upload_name}' 기반으로 답변 중")
+        if st.button("📘 기본 백서로 돌아가기"):
+            for k in ("upload_chain", "upload_retriever", "upload_id", "upload_name"):
+                st.session_state.pop(k, None)
+            st.rerun()
+    else:
+        st.info("📘 기본 문서: AIVLE School 백서")
+
+    st.divider()
+    if st.button("🗑️ 대화 삭제", type="secondary"):
+        st.session_state.messages = []
+        st.rerun()
+    st.caption("※ 지원 일정·금액 등은 기수마다 바뀔 수 있으니 공식 공지를 함께 확인하세요.")
+
+chain = st.session_state.get("upload_chain", default_chain)
+retriever = st.session_state.get("upload_retriever", get_retriever())
+
 tab_chat, tab_plan, tab_doc = st.tabs(["💬 학습 도우미", "📅 개인 학습 계획", "📝 AI 문서 작성"])
 
-# ─────────────────────────────────────────── 탭 1. 채팅 (기존 코드)
+# ─────────────────────────────────────────── 탭 1. 채팅
+SUGGESTED = [
+    "비전공자도 에이블스쿨을 따라갈 수 있을까요?",
+    "AI 개발자 트랙과 DX 컨설턴트 트랙은 어떻게 다른가요?",
+    "훈련장려금은 얼마나, 언제 받을 수 있나요?",
+    "선배들이 강조한 빅프로젝트 수상 비결은?",
+    "하루 일과는 어떻게 되나요?",
+    "포트폴리오는 어떻게 작성하면 좋을까요?",
+]
+
 with tab_chat:
-    # 세션 상태 초기화
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    # 추천 질문
+    if not st.session_state.messages:
+        st.markdown("**💡 이런 걸 물어보세요**")
+        cols = st.columns(3)
+        for i, q in enumerate(SUGGESTED):
+            if cols[i % 3].button(q, key=f"sugg_{i}", width="stretch"):
+                st.session_state.pending = q
+                st.rerun()
 
     # 기존 대화 내용 출력
     for message in st.session_state.messages:
         role = "user" if isinstance(message, HumanMessage) else "assistant"
-        with st.chat_message(role):
+        with st.chat_message(role, avatar="🙋" if role == "user" else "📘"):
             st.markdown(message.content)
 
-    # 사용자 입력 처리
-    user_input = st.chat_input("메시지를 입력하세요.")
+    # 사용자 입력 처리 (직접 입력 또는 추천 질문)
+    user_input = st.chat_input("궁금한 점을 입력하세요. 예) 수료 기준이 어떻게 되나요?")
+    if not user_input and st.session_state.get("pending"):
+        user_input = st.session_state.pop("pending")
+
     if user_input:
-        st.chat_message("user").markdown(user_input)
-        with st.chat_message("assistant"):
-            response_stream = chain.stream({"input": user_input})
-            full_response = st.write_stream(response_stream)
+        st.chat_message("user", avatar="🙋").markdown(user_input)
+        with st.chat_message("assistant", avatar="📘"):
+            full_response = st.write_stream(chain.stream({"input": user_input}))
+            # 답변 근거 표시 (명확한 문서 기반 응답)
+            with st.expander("📎 답변 근거 보기"):
+                for i, d in enumerate(retriever.invoke(user_input), 1):
+                    st.markdown(f"**근거 {i}**")
+                    st.caption(d.page_content[:300] + ("…" if len(d.page_content) > 300 else ""))
         st.session_state.messages.append(HumanMessage(content=user_input))
         st.session_state.messages.append(AIMessage(content=full_response))
 
@@ -435,9 +566,9 @@ with tab_plan:
         st.info(plan["summary"])
         c1, c2 = st.columns(2)
         c1.markdown("#### 평일 하루 계획")
-        c1.dataframe(pd.DataFrame(plan["weekday_schedule"]).rename(columns=cols), hide_index=True, use_container_width=True)
+        c1.dataframe(pd.DataFrame(plan["weekday_schedule"]).rename(columns=cols), hide_index=True, width="stretch")
         c2.markdown("#### 주말 하루 계획")
-        c2.dataframe(pd.DataFrame(plan["weekend_schedule"]).rename(columns=cols), hide_index=True, use_container_width=True)
+        c2.dataframe(pd.DataFrame(plan["weekend_schedule"]).rename(columns=cols), hide_index=True, width="stretch")
         st.markdown("#### 주간 계획")
         for w in plan["weekly_plan"]:
             with st.expander(f"{w['week']}주차 · {w['theme']}", expanded=(w["week"] == 1)):
