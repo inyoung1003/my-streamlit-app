@@ -1539,7 +1539,7 @@ elif page == "doc":
         with st.container(border=True, key=f"pcard{'on' if on else 'off'}_{i}"):
             c1, c2, c3, c4 = st.columns([5.4, 1.2, 1, 1])
             badge = (" · ✅ 포트폴리오 대상" if on else "") + (" · ✏️ 수정 중" if ss.pf_edit == i else "")
-            c1.markdown(md(f"**{i + 1}. {p['프로젝트 이름']}**{badge}  \n{p['유형']} · {p['기간']} · {p['팀 구성']}"))
+            c1.markdown(md(f"**{p['프로젝트 이름']}**{badge}  \n{p['유형']} · {p['기간']}"))
             c2.button("✅ 선택됨" if on else "선택", key=f"psel{'on' if on else 'off'}_{i}",
                       on_click=pf_toggle, args=(i,), width="stretch")
             c3.button("수정", key=f"pload_{i}", on_click=pf_load, args=(i,), width="stretch")
