@@ -710,6 +710,10 @@ div[class*="st-key-navoff_"] button:hover { border-color:#9DC3E6; background:#F5
 div[class*="st-key-navon_"] button { background: linear-gradient(120deg,#1F3864,#2E75B6) !important; color:#fff !important;
         border:none !important; border-radius:14px; justify-content:flex-start; padding: .6rem .9rem;
         font-weight:700; box-shadow: 0 6px 16px rgba(46,117,182,.25); }
+/* 추가된 프로젝트: 선택된 카드 강조 */
+div[class*="st-key-pcardon_"] { border:1.5px solid #2E75B6 !important; background:#F3F8FF; border-radius:16px; }
+div[class*="st-key-pselon_"] button { background: linear-gradient(120deg,#1F3864,#2E75B6) !important; color:#fff !important;
+        border:none !important; }
 /* 만든 포트폴리오 목록 */
 div[class*="st-key-pfoff_"] button { background:#FFFFFF; border:1px solid var(--line); border-radius:14px;
         justify-content:flex-start; color: var(--navy); font-weight:600; }
@@ -1435,8 +1439,8 @@ elif page == "plan":
 # ─────────────────────────────────────────── AI 문서 작성
 elif page == "doc":
     st.subheader("📝 프로젝트 정리 문서 만들기")
-    st.caption("프로젝트를 추가하면 아래 목록에 쌓여요. 목록에서 프로젝트를 고르면 위 입력칸에 불러와 수정할 수 있어요. "
-               "(백서 9장 포트폴리오 작성 원칙 적용)")
+    st.caption("프로젝트를 추가하면 아래 목록에 쌓여요. '선택'한 프로젝트만 포트폴리오에 들어가고, "
+               "'수정'을 누르면 위 입력칸에 불러와 고칠 수 있어요. (백서 9장 포트폴리오 작성 원칙 적용)")
     ss = st.session_state
     ss.setdefault("projects", [])
     ss.setdefault("portfolios", [])
@@ -1468,6 +1472,10 @@ elif page == "doc":
         elif e is not None and e > i:
             st.session_state.pf_edit = e - 1
 
+    def pf_toggle(i):
+        p = st.session_state.projects[i]
+        p["selected"] = not p.get("selected", False)
+
     def pf_submit():
         s = st.session_state
         if not all(str(s[k]).strip() for k in ("pf_name", "pf_role", "pf_task", "pf_learned")):
@@ -1482,11 +1490,12 @@ elif page == "doc":
         raw = {"name": s.pf_name.strip(), "type": s.pf_type, "start": a.isoformat(), "end": b.isoformat(),
                "track": s.pf_track, "size": int(s.pf_size), "tech": s.pf_tech, "role": s.pf_role, "task": s.pf_task,
                "process": s.pf_process, "result": s.pf_result, "learned": s.pf_learned}
-        proj = {"프로젝트 이름": raw["name"], "유형": raw["type"], "기간": f"{a:%Y.%m.%d}~{b:%Y.%m.%d} ({weeks_n}주)",
+        proj = {"selected": False, "프로젝트 이름": raw["name"], "유형": raw["type"], "기간": f"{a:%Y.%m.%d}~{b:%Y.%m.%d} ({weeks_n}주)",
                 "팀 구성": f"{raw['size']}명 ({raw['track']} 트랙)", "사용 기술": raw["tech"], "맡은 역할": raw["role"],
                 "과제 내용": raw["task"], "수행 과정": raw["process"], "결과·성과": raw["result"],
                 "얻은 것": raw["learned"], "_raw": raw}
         if s.pf_edit is not None and 0 <= s.pf_edit < len(s.projects):
+            proj["selected"] = s.projects[s.pf_edit].get("selected", False)
             s.projects[s.pf_edit] = proj
             s.pf_msg = ("success", f"'{raw['name']}' 수정 내용을 저장했어요.")
         else:
@@ -1526,17 +1535,25 @@ elif page == "doc":
     if not ss.projects:
         st.caption("아직 추가된 프로젝트가 없어요. 위에 입력하고 '프로젝트 추가'를 눌러 주세요.")
     for i, p in enumerate(ss.projects):
-        with st.container(border=True):
-            c1, c2, c3 = st.columns([6, 1.3, 0.9])
-            badge = " · ✏️ 수정 중" if ss.pf_edit == i else ""
+        on = p.get("selected", False)
+        with st.container(border=True, key=f"pcard{'on' if on else 'off'}_{i}"):
+            c1, c2, c3, c4 = st.columns([5.4, 1.2, 1, 1])
+            badge = (" · ✅ 포트폴리오 대상" if on else "") + (" · ✏️ 수정 중" if ss.pf_edit == i else "")
             c1.markdown(md(f"**{i + 1}. {p['프로젝트 이름']}**{badge}  \n{p['유형']} · {p['기간']} · {p['팀 구성']}"))
-            c2.button("선택해서 수정", key=f"pload_{i}", on_click=pf_load, args=(i,), width="stretch")
-            c3.button("삭제", key=f"pdel_{i}", on_click=pf_delete, args=(i,), width="stretch")
+            c2.button("✅ 선택됨" if on else "선택", key=f"psel{'on' if on else 'off'}_{i}",
+                      on_click=pf_toggle, args=(i,), width="stretch")
+            c3.button("수정", key=f"pload_{i}", on_click=pf_load, args=(i,), width="stretch")
+            c4.button("삭제", key=f"pdel_{i}", on_click=pf_delete, args=(i,), width="stretch")
 
     st.divider()
 
     # ③ 문서 정보 · 형식 · 요청 사항 · 템플릿
     st.markdown("<div class='sec-title'>🪄 포트폴리오 만들기</div>", unsafe_allow_html=True)
+    chosen = [p for p in ss.projects if p.get("selected")]
+    if chosen:
+        st.markdown(md(f"선택한 프로젝트 **{len(chosen)}개**: " + ", ".join(p["프로젝트 이름"] for p in chosen)))
+    else:
+        st.caption("위 목록에서 포트폴리오에 넣을 프로젝트를 '선택'해 주세요.")
     c1, c2 = st.columns(2)
     author_name = c1.text_input("이름", placeholder="홍길동")
     job = c2.text_input("지원 직무", value="DX 컨설턴트")
@@ -1549,12 +1566,13 @@ elif page == "doc":
     st.caption("PPT 템플릿을 올리면 그 템플릿의 레이아웃·색·글꼴로 PPT를 만들어요. 템플릿 안의 기존 슬라이드는 사용하지 않아요. "
                "올리지 않으면 기본 디자인으로 만들어요.")
 
-    if st.button("🪄 AI로 문서 작성", type="primary", disabled=not ss.projects):
+    if st.button("🪄 AI로 문서 작성", type="primary", disabled=not chosen):
         author = {"name": author_name or "에이블러", "job": job,
                   "links": [x.strip() for x in links.split(",") if x.strip()]}
         projects_text = "\n\n".join(
-            f"[프로젝트 {i + 1}]\n" + "\n".join(f"- {k}: {v or '입력 없음'}" for k, v in p.items() if k != "_raw")
-            for i, p in enumerate(ss.projects))
+            f"[프로젝트 {i + 1}]\n" + "\n".join(f"- {k}: {v or '입력 없음'}" for k, v in p.items()
+                                                if k not in ("_raw", "selected"))
+            for i, p in enumerate(chosen))
         with st.spinner("생각중입니다... 백서의 포트폴리오 원칙을 참고해 작성하고 있어요."):
             context = search_context(["포트폴리오 작성 순서", "나를 차별화하는 구성 규칙 7가지",
                                       "자기소개 페이지 다섯 칸 슬로건", "포트폴리오 핵심 4가지 영역"])
