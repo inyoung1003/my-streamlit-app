@@ -183,6 +183,12 @@ def md(text):
     return str(text).replace("~", "\\~")
 
 
+def norm_day(x):
+    """AI가 '일요일'·'일' 어느 쪽으로 답해도 한 글자 요일로 통일"""
+    x = str(x).strip()
+    return x[0] if x and x[0] in "일월화수목금토" else x
+
+
 def fmt_md(d):
     return f"{d.month}월 {d.day}일"
 
@@ -282,7 +288,7 @@ def plan_markdown(plan, prof):
          f"- 트랙: {prof['track']} / 단계: {prof['stage']}",
          f"- 기간: {prof['period']} ({prof['weeks']}주)", "", "## 계획 요약", plan["summary"], "",
          "## 요일별 시간표", "", "| 요일 | 시간 | 할 일 | 세부 내용 |", "|---|---|---|---|"]
-    L += [f"| {d['day']} | {b['time']} | {b['activity']} | {b['detail']} |"
+    L += [f"| {norm_day(d['day'])} | {b['time']} | {b['activity']} | {b['detail']} |"
           for d in plan["day_schedules"] for b in d["blocks"]]
     if prof.get("exceptions"):
         L += ["", "## 날짜별 예외"] + [f"- {e}" for e in prof["exceptions"]]
@@ -320,7 +326,7 @@ def plan_notion_blocks(plan, prof):
     blocks = [B(f"{prof['track']} · {prof['stage']} · {prof['period']} ({prof['weeks']}주)", "paragraph"),
               B("계획 요약", "heading_2"), B(plan["summary"], "paragraph"), B("요일별 시간표", "heading_2")]
     for d in plan["day_schedules"]:
-        blocks.append(B(f"{d['day']}요일", "heading_3"))
+        blocks.append(B(f"{norm_day(d['day'])}요일", "heading_3"))
         blocks += [B(f"{b['time']} · {b['activity']} — {b['detail']}", "bulleted_list_item") for b in d["blocks"]]
     blocks.append(B("주간 계획", "heading_2"))
     for w in plan["weekly_plan"]:
@@ -413,7 +419,7 @@ def plan_pdf(plan, prof):
            _p(f"{prof['track']} · {prof['stage']} · {prof['period']} ({prof['weeks']}주) · 작성일 {dt.date.today():%Y-%m-%d}", "sub"),
            _p(f"학습 목표: {prof['goal']}", "box"), _p("계획 요약", "h1"), _p(plan["summary"])]
     st_ += [_p("요일별 시간표", "h1"), _table(["요일", "시간", "할 일", "세부 내용"],
-                                          [[d["day"], b["time"], b["activity"], b["detail"]]
+                                          [[norm_day(d["day"]), b["time"], b["activity"], b["detail"]]
                                            for d in plan["day_schedules"] for b in d["blocks"]],
                                           [14 * mm, 28 * mm, 42 * mm, CW - 84 * mm])]
     if prof.get("exceptions"):
@@ -602,18 +608,19 @@ div[class*="st-key-sugg_"] button:hover { background: var(--sky); border-color:#
 .sec-title { font-weight: 800; color: var(--navy); margin: .4rem 0 .4rem 0; }
 
 /* ── 공부 가능 시간 (예비 방식) ─────────── */
-div[class*="st-key-s_on_"] button { background:#E3F2FD !important; color:#1565C0 !important;
-      border:1px solid #BBDEFB !important; border-radius:999px !important; min-height: 2.1rem; }
-div[class*="st-key-s_off_"] button { background:#FFE5E5 !important; color:#C62828 !important;
-      border:1px solid #FFCDD2 !important; border-radius:999px !important; min-height: 2.1rem; }
-div[class*="st-key-fx_"] button { background:#FFF6CC !important; color:#8A6D00 !important;
-      border:1px solid #FFE58F !important; border-radius:999px !important; opacity:1 !important; min-height: 2.1rem; }
+div[class*="st-key-s_on_"] button { background:#C8F7FF !important; color:#1565C0 !important;
+      border:1px solid #8FE3F2 !important; border-radius:999px !important; min-height: 2.1rem; }
+div[class*="st-key-s_off_"] button { background:#FFD1C9 !important; color:#C62828 !important;
+      border:1px solid #F5AFA2 !important; border-radius:999px !important; min-height: 2.1rem; }
+div[class*="st-key-fx_"] button { background:#F9FFC6 !important; color:#8A6D00 !important;
+      border:1px solid #E3EC8C !important; border-radius:999px !important; opacity:1 !important; min-height: 2.1rem; }
 /* 날짜별 수정 달력 */
 div[class*="st-key-dday_"] button { background:#FFFFFF; border:1px solid var(--line); border-radius:999px; min-height: 2.4rem; }
-div[class*="st-key-dmod_"] button { background:#E3F2FD; border:1px solid #90CAF9; color:#1565C0; border-radius:999px; min-height: 2.4rem; }
+div[class*="st-key-dmod_"] button { background:#C8F7FF; border:1px solid #90CAF9; color:#1565C0; border-radius:999px; min-height: 2.4rem; }
 div[class*="st-key-dsel_"] button { background:linear-gradient(120deg,#1F3864,#2E75B6) !important; color:#FFFFFF !important;
       border:none !important; border-radius:999px; min-height: 2.4rem; }
-.legend span { display:inline-block; padding:4px 14px; border-radius:999px; margin-right:6px; font-size:0.82rem; font-weight:600; }
+.legend { display:flex; flex-wrap:wrap; gap:8px; margin: 4px 0 18px 0; }
+.legend span { display:inline-block; padding:4px 14px; border-radius:999px; font-size:0.82rem; font-weight:600; line-height:1.4; }
 .slot-head { text-align:center; font-weight:700; color:var(--navy); }
 .slot-time { font-size:0.85rem; color:#595959; padding-top:0.45rem; }
 </style>
@@ -637,9 +644,9 @@ if "history" not in st.session_state:
 DAYS = ["일", "월", "화", "수", "목", "금", "토"]
 WEEKEND = {"일", "토"}
 HOURS = list(range(8, 24))
-CELL_STYLE = {"교육": "background-color:#FFF6CC;color:#8A6D00;",
-              "가능": "background-color:#E3F2FD;color:#1565C0;",
-              "불가": "background-color:#FFE5E5;color:#C62828;"}
+CELL_STYLE = {"교육": "background-color:#F9FFC6;color:#8A6D00;",
+              "가능": "background-color:#C8F7FF;color:#1565C0;",
+              "불가": "background-color:#FFD1C9;color:#C62828;"}
 
 
 def is_fixed(d, h):
@@ -809,9 +816,9 @@ GRID_CSS = """
 .ag-cell { height:32px; border-radius:999px; display:flex; align-items:center; justify-content:center;
            font-size:12px; font-weight:700; cursor:pointer; transition: transform .08s ease, box-shadow .15s ease; }
 .ag-cell:hover { transform: scale(1.05); box-shadow: 0 3px 10px rgba(31,56,100,.12); }
-.ag-cell.on    { background:#E3F2FD; color:#1565C0; border:1.5px solid #BBDEFB; }
-.ag-cell.off   { background:#FFE5E5; color:#C62828; border:1.5px solid #FFCDD2; }
-.ag-cell.fixed { background:#FFF6CC; color:#8A6D00; border:1.5px solid #FFE58F; cursor:not-allowed; }
+.ag-cell.on    { background:#C8F7FF; color:#1565C0; border:1.5px solid #8FE3F2; }
+.ag-cell.off   { background:#FFD1C9; color:#C62828; border:1.5px solid #F5AFA2; }
+.ag-cell.fixed { background:#F9FFC6; color:#8A6D00; border:1.5px solid #E3EC8C; cursor:not-allowed; }
 .ag-cell.fixed:hover { transform:none; box-shadow:none; }
 """
 
@@ -1147,10 +1154,11 @@ elif page == "plan":
     st.markdown(md("칸을 누르거나 **드래그하면 한 번에 칠해져요** (처음 누른 칸의 반대 값으로 칠함). "
                    "평일 09:00~18:00은 교육 시간으로 고정되고, 평일 08:00 칸은 08:00~08:50(체크인 전)입니다. "
                    "주말은 모든 시간을 선택할 수 있어요."))
-    st.markdown("<div class='legend'><span style='background:#FFF6CC;color:#8A6D00'>교육</span>"
-                "<span style='background:#E3F2FD;color:#1565C0'>가능</span>"
-                "<span style='background:#FFE5E5;color:#C62828'>불가</span></div>", unsafe_allow_html=True)
+    st.markdown("<div class='legend'><span style='background:#F9FFC6;color:#8A6D00'>교육</span>"
+                "<span style='background:#C8F7FF;color:#1565C0'>가능</span>"
+                "<span style='background:#FFD1C9;color:#C62828'>불가</span></div>", unsafe_allow_html=True)
 
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
     mode = st.segmented_control("수정 방식", ["고정 요일", "날짜별 수정"], default="고정 요일",
                                 key="avail_mode", label_visibility="collapsed") or "고정 요일"
 
@@ -1239,7 +1247,7 @@ elif page == "plan":
             st.markdown("**📌 날짜별 예외**\n" + "\n".join(f"- {md(e)}" for e in prof["exceptions"]))
 
         st.markdown("#### 요일별 시간표")
-        day_tabs = st.tabs([f"{d['day']}요일" for d in plan["day_schedules"]])
+        day_tabs = st.tabs([f"{norm_day(d['day'])}요일" for d in plan["day_schedules"]])
         for t, d in zip(day_tabs, plan["day_schedules"]):
             t.dataframe(pd.DataFrame(d["blocks"]).rename(columns={"time": "시간", "activity": "할 일", "detail": "세부 내용"}),
                         hide_index=True, width="stretch")
