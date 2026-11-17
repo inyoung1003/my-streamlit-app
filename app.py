@@ -544,6 +544,136 @@ def portfolio_pptx(doc, author):
     return buf.getvalue()
 
 
+def _tpl_find_layouts(prs):
+    """템플릿에서 표지 / 제목+내용 / 제목+내용2개 레이아웃 찾기"""
+    from pptx.enum.shapes import PP_PLACEHOLDER as PH
+    title_l = content_l = two_l = None
+    for layout in prs.slide_layouts:
+        types = [ph.placeholder_format.type for ph in layout.placeholders]
+        bodies = [t for t in types if t in (PH.BODY, PH.OBJECT)]
+        if title_l is None and PH.CENTER_TITLE in types:
+            title_l = layout
+        if PH.TITLE in types and len(bodies) == 1 and content_l is None:
+            content_l = layout
+        if PH.TITLE in types and len(bodies) >= 2 and two_l is None:
+            two_l = layout
+    layouts = list(prs.slide_layouts)
+    title_l = title_l or layouts[0]
+    content_l = content_l or (layouts[1] if len(layouts) > 1 else layouts[0])
+    return title_l, content_l, two_l
+
+
+def _tpl_clear_slides(prs):
+    """템플릿 안의 기존 슬라이드 삭제 (레이아웃·테마는 유지)"""
+    sld_ids = prs.slides._sldIdLst
+    for sld_id in list(sld_ids):
+        prs.part.drop_rel(sld_id.rId)
+        sld_ids.remove(sld_id)
+
+
+def _tpl_placeholders(slide):
+    """(제목, [본문들]) — 본문은 왼쪽 → 오른쪽 순서"""
+    from pptx.enum.shapes import PP_PLACEHOLDER as PH
+    title, bodies, subtitle = None, [], None
+    for ph in slide.placeholders:
+        t = ph.placeholder_format.type
+        if t in (PH.TITLE, PH.CENTER_TITLE):
+            title = ph
+        elif t == PH.SUBTITLE:
+            subtitle = ph
+        elif t in (PH.BODY, PH.OBJECT):
+            bodies.append(ph)
+    bodies.sort(key=lambda p: (p.left or 0, p.top or 0))
+    return title, subtitle, bodies
+
+
+def _tpl_fill(shape, sections, head_size=16, item_size=13):
+    """sections: [(소제목 또는 None, [항목...])] → 템플릿의 글머리 스타일을 살려서 채우기"""
+    tf = shape.text_frame
+    tf.clear()
+    tf.word_wrap = True
+    first = True
+    for head, items in sections:
+        if head:
+            p = tf.paragraphs[0] if first else tf.add_paragraph()
+            first = False
+            p.level = 0
+            r = p.add_run()
+            r.text = head
+            r.font.bold = True
+            r.font.size = Pt(head_size)
+        for it in items:
+            p = tf.paragraphs[0] if first else tf.add_paragraph()
+            first = False
+            p.level = 1 if head else 0
+            r = p.add_run()
+            r.text = str(it)
+            r.font.size = Pt(item_size)
+
+
+def _tpl_textbox(slide, prs, sections, top_ratio=0.22):
+    """본문 자리표시자가 없는 레이아웃이면 텍스트 상자로 대신 채우기"""
+    W, H = prs.slide_width, prs.slide_height
+    tb = slide.shapes.add_textbox(int(W * 0.06), int(H * top_ratio), int(W * 0.88), int(H * (0.92 - top_ratio)))
+    _tpl_fill(tb, sections)
+
+
+def portfolio_pptx_template(doc, author, template_bytes):
+    """업로드한 PPT 템플릿의 레이아웃·색·글꼴로 프로젝트 정리 문서 만들기"""
+    prs = Presentation(io.BytesIO(template_bytes))
+    title_l, content_l, two_l = _tpl_find_layouts(prs)
+    _tpl_clear_slides(prs)
+
+    def add(layout, title_text, left_sections, right_sections=None, subtitle_text=None):
+        s = prs.slides.add_slide(layout)
+        title, subtitle, bodies = _tpl_placeholders(s)
+        if title is not None:
+            title.text = title_text
+        else:
+            tb = s.shapes.add_textbox(int(prs.slide_width * 0.06), int(prs.slide_height * 0.06),
+                                      int(prs.slide_width * 0.88), int(prs.slide_height * 0.12))
+            _tpl_fill(tb, [(None, [title_text])], item_size=26)
+        if subtitle is not None and subtitle_text is not None:
+            subtitle.text = subtitle_text
+        if right_sections is not None and len(bodies) >= 2:
+            _tpl_fill(bodies[0], left_sections)
+            _tpl_fill(bodies[1], right_sections)
+            used = 2
+        elif bodies and left_sections:
+            _tpl_fill(bodies[0], left_sections + (right_sections or []))
+            used = 1
+        else:
+            used = 0
+            if left_sections and subtitle_text is None:
+                _tpl_textbox(s, prs, left_sections + (right_sections or []))
+        for ph in bodies[used:]:                 # 쓰지 않은 빈 자리표시자 제거
+            ph._element.getparent().remove(ph._element)
+        return s
+
+    # 1) 표지
+    add(title_l, "프로젝트 정리 문서", [], subtitle_text=f"{doc['slogan']}\n{author['name']} · {author['job']} · {dt.date.today():%Y.%m.%d}")
+
+    # 2) 한눈에 보기
+    nums = [f"{k['value']} — {k['label']}" for k in doc["key_numbers"]]
+    left = [("슬로건", [doc["slogan"]])] + ([("대표 숫자", nums)] if nums else []) + \
+           [("핵심 강점", [f"{s['title']}: {s['evidence']}" for s in doc["strengths"]])]
+    right = [("대표 프로젝트", [f"{p['project_name']}: {p['one_line_result']}" for p in doc["projects"]])] + \
+            ([("링크", author["links"])] if author["links"] else [])
+    add(two_l or content_l, "한눈에 보기", left, right)
+
+    # 3) 프로젝트별
+    for i, p in enumerate(doc["projects"], 1):
+        left = [("문제 정의", p["problem"]), ("해결 과정", p["process"])]
+        right = [("결과", p["results"]), ("회고", [p["retrospective"]]),
+                 ("역할", [f"{p['my_role']} (선택 이유: {p['role_reason']})"]),
+                 ("기술 · 키워드", [", ".join(p["tech_stack"] + p["keywords"])])]
+        add(two_l or content_l, f"{i}. {p['project_name']} — {p['title_sentence']}", left, right)
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
 # ═══════════════════════════════════════════ 화면
 st.markdown("""
 <style>
@@ -580,6 +710,12 @@ div[class*="st-key-navoff_"] button:hover { border-color:#9DC3E6; background:#F5
 div[class*="st-key-navon_"] button { background: linear-gradient(120deg,#1F3864,#2E75B6) !important; color:#fff !important;
         border:none !important; border-radius:14px; justify-content:flex-start; padding: .6rem .9rem;
         font-weight:700; box-shadow: 0 6px 16px rgba(46,117,182,.25); }
+/* 만든 포트폴리오 목록 */
+div[class*="st-key-pfoff_"] button { background:#FFFFFF; border:1px solid var(--line); border-radius:14px;
+        justify-content:flex-start; color: var(--navy); font-weight:600; }
+div[class*="st-key-pfoff_"] button:hover { border-color:#9DC3E6; background:#F5F9FF; }
+div[class*="st-key-pfon_"] button { background:#EAF3FF !important; border:1.5px solid #2E75B6 !important; border-radius:14px;
+        justify-content:flex-start; color: var(--navy) !important; font-weight:700; }
 /* 최근 질문 키워드 */
 .kw { display:inline-block; background:#FFFFFF; color:var(--navy); border:1px solid #CFE0F5; border-radius:999px;
       padding:4px 12px; margin:3px 4px 3px 0; font-size:0.8rem; box-shadow: 0 1px 3px rgba(31,56,100,.06); }
@@ -608,15 +744,15 @@ div[class*="st-key-sugg_"] button:hover { background: var(--sky); border-color:#
 .sec-title { font-weight: 800; color: var(--navy); margin: .4rem 0 .4rem 0; }
 
 /* ── 공부 가능 시간 (예비 방식) ─────────── */
-div[class*="st-key-s_on_"] button { background:#C8F7FF !important; color:#1565C0 !important;
-      border:1px solid #8FE3F2 !important; border-radius:999px !important; min-height: 2.1rem; }
-div[class*="st-key-s_off_"] button { background:#FFD1C9 !important; color:#C62828 !important;
-      border:1px solid #F5AFA2 !important; border-radius:999px !important; min-height: 2.1rem; }
-div[class*="st-key-fx_"] button { background:#F9FFC6 !important; color:#8A6D00 !important;
-      border:1px solid #E3EC8C !important; border-radius:999px !important; opacity:1 !important; min-height: 2.1rem; }
+div[class*="st-key-s_on_"] button { background:#EBFFFF !important; color:#1565C0 !important;
+      border:1px solid #A8E3EC !important; border-radius:999px !important; min-height: 2.1rem; }
+div[class*="st-key-s_off_"] button { background:#FFF5EF !important; color:#C62828 !important;
+      border:1px solid #F2C8B6 !important; border-radius:999px !important; min-height: 2.1rem; }
+div[class*="st-key-fx_"] button { background:#FDFFE9 !important; color:#8A6D00 !important;
+      border:1px solid #E2E8A6 !important; border-radius:999px !important; opacity:1 !important; min-height: 2.1rem; }
 /* 날짜별 수정 달력 */
 div[class*="st-key-dday_"] button { background:#FFFFFF; border:1px solid var(--line); border-radius:999px; min-height: 2.4rem; }
-div[class*="st-key-dmod_"] button { background:#C8F7FF; border:1px solid #90CAF9; color:#1565C0; border-radius:999px; min-height: 2.4rem; }
+div[class*="st-key-dmod_"] button { background:#EBFFFF; border:1px solid #90CAF9; color:#1565C0; border-radius:999px; min-height: 2.4rem; }
 div[class*="st-key-dsel_"] button { background:linear-gradient(120deg,#1F3864,#2E75B6) !important; color:#FFFFFF !important;
       border:none !important; border-radius:999px; min-height: 2.4rem; }
 .legend { display:flex; flex-wrap:wrap; gap:8px; margin: 4px 0 18px 0; }
@@ -644,9 +780,9 @@ if "history" not in st.session_state:
 DAYS = ["일", "월", "화", "수", "목", "금", "토"]
 WEEKEND = {"일", "토"}
 HOURS = list(range(8, 24))
-CELL_STYLE = {"교육": "background-color:#F9FFC6;color:#8A6D00;",
-              "가능": "background-color:#C8F7FF;color:#1565C0;",
-              "불가": "background-color:#FFD1C9;color:#C62828;"}
+CELL_STYLE = {"교육": "background-color:#FDFFE9;color:#8A6D00;",
+              "가능": "background-color:#EBFFFF;color:#1565C0;",
+              "불가": "background-color:#FFF5EF;color:#C62828;"}
 
 
 def is_fixed(d, h):
@@ -816,9 +952,9 @@ GRID_CSS = """
 .ag-cell { height:32px; border-radius:999px; display:flex; align-items:center; justify-content:center;
            font-size:12px; font-weight:700; cursor:pointer; transition: transform .08s ease, box-shadow .15s ease; }
 .ag-cell:hover { transform: scale(1.05); box-shadow: 0 3px 10px rgba(31,56,100,.12); }
-.ag-cell.on    { background:#C8F7FF; color:#1565C0; border:1.5px solid #8FE3F2; }
-.ag-cell.off   { background:#FFD1C9; color:#C62828; border:1.5px solid #F5AFA2; }
-.ag-cell.fixed { background:#F9FFC6; color:#8A6D00; border:1.5px solid #E3EC8C; cursor:not-allowed; }
+.ag-cell.on    { background:#EBFFFF; color:#1565C0; border:1.5px solid #A8E3EC; }
+.ag-cell.off   { background:#FFF5EF; color:#C62828; border:1.5px solid #F2C8B6; }
+.ag-cell.fixed { background:#FDFFE9; color:#8A6D00; border:1.5px solid #E2E8A6; cursor:not-allowed; }
 .ag-cell.fixed:hover { transform:none; box-shadow:none; }
 """
 
@@ -1154,9 +1290,9 @@ elif page == "plan":
     st.markdown(md("칸을 누르거나 **드래그하면 한 번에 칠해져요** (처음 누른 칸의 반대 값으로 칠함). "
                    "평일 09:00~18:00은 교육 시간으로 고정되고, 평일 08:00 칸은 08:00~08:50(체크인 전)입니다. "
                    "주말은 모든 시간을 선택할 수 있어요."))
-    st.markdown("<div class='legend'><span style='background:#F9FFC6;color:#8A6D00'>교육</span>"
-                "<span style='background:#C8F7FF;color:#1565C0'>가능</span>"
-                "<span style='background:#FFD1C9;color:#C62828'>불가</span></div>", unsafe_allow_html=True)
+    st.markdown("<div class='legend'><span style='background:#FDFFE9;color:#8A6D00'>교육</span>"
+                "<span style='background:#EBFFFF;color:#1565C0'>가능</span>"
+                "<span style='background:#FFF5EF;color:#C62828'>불가</span></div>", unsafe_allow_html=True)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
     mode = st.segmented_control("수정 방식", ["고정 요일", "날짜별 수정"], default="고정 요일",
@@ -1296,53 +1432,111 @@ elif page == "plan":
             if st.session_state.get("notion_url"):
                 st.success(f"노션에 학습 계획 페이지를 만들었어요 👉 [열기]({st.session_state.notion_url})")
 
-# ─────────────────────────────────────────── 탭 3. AI 문서 작성
+# ─────────────────────────────────────────── AI 문서 작성
 elif page == "doc":
     st.subheader("📝 프로젝트 정리 문서 만들기")
-    st.caption("프로젝트를 하나씩 추가한 뒤 PDF·PPT로 정리합니다. (백서 9장 포트폴리오 작성 원칙 적용)")
-    if "projects" not in st.session_state:
-        st.session_state.projects = []
-
+    st.caption("프로젝트를 추가하면 아래 목록에 쌓여요. 목록에서 프로젝트를 고르면 위 입력칸에 불러와 수정할 수 있어요. "
+               "(백서 9장 포트폴리오 작성 원칙 적용)")
+    ss = st.session_state
+    ss.setdefault("projects", [])
+    ss.setdefault("portfolios", [])
+    ss.setdefault("pf_edit", None)
     today = dt.date.today()
-    with st.form("project_form", clear_on_submit=True):
-        c1, c2 = st.columns([2, 1])
-        name = c1.text_input("프로젝트 이름 *")
-        ptype = c2.selectbox("유형", ["빅프로젝트", "미니프로젝트", "공모전", "해커톤", "스터디", "개인 프로젝트", "기타"])
-        proj_period = date_range_input("기간 (시작일 ~ 종료일)", today - dt.timedelta(days=55), today, "proj_period")
-        c3, c4, c5 = st.columns([1.2, 0.8, 2])
-        team_track = c3.selectbox("팀 트랙", ["DX 컨설턴트", "AI 개발자"])
-        team_size = c4.number_input("인원", min_value=1, max_value=12, value=5, step=1)
-        tech = c5.text_input("사용 기술·도구", placeholder="Python, Pandas, Streamlit")
-        role = st.text_area("맡은 역할 *", placeholder="조장, 데이터 수집·분석, 최종 발표")
-        task = st.text_area("과제 내용 (어떤 문제를 풀었나) *")
-        process = st.text_area("수행 과정 (막힌 점과 해결 포함)")
-        result = st.text_area("결과·성과 (숫자가 있으면 꼭 적기)")
-        learned = st.text_area("과제를 통해 얻은 것 *")
-        add = st.form_submit_button("➕ 프로젝트 추가")
+    PF_DEFAULTS = {"pf_name": "", "pf_type": "빅프로젝트", "pf_period": (today - dt.timedelta(days=55), today),
+                   "pf_track": "DX 컨설턴트", "pf_size": 5, "pf_tech": "", "pf_role": "", "pf_task": "",
+                   "pf_process": "", "pf_result": "", "pf_learned": ""}
+    for k, v in PF_DEFAULTS.items():
+        ss.setdefault(k, v)
 
-    if add:
-        if not all(x.strip() for x in (name, role, task, learned)):
-            st.warning("필수 항목(*)을 모두 입력해 주세요.")
-        elif not proj_period:
-            st.warning("기간의 시작일과 종료일을 모두 선택해 주세요.")
+    def pf_reset():
+        for k, v in PF_DEFAULTS.items():
+            st.session_state[k] = v
+        st.session_state.pf_edit = None
+
+    def pf_load(i):
+        r = st.session_state.projects[i]["_raw"]
+        for k in ("name", "type", "track", "size", "tech", "role", "task", "process", "result", "learned"):
+            st.session_state[f"pf_{k}"] = r[k]
+        st.session_state.pf_period = (dt.date.fromisoformat(r["start"]), dt.date.fromisoformat(r["end"]))
+        st.session_state.pf_edit = i
+
+    def pf_delete(i):
+        st.session_state.projects.pop(i)
+        e = st.session_state.pf_edit
+        if e == i:
+            pf_reset()
+        elif e is not None and e > i:
+            st.session_state.pf_edit = e - 1
+
+    def pf_submit():
+        s = st.session_state
+        if not all(str(s[k]).strip() for k in ("pf_name", "pf_role", "pf_task", "pf_learned")):
+            s.pf_msg = ("warning", "필수 항목(*)을 모두 입력해 주세요.")
+            return
+        period = s.pf_period
+        if not (isinstance(period, (tuple, list)) and len(period) == 2):
+            s.pf_msg = ("warning", "기간의 시작일과 종료일을 모두 선택해 주세요.")
+            return
+        a, b = period
+        weeks_n = max(1, math.ceil(((b - a).days + 1) / 7))
+        raw = {"name": s.pf_name.strip(), "type": s.pf_type, "start": a.isoformat(), "end": b.isoformat(),
+               "track": s.pf_track, "size": int(s.pf_size), "tech": s.pf_tech, "role": s.pf_role, "task": s.pf_task,
+               "process": s.pf_process, "result": s.pf_result, "learned": s.pf_learned}
+        proj = {"프로젝트 이름": raw["name"], "유형": raw["type"], "기간": f"{a:%Y.%m.%d}~{b:%Y.%m.%d} ({weeks_n}주)",
+                "팀 구성": f"{raw['size']}명 ({raw['track']} 트랙)", "사용 기술": raw["tech"], "맡은 역할": raw["role"],
+                "과제 내용": raw["task"], "수행 과정": raw["process"], "결과·성과": raw["result"],
+                "얻은 것": raw["learned"], "_raw": raw}
+        if s.pf_edit is not None and 0 <= s.pf_edit < len(s.projects):
+            s.projects[s.pf_edit] = proj
+            s.pf_msg = ("success", f"'{raw['name']}' 수정 내용을 저장했어요.")
         else:
-            a, b = proj_period
-            weeks_n = max(1, math.ceil(((b - a).days + 1) / 7))
-            period = f"{a:%Y.%m.%d}~{b:%Y.%m.%d} ({weeks_n}주)"
-            team = f"{team_size}명 ({team_track} 트랙)"
-            st.session_state.projects.append({"프로젝트 이름": name, "유형": ptype, "기간": period, "팀 구성": team,
-                                              "사용 기술": tech, "맡은 역할": role, "과제 내용": task,
-                                              "수행 과정": process, "결과·성과": result, "얻은 것": learned})
-            st.success(f"'{name}' 추가 완료")
+            s.projects.append(proj)
+            s.pf_msg = ("success", f"'{raw['name']}'을(를) 추가했어요.")
+        pf_reset()
 
-    for i, p in enumerate(st.session_state.projects):
-        c1, c2 = st.columns([10, 1])
-        c1.markdown(md(f"**{i + 1}. {p['프로젝트 이름']}** · {p['유형']} · {p['기간']} · {p['팀 구성']}"))
-        if c2.button("삭제", key=f"del_{i}"):
-            st.session_state.projects.pop(i)
-            st.rerun()
+    # ① 프로젝트 입력 (선택한 프로젝트는 여기로 불러와 수정)
+    editing = ss.pf_edit is not None and ss.pf_edit < len(ss.projects)
+    if editing:
+        e1, e2 = st.columns([5, 1.4])
+        e1.info(f"✏️ '{ss.projects[ss.pf_edit]['프로젝트 이름']}' 수정 중입니다. 고친 뒤 '수정 내용 저장'을 누르세요.")
+        e2.button("새 프로젝트 입력", on_click=pf_reset, width="stretch")
+
+    with st.form("project_form"):
+        c1, c2 = st.columns([2, 1])
+        c1.text_input("프로젝트 이름 *", key="pf_name")
+        c2.selectbox("유형", ["빅프로젝트", "미니프로젝트", "공모전", "해커톤", "스터디", "개인 프로젝트", "기타"], key="pf_type")
+        st.date_input("기간 (시작일 ~ 종료일)", key="pf_period", format="YYYY.MM.DD")
+        c3, c4, c5 = st.columns([1.2, 0.8, 2])
+        c3.selectbox("팀 트랙", ["DX 컨설턴트", "AI 개발자"], key="pf_track")
+        c4.number_input("인원", min_value=1, max_value=12, step=1, key="pf_size")
+        c5.text_input("사용 기술·도구", placeholder="Python, Pandas, Streamlit", key="pf_tech")
+        st.text_area("맡은 역할 *", placeholder="조장, 데이터 수집·분석, 최종 발표", key="pf_role")
+        st.text_area("과제 내용 (어떤 문제를 풀었나) *", key="pf_task")
+        st.text_area("수행 과정 (막힌 점과 해결 포함)", key="pf_process")
+        st.text_area("결과·성과 (숫자가 있으면 꼭 적기)", key="pf_result")
+        st.text_area("과제를 통해 얻은 것 *", key="pf_learned")
+        st.form_submit_button("💾 수정 내용 저장" if editing else "➕ 프로젝트 추가", type="primary", on_click=pf_submit)
+
+    if ss.get("pf_msg"):
+        kind, text = ss.pop("pf_msg")
+        (st.success if kind == "success" else st.warning)(text)
+
+    # ② 추가된 프로젝트 (선택하면 위로 불러오기)
+    st.markdown(f"<div class='sec-title'>📁 추가된 프로젝트 ({len(ss.projects)}개)</div>", unsafe_allow_html=True)
+    if not ss.projects:
+        st.caption("아직 추가된 프로젝트가 없어요. 위에 입력하고 '프로젝트 추가'를 눌러 주세요.")
+    for i, p in enumerate(ss.projects):
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([6, 1.3, 0.9])
+            badge = " · ✏️ 수정 중" if ss.pf_edit == i else ""
+            c1.markdown(md(f"**{i + 1}. {p['프로젝트 이름']}**{badge}  \n{p['유형']} · {p['기간']} · {p['팀 구성']}"))
+            c2.button("선택해서 수정", key=f"pload_{i}", on_click=pf_load, args=(i,), width="stretch")
+            c3.button("삭제", key=f"pdel_{i}", on_click=pf_delete, args=(i,), width="stretch")
 
     st.divider()
+
+    # ③ 문서 정보 · 형식 · 요청 사항 · 템플릿
+    st.markdown("<div class='sec-title'>🪄 포트폴리오 만들기</div>", unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     author_name = c1.text_input("이름", placeholder="홍길동")
     job = c2.text_input("지원 직무", value="DX 컨설턴트")
@@ -1350,12 +1544,17 @@ elif page == "doc":
     formats = st.multiselect("출력 형식", ["PDF", "PPT"], default=["PDF", "PPT"])
     request = st.text_area("요청 사항", placeholder="예) 데이터 분석 역량이 잘 드러나게, 면접관이 1분 안에 읽을 수 있게 간결하게, "
                                                  "금융권 지원용 표현으로")
+    st.markdown("**🎨 템플릿 선택**")
+    template = st.file_uploader("PPT 템플릿 (.pptx)", type=["pptx"], key="pf_template", label_visibility="collapsed")
+    st.caption("PPT 템플릿을 올리면 그 템플릿의 레이아웃·색·글꼴로 PPT를 만들어요. 템플릿 안의 기존 슬라이드는 사용하지 않아요. "
+               "올리지 않으면 기본 디자인으로 만들어요.")
 
-    if st.button("🪄 AI로 문서 작성", type="primary", disabled=not st.session_state.projects):
+    if st.button("🪄 AI로 문서 작성", type="primary", disabled=not ss.projects):
         author = {"name": author_name or "에이블러", "job": job,
                   "links": [x.strip() for x in links.split(",") if x.strip()]}
-        projects_text = "\n\n".join(f"[프로젝트 {i + 1}]\n" + "\n".join(f"- {k}: {v or '입력 없음'}" for k, v in p.items())
-                                    for i, p in enumerate(st.session_state.projects))
+        projects_text = "\n\n".join(
+            f"[프로젝트 {i + 1}]\n" + "\n".join(f"- {k}: {v or '입력 없음'}" for k, v in p.items() if k != "_raw")
+            for i, p in enumerate(ss.projects))
         with st.spinner("생각중입니다... 백서의 포트폴리오 원칙을 참고해 작성하고 있어요."):
             context = search_context(["포트폴리오 작성 순서", "나를 차별화하는 구성 규칙 7가지",
                                       "자기소개 페이지 다섯 칸 슬로건", "포트폴리오 핵심 4가지 영역"])
@@ -1380,31 +1579,64 @@ elif page == "doc":
             doc = (prompt | ChatOpenAI(model=MODEL, temperature=0.2).with_structured_output(PortfolioDoc)).invoke(
                 {"context": context, "job": job, "projects": projects_text,
                  "request": request.strip() or "없음"}).model_dump()
-        st.session_state.portfolio = doc
-        stamp = f"{dt.date.today():%Y%m%d}"
-        st.session_state.files = {}
-        if "PDF" in formats:
-            st.session_state.files["PDF"] = (portfolio_pdf(doc, author), f"프로젝트정리_{stamp}.pdf", "application/pdf")
-        if "PPT" in formats:
-            st.session_state.files["PPT"] = (portfolio_pptx(doc, author), f"프로젝트정리_{stamp}.pptx",
-                                             "application/vnd.openxmlformats-officedocument.presentationml.presentation")
 
-    if "portfolio" in st.session_state:
-        doc = st.session_state.portfolio
-        st.success(f"💡 {md(doc['slogan'])}")
-        if doc["key_numbers"]:
-            for col, k in zip(st.columns(len(doc["key_numbers"])), doc["key_numbers"]):
-                col.metric(k["label"], k["value"])
-        for p in doc["projects"]:
-            with st.expander(md(f"📁 {p['project_name']} — {p['title_sentence']}")):
-                st.markdown(md(f"**내 역할**: {p['my_role']}  \n**선택 이유**: {p['role_reason']}"))
-                for title, key in (("문제 정의", "problem"), ("해결 과정", "process"), ("결과", "results")):
-                    st.markdown(f"**{title}**\n" + "\n".join(f"- {md(x)}" for x in p[key]))
-                st.markdown(md(f"**회고**: {p['retrospective']}"))
-        for col, (fmt, (data, fname, mime)) in zip(st.columns(max(len(st.session_state.files), 1)),
-                                                   st.session_state.files.items()):
-            col.download_button(f"⬇️ {fmt} 다운로드", data, file_name=fname, mime=mime)
-        st.caption("※ AI가 정리한 초안입니다. 제출 전 내용을 꼭 확인하세요.")
+            stamp = dt.datetime.now()
+            files, tpl_note = {}, ""
+            if "PDF" in formats:
+                files["PDF"] = (portfolio_pdf(doc, author), f"프로젝트정리_{stamp:%Y%m%d_%H%M}.pdf", "application/pdf")
+            if "PPT" in formats:
+                pptx_bytes = None
+                if template is not None:
+                    try:
+                        pptx_bytes = portfolio_pptx_template(doc, author, template.getvalue())
+                        tpl_note = f"템플릿: {template.name}"
+                    except Exception as e:
+                        st.warning(f"템플릿을 적용하지 못해 기본 디자인으로 만들었어요. ({e})")
+                if pptx_bytes is None:
+                    pptx_bytes = portfolio_pptx(doc, author)
+                files["PPT"] = (pptx_bytes, f"프로젝트정리_{stamp:%Y%m%d_%H%M}.pptx",
+                                "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        ss.portfolios.insert(0, {"id": stamp.strftime("%H%M%S%f"), "time": f"{stamp:%m.%d %H:%M}", "job": job,
+                                 "n": len(doc["projects"]), "formats": " · ".join(files), "note": tpl_note,
+                                 "doc": doc, "files": files})
+        st.success("포트폴리오를 만들었어요! 아래 '만든 포트폴리오'에서 선택하면 슬로건·대표 숫자와 파일을 볼 수 있어요.")
+
+    # ④ 만든 포트폴리오 (선택하면 슬로건·대표 숫자·파일 표시)
+    if ss.portfolios:
+        st.markdown("<div class='sec-title'>📚 만든 포트폴리오</div>", unsafe_allow_html=True)
+        sel = ss.get("pf_sel")
+        for pf in ss.portfolios:
+            on = sel == pf["id"]
+            label = (f"{'▼' if on else '▶'}  📄 {pf['time']} · {pf['job']} · 프로젝트 {pf['n']}개 · {pf['formats']}"
+                     + (f" · {pf['note']}" if pf["note"] else ""))
+            if st.button(label, key=f"pf{'on' if on else 'off'}_{pf['id']}", width="stretch"):
+                st.session_state.pf_sel = None if on else pf["id"]
+                st.rerun()
+            if on:
+                doc = pf["doc"]
+                with st.container(border=True):
+                    st.success(f"💡 {md(doc['slogan'])}")
+                    if doc["key_numbers"]:
+                        for col, k in zip(st.columns(len(doc["key_numbers"])), doc["key_numbers"]):
+                            col.metric(k["label"], k["value"])
+                    st.markdown("**핵심 강점**\n" + "\n".join(f"- **{md(s['title'])}**: {md(s['evidence'])}"
+                                                           for s in doc["strengths"]))
+                    for p in doc["projects"]:
+                        with st.expander(md(f"📁 {p['project_name']} — {p['title_sentence']}")):
+                            st.markdown(md(f"**내 역할**: {p['my_role']}  \n**선택 이유**: {p['role_reason']}"))
+                            for title, key in (("문제 정의", "problem"), ("해결 과정", "process"), ("결과", "results")):
+                                st.markdown(f"**{title}**\n" + "\n".join(f"- {md(x)}" for x in p[key]))
+                            st.markdown(md(f"**회고**: {p['retrospective']}"))
+                    cols = st.columns(max(len(pf["files"]), 1) + 1)
+                    for col, (fmt, (data, fname, mime)) in zip(cols, pf["files"].items()):
+                        col.download_button(f"⬇️ {fmt} 다운로드", data, file_name=fname, mime=mime,
+                                            key=f"dl_{fmt}_{pf['id']}", width="stretch")
+                    if cols[-1].button("🗑️ 삭제", key=f"pfdel_{pf['id']}", width="stretch"):
+                        ss.portfolios = [x for x in ss.portfolios if x["id"] != pf["id"]]
+                        ss.pf_sel = None
+                        st.rerun()
+                    st.caption("※ AI가 정리한 초안입니다. 제출 전 내용을 꼭 확인하세요.")
+
 
 # ─────────────────────────────────────────── 사이드바: 최근 질문 3개 (키워드) · 대화 삭제
 with recent_box:
