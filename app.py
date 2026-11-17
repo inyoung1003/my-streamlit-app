@@ -10,6 +10,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -68,6 +69,7 @@ SYSTEM_MSG = """당신은 KT AIVLE School 선배 에이블러처럼 친근하고
 5. 문서에 없는 사실이나 수치를 만들지 마세요.
 6. 마지막에 질문자의 상황에 맞는 응원 한 문장이나 다음에 해 볼 행동 하나를 제안해, 에이블스쿨에 적극적으로 도전하고 싶어지게 하세요.
 7. 친절하고 이해하기 쉬운 한국어로 답하세요.
+8. [참고 문서]는 사용자가 쓴 글이 아니라 백서에서 검색된 자료입니다. 사용자를 칭찬하거나 "잘 정리해 주셨네요"처럼 사용자가 문서를 제공한 것처럼 말하지 말고, 사용자의 질문에 바로 답하세요.
 
 [참고 문서]
 {context}"""
@@ -112,7 +114,7 @@ def make_chain(retriever):
     llm = ChatOpenAI(model=MODEL, streaming=True, temperature=0)
     return (
         {
-            "context": itemgetter("input") | retriever | format_docs,
+            "context": RunnableLambda(lambda x: x.get("query") or x["input"]) | retriever | format_docs,
             "input": itemgetter("input"),
             "history": itemgetter("history"),
         }
@@ -178,6 +180,11 @@ def week_ranges(start, end):
         out.append((cur, last))
         cur = last + dt.timedelta(days=1)
     return out
+
+
+def md(text):
+    """마크다운에서 ~가 두 개면 취소선이 되므로 이스케이프"""
+    return str(text).replace("~", "\\~")
 
 
 def fmt_md(d):
@@ -281,6 +288,8 @@ def plan_markdown(plan, prof):
          "## 요일별 시간표", "", "| 요일 | 시간 | 할 일 | 세부 내용 |", "|---|---|---|---|"]
     L += [f"| {d['day']} | {b['time']} | {b['activity']} | {b['detail']} |"
           for d in plan["day_schedules"] for b in d["blocks"]]
+    if prof.get("exceptions"):
+        L += ["", "## 날짜별 예외"] + [f"- {e}" for e in prof["exceptions"]]
     L += ["", "## 주간 계획"]
     for w in plan["weekly_plan"]:
         L += ["", f"### {w['week']}주차 ({week_label(prof, w['week'])}) · {w['theme']}", "**목표**"]
@@ -411,6 +420,8 @@ def plan_pdf(plan, prof):
                                           [[d["day"], b["time"], b["activity"], b["detail"]]
                                            for d in plan["day_schedules"] for b in d["blocks"]],
                                           [14 * mm, 28 * mm, 42 * mm, CW - 84 * mm])]
+    if prof.get("exceptions"):
+        st_ += [_p("날짜별 예외", "h1")] + _bullets(prof["exceptions"])
     st_.append(_p("주간 계획", "h1"))
     for w in plan["weekly_plan"]:
         st_.append(KeepTogether([_p(f"{w['week']}주차 ({week_label(prof, w['week'])}) · {w['theme']}", "h2"), _p("목표")] + _bullets(w["goals"])
@@ -547,7 +558,7 @@ section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button {
 .st-key-logo_start button {{
     background: url("data:image/png;base64,{LOGO_B64}") center / contain no-repeat !important;
     border: none !important; box-shadow: none !important;
-    width: 100%; height: 110px; color: transparent !important; cursor: pointer;
+    width: 100%; height: 150px; color: transparent !important; cursor: pointer;
     transition: transform .15s ease;
 }}
 .st-key-logo_start button:hover {{transform: scale(1.04);}}
@@ -561,13 +572,18 @@ div[class*="st-key-sugg_"] button {{border-radius: 20px; font-size: 0.85rem;}}
 /* 최근 질문 키워드 */
 .kw {{display:inline-block; background:#EEF3FA; color:#1F3864; border-radius:12px;
       padding:3px 10px; margin:3px 4px 3px 0; font-size:0.82rem;}}
-/* 공부 가능 시간표 */
-div[class*="st-key-s_on_"] button {{background:#E9ECF1 !important; color:#222 !important;
-      border:1px solid #D0D5DD !important; min-height: 2.1rem;}}
-div[class*="st-key-s_off_"] button {{background:#FFF1EF !important; color:#C0392B !important;
-      border:1px solid #F5C6C0 !important; min-height: 2.1rem;}}
-div[class*="st-key-fx_"] button {{background:#EAF1FB !important; color:#2E75B6 !important;
-      border:1px solid #C9DAF0 !important; opacity:1 !important; min-height: 2.1rem;}}
+/* 공부 가능 시간표 (버튼 방식 예비용) — 교육: 노랑 / 가능: 하늘 / 불가: 빨강 */
+div[class*="st-key-s_on_"] button {{background:#E3F2FD !important; color:#1565C0 !important;
+      border:1px solid #BBDEFB !important; min-height: 2.1rem;}}
+div[class*="st-key-s_off_"] button {{background:#FFE5E5 !important; color:#C62828 !important;
+      border:1px solid #FFCDD2 !important; min-height: 2.1rem;}}
+div[class*="st-key-fx_"] button {{background:#FFF6CC !important; color:#8A6D00 !important;
+      border:1px solid #FFE58F !important; opacity:1 !important; min-height: 2.1rem;}}
+/* 날짜별 수정 달력 */
+div[class*="st-key-dday_"] button {{background:#FFFFFF; border:1px solid #E5E7EB; min-height: 2.4rem;}}
+div[class*="st-key-dmod_"] button {{background:#E3F2FD; border:1px solid #90CAF9; color:#1565C0; min-height: 2.4rem;}}
+div[class*="st-key-dsel_"] button {{background:#1F3864 !important; color:#FFFFFF !important; min-height: 2.4rem;}}
+.legend span {{display:inline-block; padding:3px 12px; border-radius:8px; margin-right:6px; font-size:0.85rem;}}
 .slot-head {{text-align:center; font-weight:700; color:#1F3864;}}
 .slot-time {{font-size:0.85rem; color:#595959; padding-top:0.45rem;}}
 </style>
@@ -578,11 +594,9 @@ if not st.session_state.get("started"):
     st.markdown("<div style='height:16vh'></div>", unsafe_allow_html=True)
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
-        if st.button("AIVLE", key="logo_start", help="눌러서 대화 시작"):
+        if st.button("AIVLE", key="logo_start", help="눌러서 대화 시작", width="stretch"):
             st.session_state.started = True
             st.rerun()
-        st.markdown("<p style='text-align:center;color:#595959;'>로고를 누르면 대화가 시작돼요</p>",
-                    unsafe_allow_html=True)
     st.stop()
 
 st.markdown('<div class="hero"><h1>AIVLE School 학습 도우미</h1></div>', unsafe_allow_html=True)
@@ -602,7 +616,10 @@ if "history" not in st.session_state:
 # ─────────────────────────────────────────── 공부 가능 시간 (요일 × 시간)
 DAYS = ["일", "월", "화", "수", "목", "금", "토"]
 WEEKEND = {"일", "토"}
-BANDS = {"오전 08–12": range(8, 12), "오후 12–18": range(12, 18), "저녁 18–24": range(18, 24)}
+HOURS = list(range(8, 24))
+CELL_STYLE = {"교육": "background-color:#FFF6CC;color:#8A6D00;",
+              "가능": "background-color:#E3F2FD;color:#1565C0;",
+              "불가": "background-color:#FFE5E5;color:#C62828;"}
 
 
 def is_fixed(d, h):
@@ -614,19 +631,48 @@ def slot_minutes(d, h):
     return 50 if (d not in WEEKEND and h == 8) else 60     # 평일 08:00~08:50
 
 
-if "avail" not in st.session_state:
+def day_of(date):
+    return DAYS[(date.weekday() + 1) % 7]
+
+
+if "avail" not in st.session_state:          # 고정 요일 시간표
     st.session_state.avail = {
         f"{d}-{h}": (h in (19, 20, 21)) if d not in WEEKEND else (h in (10, 11, 14, 15, 16, 17))
-        for d in DAYS for h in range(8, 24) if not is_fixed(d, h)}
+        for d in DAYS for h in HOURS if not is_fixed(d, h)}
+if "date_avail" not in st.session_state:     # 날짜별 수정 {날짜: {시: bool}}
+    st.session_state.date_avail = {}
+if "grid_ver" not in st.session_state:
+    st.session_state.grid_ver = 0
 
 
-def day_ranges(d):
-    """선택한 가능 시간을 이어진 구간으로 합치기. 예) ['08:00~08:50', '19:00~22:00']"""
-    hours = [h for h in range(8, 24) if st.session_state.avail.get(f"{d}-{h}")]
+def is_on(d, h, date=None):
+    if is_fixed(d, h):
+        return False
+    if date is not None and date.isoformat() in st.session_state.date_avail:
+        return st.session_state.date_avail[date.isoformat()].get(h, False)
+    return st.session_state.avail.get(f"{d}-{h}", False)
+
+
+def set_on(d, h, value, date=None):
+    if is_fixed(d, h):
+        return
+    if date is None:
+        st.session_state.avail[f"{d}-{h}"] = value
+    else:
+        iso = date.isoformat()
+        if iso not in st.session_state.date_avail:      # 처음 수정하면 고정 요일 시간표를 복사
+            st.session_state.date_avail[iso] = {x: st.session_state.avail.get(f"{d}-{x}", False)
+                                                for x in HOURS if not is_fixed(d, x)}
+        st.session_state.date_avail[iso][h] = value
+
+
+def day_ranges(d, date=None):
+    """가능 시간을 이어진 구간으로 합치기. 예) ['08:00~08:50', '19:00~22:00']"""
+    hours = [h for h in HOURS if is_on(d, h, date)]
     out, i = [], 0
     while i < len(hours):
         j = i
-        while j + 1 < len(hours) and hours[j + 1] == hours[j] + 1 and not is_fixed(d, hours[j + 1]):
+        while j + 1 < len(hours) and hours[j + 1] == hours[j] + 1:
             j += 1
         a, b = hours[i], hours[j]
         end = "08:50" if (d not in WEEKEND and b == 8) else f"{b + 1:02d}:00"
@@ -635,8 +681,8 @@ def day_ranges(d):
     return out
 
 
-def day_minutes(d):
-    return sum(slot_minutes(d, h) for h in range(8, 24) if st.session_state.avail.get(f"{d}-{h}"))
+def day_minutes(d, date=None):
+    return sum(slot_minutes(d, h) for h in HOURS if is_on(d, h, date))
 
 
 def availability_text():
@@ -648,13 +694,97 @@ def availability_text():
     return "\n".join(lines)
 
 
+def exceptions_in(start, end):
+    """계획 기간 안에서 고정 요일과 다르게 수정한 날짜 목록"""
+    out = []
+    for iso in sorted(st.session_state.date_avail):
+        date = dt.date.fromisoformat(iso)
+        if start <= date <= end:
+            d = day_of(date)
+            new, base = day_ranges(d, date), day_ranges(d)
+            if new != base:
+                out.append(f"{fmt_md(date)}({d}): " + (", ".join(new) if new else "공부 불가")
+                           + f" (평소 {', '.join(base) if base else '공부 불가'})")
+    return out
+
+
+def period_dates():
+    """현재 선택한 계획 기간의 날짜 목록 (최대 12주)"""
+    value = st.session_state.get("plan_period")
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        a, b = value
+    else:
+        a = dt.date.today()
+        b = a + dt.timedelta(days=27)
+    b = min(b, a + dt.timedelta(days=7 * 12 - 1))
+    return [a + dt.timedelta(days=i) for i in range((b - a).days + 1)]
+
+
+def editable_grid(columns, key):
+    """
+    columns: [(열 이름, 요일, 날짜 또는 None)]
+    표에서 칸을 드래그해 여러 칸을 선택한 뒤 '가능/불가로 칠하기' 버튼으로 한 번에 변경
+    """
+    df = pd.DataFrame(
+        {label: ["교육" if is_fixed(d, h) else ("가능" if is_on(d, h, date) else "불가") for h in HOURS]
+         for label, d, date in columns},
+        index=[f"{h:02d}:00" for h in HOURS])
+    styler = df.style
+    styler = (styler.map if hasattr(styler, "map") else styler.applymap)(
+        lambda v: CELL_STYLE.get(v, "") + "text-align:center;")
+    cells = []
+    try:
+        event = st.dataframe(styler, key=f"{key}_{st.session_state.grid_ver}", on_select="rerun",
+                             selection_mode="multi-cell", height=36 * (len(HOURS) + 1) + 4, width="stretch")
+        sel = event["selection"] if isinstance(event, dict) else event.selection
+        raw = sel.get("cells", []) if isinstance(sel, dict) else getattr(sel, "cells", [])
+        for c in raw:
+            r, col = (c.get("row"), c.get("column")) if isinstance(c, dict) else (c[0], c[1])
+            if isinstance(col, int):
+                col = df.columns[col]
+            cells.append((int(r), col))
+    except Exception:
+        # 드래그 선택을 지원하지 않는 버전이면 칸을 하나씩 눌러 바꾸는 방식으로
+        st.caption("칸을 눌러 가능 ↔ 불가를 바꿀 수 있어요.")
+        head = st.columns([0.8] + [1] * len(columns))
+        for j, (label, d, date) in enumerate(columns):
+            head[j + 1].markdown(f"<div class='slot-head'>{label}</div>", unsafe_allow_html=True)
+        for h in HOURS:
+            row = st.columns([0.8] + [1] * len(columns))
+            row[0].markdown(f"<div class='slot-time'>{h:02d}:00</div>", unsafe_allow_html=True)
+            for j, (label, d, date) in enumerate(columns):
+                if is_fixed(d, h):
+                    row[j + 1].button("교육", key=f"fx_{key}_{j}_{h}", disabled=True, width="stretch")
+                else:
+                    on = is_on(d, h, date)
+                    if row[j + 1].button("가능" if on else "불가", key=f"s_{'on' if on else 'off'}_{key}_{j}_{h}",
+                                         width="stretch"):
+                        set_on(d, h, not on, date)
+                        st.rerun()
+        return
+
+    label_map = {label: (d, date) for label, d, date in columns}
+    b1, b2 = st.columns(2)
+    paint_on = b1.button("선택한 칸 가능으로 칠하기", key=f"on_{key}", disabled=not cells, width="stretch")
+    paint_off = b2.button("선택한 칸 불가로 칠하기", key=f"off_{key}", disabled=not cells, width="stretch")
+    if paint_on or paint_off:
+        for r, col in cells:
+            if col in label_map and 0 <= r < len(HOURS):
+                d, date = label_map[col]
+                set_on(d, HOURS[r], paint_on, date)
+        st.session_state.grid_ver += 1      # 선택 초기화
+        st.rerun()
+
+
 # ─────────────────────────────────────────── 학습 계획 생성 (탭·채팅 공용)
 def generate_plan(track, stage, goal, start, end, level):
     ranges = week_ranges(start, end)
     weeks = len(ranges)
     period_txt = f"{fmt_md(start)}~{fmt_md(end)}"
     week_txt = "\n".join(f"- {i}주차: {fmt_md(a)}~{fmt_md(b)}" for i, (a, b) in enumerate(ranges, 1))
-    prof = {"track": track, "stage": stage, "goal": goal, "weeks": weeks, "period": period_txt, "ranges": ranges}
+    exceptions = exceptions_in(start, end)
+    prof = {"track": track, "stage": stage, "goal": goal, "weeks": weeks, "period": period_txt, "ranges": ranges,
+            "exceptions": exceptions}
     context = search_context(["개인 학습 전략 하루 루틴", f"{stage} 단계별 전략", "일일 타임테이블",
                               f"{track} 트랙", goal, "배경별 팁"])
     prompt = ChatPromptTemplate.from_messages([
@@ -665,10 +795,14 @@ def generate_plan(track, stage, goal, start, end, level):
 3. 평일(월~금)에는 '09:00~18:00 교육 참여' 블록을 넣으세요.
 4. 가능 시간이 긴 날은 중간에 휴식을 넣고, 블록은 30분 또는 1시간 단위로 나누세요.
 5. 주간 계획은 [주차 구분]대로 정확히 {weeks}개 주차로 만들고, 할 일에는 분량(문제 수·시간·회차)을 적으세요.
+   [날짜별 예외]가 있는 주는 그날 늘어나거나 줄어든 공부 시간만큼 그 주 할 일 분량을 조정하세요.
 6. 백서에 없는 사실·날짜·수치는 만들지 마세요. 한국어로 작성하세요.
 
 [공부 가능 시간]
 {avail}
+
+[날짜별 예외] (요일별 시간표는 평소 기준, 아래 날짜만 다름)
+{exceptions}
 
 [주차 구분]
 {week_txt}
@@ -680,6 +814,7 @@ def generate_plan(track, stage, goal, start, end, level):
     plan = (prompt | ChatOpenAI(model=MODEL, temperature=0.3).with_structured_output(StudyPlan)).invoke({
         "context": context, "track": track, "stage": stage, "goal": goal, "weeks": weeks,
         "week_txt": week_txt, "period": period_txt, "avail": availability_text(), "level": level or "입력 없음",
+        "exceptions": "\n".join(f"- {e}" for e in exceptions) or "없음",
     }).model_dump()
     st.session_state.plan, st.session_state.plan_prof = plan, prof
     st.session_state.plan_pdf = plan_pdf(plan, prof)
@@ -773,7 +908,7 @@ def show_sources(sources):
         with st.expander("📎 답변 근거 보기"):
             for i, s in enumerate(sources, 1):
                 st.markdown(f"**근거 {i}**")
-                st.caption(s)
+                st.caption(md(s))
 
 
 with tab_chat:
@@ -802,7 +937,7 @@ with tab_chat:
     shown = 0
     if question:
         with st.chat_message("user", avatar="🙋"):
-            st.markdown(question)
+            st.markdown(md(question))
         with st.chat_message("assistant", avatar="📘"):
             thinking = st.empty()
             thinking.markdown("🤔 생각중입니다...")
@@ -825,16 +960,21 @@ with tab_chat:
                           f"주차별 할 일을 확인하고, PDF·노션으로 내보낼 수 있어요.\n\n"
                           f"- 목표: {prof['goal']}\n- 기간: {prof['period']} ({prof['weeks']}주)\n"
                           f"- 공부 가능 시간: 개인 학습 계획 탭에서 선택한 시간 기준\n\n{plan['summary']}")
-                st.markdown(answer)
+                st.markdown(md(answer))
             else:
+                raw = []
+
                 def stream():
                     first = True
-                    for chunk in chain.stream({"input": info.standalone or question, "history": past}):
+                    for chunk in chain.stream({"input": question, "query": info.standalone or question,
+                                               "history": past}):
                         if first:
                             thinking.empty()
                             first = False
-                        yield chunk
-                answer = st.write_stream(stream())
+                        raw.append(chunk)
+                        yield md(chunk)
+                st.write_stream(stream())
+                answer = "".join(raw)
                 sources = [d.page_content[:300] + ("…" if len(d.page_content) > 300 else "")
                            for d in retriever.invoke(info.standalone or question)]
                 show_sources(sources)
@@ -847,90 +987,115 @@ with tab_chat:
         st.divider()
     for h in st.session_state.history[shown:]:
         with st.chat_message("user", avatar="🙋"):
-            st.markdown(h["q"])
+            st.markdown(md(h["q"]))
         with st.chat_message("assistant", avatar="📘"):
-            st.markdown(h["a"])
+            st.markdown(md(h["a"]))
             show_sources(h["sources"])
 
 # ─────────────────────────────────────────── 탭 2. 개인 학습 계획
 with tab_plan:
     st.subheader("📅 개인 학습 계획 만들기")
+    today = dt.date.today()
 
-    # ① 공부 가능 시간 선택 (칸을 누르면 가능 ↔ 불가)
-    st.markdown("#### ① 공부할 수 있는 시간 선택")
-    st.caption("칸을 누르면 가능 ↔ 불가가 바뀝니다. 평일 09:00~18:00은 교육 시간으로 고정되고, "
-               "평일 08:00 칸은 08:00~08:50(체크인 전)입니다. 주말은 모든 시간을 선택할 수 있어요.")
-    band = st.segmented_control("시간대", list(BANDS), default="저녁 18–24", key="band",
-                                label_visibility="collapsed") or "저녁 18–24"
+    # ① 계획 기간
+    st.markdown("#### ① 계획 기간")
+    date_range_input("계획 기간 (시작일 ~ 종료일)", today, today + dt.timedelta(days=27), "plan_period")
 
-    b1, b2 = st.columns(2)
-    if b1.button("이 시간대 모두 가능", width="stretch"):
-        for d in DAYS:
-            for h in BANDS[band]:
-                if not is_fixed(d, h):
-                    st.session_state.avail[f"{d}-{h}"] = True
-        st.rerun()
-    if b2.button("이 시간대 모두 불가", width="stretch"):
-        for d in DAYS:
-            for h in BANDS[band]:
-                if not is_fixed(d, h):
-                    st.session_state.avail[f"{d}-{h}"] = False
-        st.rerun()
+    # ② 공부 가능 시간 선택
+    st.markdown("#### ② 공부할 수 있는 시간 선택")
+    st.markdown(md("표에서 칸을 **드래그해 여러 칸을 선택**한 뒤 아래 버튼으로 한 번에 칠하세요. "
+                   "평일 09:00~18:00은 교육 시간으로 고정되고, 평일 08:00 칸은 08:00~08:50(체크인 전)입니다. "
+                   "주말은 모든 시간을 선택할 수 있어요."))
+    st.markdown("<div class='legend'><span style='background:#FFF6CC;color:#8A6D00'>교육</span>"
+                "<span style='background:#E3F2FD;color:#1565C0'>가능</span>"
+                "<span style='background:#FFE5E5;color:#C62828'>불가</span></div>", unsafe_allow_html=True)
 
-    head = st.columns([0.8] + [1] * 7)
-    for j, d in enumerate(DAYS):
-        head[j + 1].markdown(f"<div class='slot-head'>{d}</div>", unsafe_allow_html=True)
-    for h in BANDS[band]:
-        row = st.columns([0.8] + [1] * 7)
-        row[0].markdown(f"<div class='slot-time'>{h:02d}:00</div>", unsafe_allow_html=True)
+    mode = st.segmented_control("수정 방식", ["고정 요일", "날짜별 수정"], default="고정 요일",
+                                key="avail_mode", label_visibility="collapsed") or "고정 요일"
+
+    if mode == "고정 요일":
+        st.caption("요일마다 반복되는 기본 시간표입니다. 요일(열)마다 따로 칠할 수 있어요.")
+        editable_grid([(d, d, None) for d in DAYS], "week")
+        total = sum(day_minutes(d) for d in DAYS)
+        st.caption("주간 공부 가능 시간: **" + fmt_minutes(total) + "**  ·  " +
+                   "  ".join(f"{d} {fmt_minutes(day_minutes(d))}" for d in DAYS if day_minutes(d)))
+    else:
+        st.caption("특정 날짜만 다르게 바꿀 수 있어요. 날짜를 고른 뒤 그날의 시간표를 칠하세요. "
+                   "(하늘색 날짜 = 수정한 날)")
+        dates = period_dates()
+        sel = st.session_state.get("sel_date")
+        head = st.columns(7)
         for j, d in enumerate(DAYS):
-            if is_fixed(d, h):
-                row[j + 1].button("교육", key=f"fx_{j}_{h}", disabled=True, width="stretch")
-            else:
-                on = st.session_state.avail[f"{d}-{h}"]
-                if row[j + 1].button("가능" if on else "불가", key=f"s_{'on' if on else 'off'}_{j}_{h}",
-                                     width="stretch"):
-                    st.session_state.avail[f"{d}-{h}"] = not on
+            head[j].markdown(f"<div class='slot-head'>{d}</div>", unsafe_allow_html=True)
+        week = [None] * ((dates[0].weekday() + 1) % 7)
+        rows = []
+        for date in dates:
+            week.append(date)
+            if len(week) == 7:
+                rows.append(week)
+                week = []
+        if week:
+            rows.append(week + [None] * (7 - len(week)))
+        for wk in rows:
+            cols = st.columns(7)
+            for j, date in enumerate(wk):
+                if date is None:
+                    continue
+                iso = date.isoformat()
+                prefix = "dsel" if iso == sel else ("dmod" if iso in st.session_state.date_avail else "dday")
+                if cols[j].button(f"{date.month}.{date.day}", key=f"{prefix}_{iso}", width="stretch"):
+                    st.session_state.sel_date = iso
                     st.rerun()
 
-    total = sum(day_minutes(d) for d in DAYS)
-    st.caption("주간 공부 가능 시간: **" + fmt_minutes(total) + "**  ·  " +
-               "  ".join(f"{d} {fmt_minutes(day_minutes(d))}" for d in DAYS if day_minutes(d)))
+        if sel and dt.date.fromisoformat(sel) in dates:
+            date = dt.date.fromisoformat(sel)
+            d = day_of(date)
+            st.markdown(f"**{fmt_md(date)} ({d}) 시간표**")
+            editable_grid([(f"{date.month}.{date.day}({d})", d, date)], f"date_{sel}")
+            st.caption(f"이날 공부 가능 시간: **{fmt_minutes(day_minutes(d, date))}** "
+                       f"(평소 {d}요일 {fmt_minutes(day_minutes(d))})")
+            if sel in st.session_state.date_avail and st.button("↩️ 이 날짜를 고정 요일 시간표로 되돌리기"):
+                st.session_state.date_avail.pop(sel, None)
+                st.session_state.grid_ver += 1
+                st.rerun()
+        else:
+            st.info("위 달력에서 수정할 날짜를 눌러 주세요.")
 
-    # ② 계획 정보 입력
-    st.markdown("#### ② 계획 정보 입력")
-    today = dt.date.today()
+    # ③ 계획 정보 입력
+    st.markdown("#### ③ 계획 정보 입력")
     with st.form("plan_form"):
         c1, c2 = st.columns(2)
         track = c1.radio("트랙", ["DX 컨설턴트", "AI 개발자"], horizontal=True, key="plan_track")
         stage = c2.selectbox("현재 단계", ["교육 시작 전", "STEP1 (분석형·생성형 AI)", "STEP2 (Cloud·서비스 개발/제안)",
                                          "STEP3 (빅프로젝트)", "수료 전후 (취업 준비)"], key="plan_stage")
-        period = date_range_input("계획 기간 (시작일 ~ 종료일)", today, today + dt.timedelta(days=27), "plan_period")
         goal = st.text_area("학습 목표 *", placeholder="예) AICE Associate 합격, SQL 기본기 다지기")
         level = st.text_area("현재 수준·강점·보완점", placeholder="예) 비전공자, 파이썬 기초는 됨, SQL이 약함",
                              key="plan_level")
         ok = st.form_submit_button("📅 학습 계획 생성", type="primary")
 
     if ok:
+        period = st.session_state.get("plan_period")
         if not goal.strip():
             st.warning("학습 목표를 입력해 주세요.")
-        elif not period:
+        elif not (isinstance(period, (tuple, list)) and len(period) == 2):
             st.warning("계획 기간의 시작일과 종료일을 모두 선택해 주세요.")
         elif (period[1] - period[0]).days > 7 * 12:
             st.warning("계획 기간은 최대 12주까지 설정할 수 있어요.")
-        elif total == 0:
+        elif sum(day_minutes(d) for d in DAYS) == 0 and not st.session_state.date_avail:
             st.warning("공부할 수 있는 시간을 한 칸 이상 '가능'으로 선택해 주세요.")
         else:
             with st.spinner("생각중입니다... 백서를 참고해 계획을 만들고 있어요."):
                 generate_plan(track, stage, goal, period[0], period[1], level)
 
-    # ③ 결과
+    # ④ 결과
     if "plan" in st.session_state:
         plan, prof = st.session_state.plan, st.session_state.plan_prof
         st.divider()
-        st.markdown(f"### 🎯 {prof['goal']}")
-        st.caption(f"📆 {prof['period']} ({prof['weeks']}주) · {prof['track']} · {prof['stage']}")
-        st.info(plan["summary"])
+        st.markdown(f"### 🎯 {md(prof['goal'])}")
+        st.caption(md(f"📆 {prof['period']} ({prof['weeks']}주) · {prof['track']} · {prof['stage']}"))
+        st.info(md(plan["summary"]))
+        if prof.get("exceptions"):
+            st.markdown("**📌 날짜별 예외**\n" + "\n".join(f"- {md(e)}" for e in prof["exceptions"]))
 
         st.markdown("#### 요일별 시간표")
         day_tabs = st.tabs([f"{d['day']}요일" for d in plan["day_schedules"]])
@@ -940,17 +1105,17 @@ with tab_plan:
 
         st.markdown("#### 주간 계획")
         for w in plan["weekly_plan"]:
-            with st.expander(f"{w['week']}주차 ({week_label(prof, w['week'])}) · {w['theme']}", expanded=(w["week"] == 1)):
-                st.markdown("**목표**\n" + "\n".join(f"- {g}" for g in w["goals"]))
-                st.markdown("**할 일**\n" + "\n".join(f"- [ ] {t}" for t in w["tasks"]))
-                st.caption(f"점검 기준: {w['checkpoint']}")
-        st.markdown("#### 실천 팁\n" + "\n".join(f"- {t}" for t in plan["tips"]))
+            with st.expander(md(f"{w['week']}주차 ({week_label(prof, w['week'])}) · {w['theme']}"), expanded=(w["week"] == 1)):
+                st.markdown("**목표**\n" + "\n".join(f"- {md(g)}" for g in w["goals"]))
+                st.markdown("**할 일**\n" + "\n".join(f"- [ ] {md(t)}" for t in w["tasks"]))
+                st.caption(md(f"점검 기준: {w['checkpoint']}"))
+        st.markdown("#### 실천 팁\n" + "\n".join(f"- {md(t)}" for t in plan["tips"]))
 
         stamp = f"{dt.date.today():%Y%m%d}"
         st.download_button("⬇️ 학습 계획 PDF 다운로드", st.session_state.plan_pdf,
                            file_name=f"학습계획_{stamp}.pdf", mime="application/pdf")
 
-        # ④ 노션 연동
+        # ⑤ 노션 연동
         st.markdown("#### 🗂️ 노션으로 내보내기")
         n1, n2 = st.columns(2)
         n1.download_button("⬇️ 노션 페이지용 Markdown", plan_markdown(plan, prof).encode("utf-8"),
@@ -1023,7 +1188,7 @@ with tab_doc:
 
     for i, p in enumerate(st.session_state.projects):
         c1, c2 = st.columns([10, 1])
-        c1.markdown(f"**{i + 1}. {p['프로젝트 이름']}** · {p['유형']} · {p['기간']} · {p['팀 구성']}")
+        c1.markdown(md(f"**{i + 1}. {p['프로젝트 이름']}** · {p['유형']} · {p['기간']} · {p['팀 구성']}"))
         if c2.button("삭제", key=f"del_{i}"):
             st.session_state.projects.pop(i)
             st.rerun()
@@ -1077,16 +1242,16 @@ with tab_doc:
 
     if "portfolio" in st.session_state:
         doc = st.session_state.portfolio
-        st.success(f"💡 {doc['slogan']}")
+        st.success(f"💡 {md(doc['slogan'])}")
         if doc["key_numbers"]:
             for col, k in zip(st.columns(len(doc["key_numbers"])), doc["key_numbers"]):
                 col.metric(k["label"], k["value"])
         for p in doc["projects"]:
-            with st.expander(f"📁 {p['project_name']} — {p['title_sentence']}"):
-                st.markdown(f"**내 역할**: {p['my_role']}  \n**선택 이유**: {p['role_reason']}")
+            with st.expander(md(f"📁 {p['project_name']} — {p['title_sentence']}")):
+                st.markdown(md(f"**내 역할**: {p['my_role']}  \n**선택 이유**: {p['role_reason']}"))
                 for title, key in (("문제 정의", "problem"), ("해결 과정", "process"), ("결과", "results")):
-                    st.markdown(f"**{title}**\n" + "\n".join(f"- {x}" for x in p[key]))
-                st.markdown(f"**회고**: {p['retrospective']}")
+                    st.markdown(f"**{title}**\n" + "\n".join(f"- {md(x)}" for x in p[key]))
+                st.markdown(md(f"**회고**: {p['retrospective']}"))
         for col, (fmt, (data, fname, mime)) in zip(st.columns(max(len(st.session_state.files), 1)),
                                                    st.session_state.files.items()):
             col.download_button(f"⬇️ {fmt} 다운로드", data, file_name=fname, mime=mime)
