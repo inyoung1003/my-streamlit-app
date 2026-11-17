@@ -710,6 +710,15 @@ div[class*="st-key-navoff_"] button:hover { border-color:#9DC3E6; background:#F5
 div[class*="st-key-navon_"] button { background: linear-gradient(120deg,#1F3864,#2E75B6) !important; color:#fff !important;
         border:none !important; border-radius:14px; justify-content:flex-start; padding: .6rem .9rem;
         font-weight:700; box-shadow: 0 6px 16px rgba(46,117,182,.25); }
+/* AI로 문서 작성 버튼: 사이드바 메뉴(선택됨)와 같은 디자인 */
+.st-key-gen_doc button { background: linear-gradient(120deg,#1F3864,#2E75B6) !important; color:#FFFFFF !important;
+        border:none !important; border-radius:14px !important; padding: .7rem 1rem; font-weight:700;
+        box-shadow: 0 6px 16px rgba(46,117,182,.25); }
+.st-key-gen_doc button p { color:#FFFFFF !important; font-weight:700; }
+.st-key-gen_doc button:disabled { opacity: .55; cursor: not-allowed; box-shadow: none; }
+/* 비활성 상태의 주요 버튼도 글자가 보이게 */
+button[data-testid^="stBaseButton-primary"]:disabled, button[data-testid^="stBaseButton-primary"]:disabled p {
+        color:#FFFFFF !important; opacity: .6; }
 /* 추가된 프로젝트: 선택된 카드 강조 */
 div[class*="st-key-pcardon_"] { border:1.5px solid #2E75B6 !important; background:#F3F8FF; border-radius:16px; }
 div[class*="st-key-pselon_"] button { background: linear-gradient(120deg,#1F3864,#2E75B6) !important; color:#fff !important;
@@ -1566,7 +1575,7 @@ elif page == "doc":
     st.caption("PPT 템플릿을 올리면 그 템플릿의 레이아웃·색·글꼴로 PPT를 만들어요. 템플릿 안의 기존 슬라이드는 사용하지 않아요. "
                "올리지 않으면 기본 디자인으로 만들어요.")
 
-    if st.button("🪄 AI로 문서 작성", type="primary", disabled=not chosen):
+    if st.button("🪄 AI로 문서 작성", key="gen_doc", disabled=not chosen, width="stretch"):
         author = {"name": author_name or "에이블러", "job": job,
                   "links": [x.strip() for x in links.split(",") if x.strip()]}
         projects_text = "\n\n".join(
