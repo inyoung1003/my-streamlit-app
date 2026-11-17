@@ -590,14 +590,7 @@ div[class*="st-key-dsel_"] button {{background:#1F3864 !important; color:#FFFFFF
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────── 시작 화면: 로고를 누르면 대화 시작
-if not st.session_state.get("started"):
-    st.markdown("<div style='height:16vh'></div>", unsafe_allow_html=True)
-    _, mid, _ = st.columns([1, 2, 1])
-    with mid:
-        if st.button("AIVLE", key="logo_start", help="눌러서 대화 시작", width="stretch"):
-            st.session_state.started = True
-            st.rerun()
-    st.stop()
+
 
 st.markdown('<div class="hero"><h1>AIVLE School 학습 도우미</h1></div>', unsafe_allow_html=True)
 
